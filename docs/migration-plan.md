@@ -1,8 +1,9 @@
 # Migration plan: pen-editor repos → `@sideform/browser-agent`
 
-Status: plan only. Stage 1 did not change `pen-editor`, `pen-editor-backend`
-or `pen-editor-desktop`. Each step below is a separate PR in one repo, with
-its own lint/test/build gate.
+Status: done 2026-10-13 on v0.2.1. pen-editor-backend `2cb790f`, pen-editor-desktop
+`73d17e5`, pen-editor `e8b56e8f`. Bench: 7/7 ultrafast scenarios (2 live sites).
+The copies in the three repos are gone: fix browser use here, then bump the
+tag in each consumer.
 
 ## 0. Preconditions (all repos)
 
