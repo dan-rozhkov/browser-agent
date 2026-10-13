@@ -53,8 +53,10 @@ export interface LoopEnv {
   browser: BrowserBridge;
   /** Where `/api/browse/{step,plan}` requests go. */
   backend: BrowseBackend;
-  /** User switches sent with every step; omitted from the body when absent. */
-  permissions?: BrowsePermissions;
+  /** User switches sent with every step; omitted from the body when absent.
+   * A getter is called before each step, so a switch the user flips mid-run
+   * applies from the next step. */
+  permissions?: BrowsePermissions | (() => BrowsePermissions);
   /** Action cache storage (was `localStorage`); absent = cache off. */
   storage?: KeyValueStorage;
   /** The browser is a remote (cloud) one: longer deadlines (was
@@ -771,7 +773,9 @@ async function requestStep(
     // User switches (password entry / confirm irreversible), passed in by the
     // host (`permissions` option) and sent as given. An older backend's zod
     // object strips it. Omitted when the host gave none.
-    ...(env.permissions !== undefined ? { permissions: { ...env.permissions } } : {}),
+    ...(env.permissions !== undefined
+      ? { permissions: { ...(typeof env.permissions === "function" ? env.permissions() : env.permissions) } }
+      : {}),
   }, undefined, signal, clock);
   if (!res.ok) {
     throw new Error(`/api/browse/step responded ${res.status}`);
@@ -2545,8 +2549,11 @@ export interface RunBrowseTaskOptions {
   url?: string;
   /** Aborts the whole call ("cancelled"). */
   signal?: AbortSignal;
-  /** User switches sent with every step (was the Zustand settings store). */
-  permissions?: BrowsePermissions;
+  /** User switches sent with every step (was the Zustand settings store).
+   * Pass a getter to read them before each step, as pen-editor did ("read
+   * now rather than cached"): a switch flipped mid-run then applies from the
+   * next step. A plain object is fixed for the whole call. */
+  permissions?: BrowsePermissions | (() => BrowsePermissions);
   /** Action cache storage (pen-editor passes `localStorage`); omitted = cache off. */
   storage?: KeyValueStorage;
   /** The browser is remote (was `isDesktopBrowserAvailable() === false`):

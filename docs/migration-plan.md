@@ -8,7 +8,7 @@ its own lint/test/build gate.
 
 1. **Distribution.** The repo is public (MIT) and the package is not on a
    registry. Install it from GitHub, pinned to a tag:
-   `"@sideform/browser-agent": "github:dan-rozhkov/browser-agent#v0.2.0"`.
+   `"@sideform/browser-agent": "github:dan-rozhkov/browser-agent#v0.2.1"`.
    npm runs the package's `prepare` script (`npm run build`) on install, so
    `dist/` is built on the consumer side.
 2. **CI access.** None needed: the repo is public, so `npm ci` in GitHub

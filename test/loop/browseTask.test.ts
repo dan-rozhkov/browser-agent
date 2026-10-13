@@ -1182,6 +1182,24 @@ describe("browse_task", () => {
     expect(receivedBodies[0]!.permissions).toEqual(expected);
   });
 
+  it("a permissions getter is read before each step, so a mid-run switch applies to the next step", async () => {
+    let current: BrowsePermissions = { allowPasswordEntry: true, confirmIrreversible: false };
+    const receivedBodies: Array<Record<string, unknown>> = [];
+    stubFetchSequence([CLICK_STEP, DONE], (init) => {
+      receivedBodies.push(JSON.parse(init.body as string));
+      // The user flips both switches while the first step is in flight.
+      current = { allowPasswordEntry: false, confirmIrreversible: true };
+    });
+
+    const browser = stubBrowser({});
+    await runBrowseTaskLoopImpl("accept cookies", 12, { ...envFor(browser), permissions: () => current });
+
+    const steps = receivedBodies.filter((b) => "elements" in b);
+    expect(steps).toHaveLength(2);
+    expect(steps[0]!.permissions).toEqual({ allowPasswordEntry: true, confirmIrreversible: false });
+    expect(steps[1]!.permissions).toEqual({ allowPasswordEntry: false, confirmIrreversible: true });
+  });
+
   it("clamps oversized goal/title/url/history/pageText/modal fields in the step body", async () => {
     const receivedBodies: Array<{ goal: string; url: string; title: string }> = [];
     stubFetchSequence([DONE], (init) => {

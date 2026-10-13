@@ -35,7 +35,7 @@ three pen-editor repos move onto this package.
 The package is private. Install it from the Git repo:
 
 ```bash
-npm install github:dan-rozhkov/browser-agent#v0.2.0
+npm install github:dan-rozhkov/browser-agent#v0.2.1
 ```
 
 `prepare` builds `dist/` on install. Peer dependencies are optional:
