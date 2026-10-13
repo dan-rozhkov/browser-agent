@@ -4,6 +4,7 @@
 + loop + adapters), extracted from pen-editor. TypeScript, ESM/NodeNext,
 Vitest 4, ESLint 9. Read `README.md` for the API, `docs/design.md` for the
 design, `docs/migration-plan.md` for how consumers move onto it.
+Controller design notes and fix history (moved from pen-editor-desktop): `docs/controller-notes.md`.
 
 ## Commands
 
