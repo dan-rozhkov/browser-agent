@@ -150,7 +150,7 @@ export function filterElementsForBackend(elements: unknown[]): unknown[] {
  * no tighter effective cap exists. One oversized field 400s the whole step.
  */
 export const BACKEND_MAX_ELEMENTS = 120;
-const ELEMENT_CAPS = { tag: 40, role: 60, label: 200, value: 500, frame: 200 } as const;
+const ELEMENT_CAPS = { tag: 40, role: 60, label: 200, value: 500, frame: 200, inputType: 20 } as const;
 const OPTIONS_MAX_ITEMS = 100;
 const OPTION_MAX_CHARS = 200;
 export const BACKEND_MAX_GOAL = 2_000;
@@ -200,7 +200,7 @@ export function sanitizeElementForBackend(el: unknown): Record<string, unknown> 
     label: typeof e.label === "string" ? truncateToChars(e.label, ELEMENT_CAPS.label) : "",
     ops,
   };
-  for (const key of ["role", "value", "frame"] as const) {
+  for (const key of ["role", "value", "frame", "inputType"] as const) {
     if (typeof e[key] === "string") out[key] = truncateToChars(e[key], ELEMENT_CAPS[key]);
     else delete out[key];
   }

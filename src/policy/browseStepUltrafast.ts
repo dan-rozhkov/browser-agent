@@ -213,38 +213,47 @@ function wordTokens(text: string): string[] {
   return foldWords(text.replace(/\d+(?:[.,]\d+)?/g, " ").replace(/\p{Sc}/gu, " ")).split(" ").filter(Boolean);
 }
 
-/** The text with thousands separators and currency marks dropped, for an exact-phrase match. */
-function literalForm(text: string): string {
-  return normalize(text.replace(/\p{Sc}/gu, "").replace(/(?<=\d)[,.\u202f\u00a0 ](?=\d{3}(?!\d))/g, ""));
-}
-
 /** The digit-bearing quoted phrases of a goal (goal clauses stripped). */
 function numericQuotedPhrases(goal: string): string[] {
   return quotedPhrases(stripGoalClauses(goal)).filter((p) => /\d/.test(p));
 }
 
+/** True when the label says the phrase exactly: every word of the phrase is
+ * a word of the label and the number tokens are identical (so "under 15"
+ * is not inside "Under $150", nor "March 1" inside "March 15"). */
+function labelHasPhrase(label: string, phrase: string): boolean {
+  const labelWords = new Set(wordTokens(label));
+  const words = wordTokens(phrase);
+  if (!words.every((w) => labelWords.has(w))) return false;
+  return numberTokens(phrase).join("|") === numberTokens(label).join("|");
+}
+
 /** The quoted number-bearing phrase a label nearly matches: same words,
  * different numbers ("under 20" for a goal that quotes "Under 15"). */
 function nearMissPhrase(goal: string, label: string): string | undefined {
-  const labelNums = numberTokens(label);
-  if (labelNums.length === 0) return undefined;
+  if (numberTokens(label).length === 0) return undefined;
   const labelWords = new Set(wordTokens(label));
   return numericQuotedPhrases(goal).find((phrase) => {
     const words = wordTokens(phrase);
     if (words.length === 0 || !words.every((w) => labelWords.has(w))) return false;
-    const a = numberTokens(phrase).join("|");
-    return a !== labelNums.join("|") && !literalForm(label).includes(literalForm(phrase));
+    return !labelHasPhrase(label, phrase);
   });
 }
 
-const OPTION_ROLE_RE = /^(option|menuitem|menuitemradio|menuitemcheckbox|radio|checkbox)$/;
-const SHORT_OPTION_LABEL_CHARS = 40;
+const OPTION_ROLE_RE = /^(option|menuitem|menuitemradio|menuitemcheckbox|radio|checkbox|tab)$/;
 
+/** A pick-one/pick-some control by role or native input type. A stepper or
+ * pagination button is not one, however short its label. */
 function isOptionLike(el: BrowseStepElement): boolean {
-  return OPTION_ROLE_RE.test(el.role ?? "") || el.label.length <= SHORT_OPTION_LABEL_CHARS;
+  if (OPTION_ROLE_RE.test(el.role ?? "")) return true;
+  return el.tag === "input" && (el.inputType === "radio" || el.inputType === "checkbox");
 }
 
 const RADIO_ROLES = new Set(["radio", "menuitemradio"]);
+
+function isRadioLike(el: BrowseStepElement): boolean {
+  return RADIO_ROLES.has(el.role ?? "") || (el.tag === "input" && el.inputType === "radio");
+}
 const BUTTON_ROLES = new Set(["button", "link"]);
 
 /** A disabled control that looks like a button (Continue, Next, Submit). */
@@ -270,7 +279,7 @@ function unansweredRadioRun(
     return ok ? open : undefined;
   };
   for (const el of elements) {
-    if (RADIO_ROLES.has(el.role ?? "")) {
+    if (isRadioLike(el)) {
       run.push(el);
       continue;
     }
@@ -1259,23 +1268,31 @@ export async function decideBrowseStepUltrafast(
     const reason = "required options are unanswered and the button is disabled: answer the choice instead of scrolling";
     const own = choiceAnswer(answers[TARGET_QUESTION_ID.CLICK]);
     const ownEl = own ? options.find((el) => String(el.index) === own.choice) : undefined;
-    if (own && ownEl) return fire(ownEl, peakProbability(own), own.confidence, reason);
+    if (own && ownEl && peakProbability(own) >= UNANSWERED_CHOICE_MIN_PEAK) {
+      return fire(ownEl, peakProbability(own), own.confidence, reason);
+    }
     const criteria: Record<string, Record<string, unknown> | string> = {};
     for (const el of options) criteria[String(el.index)] = targetCriterion(el);
     if (luna) criteria[NONE_KEY] = NONE_LABEL;
     const instructions = luna
       ? `${lunaInstructions(goal, "CLICK", vision, false, modalName !== undefined)}\n${UNANSWERED_CHOICE_RULE}`
-      : { goal, operation: "CLICK", rules: [TARGET_RULES, DISABLED_CONTROL_RULE, UNANSWERED_CHOICE_RULE] };
+      : { goal, operation: "CLICK", rules: [TARGET_RULES, DISABLED_CONTROL_RULE, UNANSWERED_CHOICE_RULE], ...(vision ? SCREENSHOT_NOTE : {}) };
     let answer: SystemOneChoiceAnswer | null;
+    const narrowStart = Date.now();
     try {
       const res = await client.evaluate({
-        state: stateObject,
+        state: vision
+          ? [JSON.stringify(stateObject), { type: "image_url", image_url: { url: input.screenshot } }]
+          : stateObject,
         questions: { unanswered_choice: { type: "choice", criteria, instructions } },
         signal: AbortSignal.timeout(BROWSE_STEP_TIMEOUT_MS),
       });
       answer = choiceAnswer(res.answers.unanswered_choice);
+      if (typeof res.usage?.input_tokens === "number") inputTokens = (inputTokens ?? 0) + res.usage.input_tokens;
     } catch {
       return undefined;
+    } finally {
+      timings.jevMs += Date.now() - narrowStart;
     }
     const el = answer ? options.find((e) => String(e.index) === answer!.choice) : undefined;
     if (!answer || !el || peakProbability(answer) < UNANSWERED_CHOICE_MIN_PEAK) return undefined;
@@ -1305,7 +1322,7 @@ export async function decideBrowseStepUltrafast(
       // type the value into; never settle for the near match.
       const exact = [...targets.CLICK.values()]
         .map((t) => elements.find((e) => e.index === t.index))
-        .filter((e): e is BrowseStepElement => !!e && isOptionLike(e) && literalForm(e.label).includes(literalForm(phrase)))
+        .filter((e): e is BrowseStepElement => !!e && isOptionLike(e) && labelHasPhrase(e.label, phrase))
         .sort((a, b) => (targetAnswer.probabilities[String(b.index)] ?? 0) - (targetAnswer.probabilities[String(a.index)] ?? 0))[0];
       gates.push({ head: "literal-mismatch", peak: peakProbability(targetAnswer), threshold: 0, jevPick: `CLICK ${target.index}` });
       ruleTier = true;
@@ -1321,7 +1338,7 @@ export async function decideBrowseStepUltrafast(
       }
       if (!literalTypeTried) {
         literalTypeTried = true;
-        const alt = pickRunnerUp({ minP: 0, requireTarget: true, exclude: (op) => op !== "TYPE_TEXT" });
+        const alt = pickRunnerUp({ minP: NO_TEXT_RUNNER_UP_MIN_PROBABILITY, requireTarget: true, exclude: (op) => op !== "TYPE_TEXT" });
         if (alt) {
           return decideTarget("TYPE_TEXT", "TYPE_TEXT", choiceAnswer(answers[TARGET_QUESTION_ID.TYPE_TEXT]), opProbabilities[alt] ?? 0);
         }
@@ -1473,7 +1490,7 @@ export async function decideBrowseStepUltrafast(
   }
   timings.textMs = Date.now() - textStart;
   const norm = (v: string) => normalize(v);
-  const alreadySet = text !== null && norm(text).length >= 3 && norm(el.value ?? "").includes(norm(text));
+  const alreadySet = text !== null && norm(text).length >= 3 && norm(el.value ?? "") === norm(text);
   if (text === null || alreadySet) {
     // No text to type is not a dead end: continue with the best other
     // non-terminal operation that has a real target (or needs none).

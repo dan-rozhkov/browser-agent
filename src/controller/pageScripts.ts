@@ -3556,7 +3556,10 @@ export const SNAPSHOT_JS = `(() => {
     // tell was a screenshot.
     if (tag === "input") {
       var checkType = (el.getAttribute("type") || "").toLowerCase();
-      if (checkType === "checkbox" || checkType === "radio") entry.checked = !!el.checked;
+      if (checkType === "checkbox" || checkType === "radio") {
+        entry.checked = !!el.checked;
+        entry.inputType = checkType;
+      }
     }
     if (penIsAriaSlider(el)) {
       // Where the slider sits now, as a bare number only: aria-valuetext is
@@ -4044,6 +4047,7 @@ export const SNAPSHOT_JS = `(() => {
     // rule is absolute, so the signal carrying it has to leave the page.
     if (item.isPassword) out.isPassword = true;
     if (item.checked !== undefined) out.checked = item.checked;
+    if (item.inputType) out.inputType = item.inputType;
     if (item.expanded !== undefined) out.expanded = item.expanded;
     if (item.disabled === true) out.disabled = true;
     elements.push(out);
@@ -4757,34 +4761,50 @@ export const SIGNATURE_JS = `(() => {
   }
 
   // controlsHash: one numeric hash over the live state of the visible form
-  // controls (value, checked, aria-valuenow / aria-checked / aria-selected).
-  // The MutationObserver cannot see a .value or .checked property change, so
-  // a stepper that rewrites a sibling input would otherwise look like "no
-  // effect". Scoped to the open dialog when there is one, capped, and only a
-  // number leaves the page; password fields are skipped.
+  // controls: native input/select/textarea value + checked, aria-checked on
+  // checkbox-like roles, aria-valuenow on spinbuttons only. Ambient state
+  // (a video progress slider, an auto-rotating tab's aria-selected, a range
+  // input) is excluded, or every no-op action would look "changed". The
+  // MutationObserver cannot see a .value or .checked property change, so a
+  // stepper that rewrites a sibling input would otherwise look like "no
+  // effect". Scoped to a visible real modal when there is one, capped (after
+  // the visibility filter), and only a number leaves the page; password
+  // fields are skipped.
   var controlsHash = 0;
   try {
     var ctlRoot = document;
-    var dlgs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]');
+    var dlgs = document.querySelectorAll('[aria-modal="true"], dialog[open]');
     for (var di = dlgs.length - 1; di >= 0; di--) {
-      if (isVisible(dlgs[di])) {
-        ctlRoot = dlgs[di];
+      var dlg = dlgs[di];
+      var isModal = dlg.getAttribute("aria-modal") === "true";
+      if (!isModal) {
+        try {
+          isModal = dlg.matches(":modal");
+        } catch (e) {}
+      }
+      if (isModal && isVisible(dlg)) {
+        ctlRoot = dlg;
         break;
       }
     }
     var ctls = ctlRoot.querySelectorAll(
-      "input, select, textarea, [role='checkbox'], [role='radio'], [role='switch'], [role='slider'], [role='spinbutton'], [role='option'], [role='tab'], [aria-checked], [aria-selected], [aria-valuenow]"
+      "input, select, textarea, [role='checkbox'], [role='radio'], [role='switch'], [role='menuitemcheckbox'], [role='menuitemradio'], [role='spinbutton']"
     );
-    var ctlCap = Math.min(ctls.length, 150);
     var ctlKey = "";
-    for (var ci = 0; ci < ctlCap; ci++) {
+    var ctlSeen = 0;
+    for (var ci = 0; ci < ctls.length && ctlSeen < 150; ci++) {
       var ctl = ctls[ci];
-      if (String(ctl.type || "").toLowerCase() === "password") continue;
+      var ctlTag = (ctl.tagName || "").toLowerCase();
+      var ctlType = String(ctl.type || "").toLowerCase();
+      var ctlRole = ctl.getAttribute("role") || "";
+      if (ctlType === "password" || ctlType === "range") continue;
       if (!isVisible(ctl)) continue;
+      ctlSeen++;
+      var ctlNative = ctlTag === "input" || ctlTag === "select" || ctlTag === "textarea";
       ctlKey +=
-        ci + "|" + ("value" in ctl ? String(ctl.value || "") : "") + "|" + (ctl.checked ? 1 : 0) + "|" +
-        (ctl.getAttribute("aria-valuenow") || "") + "|" + (ctl.getAttribute("aria-checked") || "") + "|" +
-        (ctl.getAttribute("aria-selected") || "") + ";";
+        ci + "|" + (ctlNative ? String(ctl.value || "") : "") + "|" + (ctlNative && ctl.checked ? 1 : 0) + "|" +
+        (ctlRole === "spinbutton" ? ctl.getAttribute("aria-valuenow") || "" : "") + "|" +
+        (/^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(ctlRole) ? ctl.getAttribute("aria-checked") || "" : "") + ";";
     }
     controlsHash = penHashString(ctlKey);
   } catch (e) {}

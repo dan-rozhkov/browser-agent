@@ -441,6 +441,8 @@ export interface BrowseStepElement {
   /** Checkbox/radio state from the desktop snapshot. Without it a filter
    * that is already on reads exactly like one that is off. */
   checked?: boolean;
+  /** Native input type of a checkbox/radio input (role-less in the snapshot). */
+  inputType?: string;
   /** aria-expanded: whether a combobox's / menu button's list is open. Without
    * it "open the dropdown" and "pick from the open list" look identical, and
    * Jev toggled a list open and shut (live, Google Flights trip type). */

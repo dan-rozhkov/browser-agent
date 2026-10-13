@@ -30,6 +30,9 @@ export const elementSchema = z
     // field is already filled, which is the whole reason `value` was dropped.
     hasValue: z.boolean().optional(),
     checked: z.boolean().optional(),
+    // Native input type of a checkbox/radio input; a native radio comes
+    // role-less, so this is how a group is recognised.
+    inputType: z.string().max(20).optional(),
     // aria-expanded of a combobox/menu button: whether its list is open.
     expanded: z.boolean().optional(),
     isPassword: z.boolean().optional(),

@@ -89,11 +89,55 @@ describe("SIGNATURE_JS controlsHash", () => {
     expect(json).not.toContain("secret-value");
   });
 
-  it("scopes to an open dialog", () => {
-    document.body.innerHTML = '<input id="out" value="1"><div role="dialog"><input value="2"></div>';
+  it("scopes to a visible modal dialog", () => {
+    document.body.innerHTML = '<input id="out" value="1"><div role="dialog" aria-modal="true"><input value="2"></div>';
     const before = signature("before");
     (document.getElementById("out") as HTMLInputElement).value = "9";
     expect(signature("after").controlsHash).toBe(before.controlsHash);
+  });
+
+  it("does not narrow to a non-modal dialog (cookie banner, chat bubble)", () => {
+    document.body.innerHTML = '<input id="out" value="1"><div role="dialog"><input value="2"></div>';
+    const before = signature("before");
+    (document.getElementById("out") as HTMLInputElement).value = "9";
+    expect(signature("after").controlsHash).not.toBe(before.controlsHash);
+  });
+
+  it("ignores ambient aria state: slider progress, tab selection, range input", () => {
+    document.body.innerHTML =
+      '<div id="s" role="slider" aria-valuenow="10"></div><div id="t" role="tab" aria-selected="true"></div><input id="r" type="range" value="3">';
+    const before = signature("before");
+    document.getElementById("s")!.setAttribute("aria-valuenow", "55");
+    document.getElementById("t")!.setAttribute("aria-selected", "false");
+    (document.getElementById("r") as HTMLInputElement).value = "7";
+    expect(signature("after").controlsHash).toBe(before.controlsHash);
+  });
+
+  it("tracks aria-valuenow on a spinbutton and aria-checked on a switch", () => {
+    document.body.innerHTML = '<div id="n" role="spinbutton" aria-valuenow="1"></div><div id="w" role="switch" aria-checked="false"></div>';
+    const b1 = signature("before");
+    document.getElementById("n")!.setAttribute("aria-valuenow", "2");
+    expect(signature("after").controlsHash).not.toBe(b1.controlsHash);
+    const b2 = signature("before");
+    document.getElementById("w")!.setAttribute("aria-checked", "true");
+    expect(signature("after").controlsHash).not.toBe(b2.controlsHash);
+  });
+
+  it("applies the 150 cap after the visibility filter", () => {
+    const hidden = Array.from({ length: 160 }, () => '<input value="h" hidden-test>').join("");
+    document.body.innerHTML = hidden + '<input id="late" value="1">';
+    const orig = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function () {
+      const zero = this.hasAttribute("hidden-test");
+      return { x: 0, y: 0, top: 0, left: 0, right: 100, bottom: 20, width: zero ? 0 : 100, height: zero ? 0 : 20, toJSON() {} } as DOMRect;
+    };
+    try {
+      const before = signature("before");
+      (document.getElementById("late") as HTMLInputElement).value = "2";
+      expect(signature("after").controlsHash).not.toBe(before.controlsHash);
+    } finally {
+      Element.prototype.getBoundingClientRect = orig;
+    }
   });
 });
 
@@ -165,5 +209,17 @@ describe("SNAPSHOT_JS table headers", () => {
     const els = res.elements as { tag: string; label: string }[];
     expect(els.filter((e) => e.label.includes("Sort size"))).toHaveLength(1);
     expect(els.some((e) => e.tag === "th")).toBe(false);
+  });
+});
+
+describe("SNAPSHOT_JS inputType", () => {
+  it("exposes inputType for native radio and checkbox inputs only", () => {
+    document.body.innerHTML =
+      '<label>Std <input type="radio" name="g"></label><label>Opt <input type="checkbox"></label><input type="text" aria-label="Name">';
+    const res = run(SNAPSHOT_JS, { snapshotId: "s9", maxElements: 100 });
+    const els = res.elements as { tag: string; inputType?: string; label: string }[];
+    expect(els.filter((e) => e.inputType === "radio")).toHaveLength(1);
+    expect(els.filter((e) => e.inputType === "checkbox")).toHaveLength(1);
+    expect(els.filter((e) => e.tag === "input" && e.inputType === undefined)).toHaveLength(1);
   });
 });

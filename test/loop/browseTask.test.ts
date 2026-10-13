@@ -744,13 +744,24 @@ describe("browse_task", () => {
       expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
-    it("also treats a listed option as an open popup", async () => {
-      stubFetchSequence([CLICK_STEP, DONE, DONE]);
+    it("does not treat a persistent listed menuitem/option as an open popup", async () => {
+      stubFetchSequence([CLICK_STEP, DONE]);
       const act = vi.fn(async () => ({}));
-      const browser = stubBrowser({ act, snapshot: async () => pageWith([OPTION]) });
+      const nav = { index: 2, tag: "a", role: "menuitem", label: "Home", ops: ["CLICK"] };
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([OPTION, nav]) });
       const t = await runBrowseTaskLoop("filter by red", 12, browser);
       expect(t.status).toBe("done");
-      expect(escapeCalls(act)).toHaveLength(1);
+      expect(escapeCalls(act)).toHaveLength(0);
+    });
+
+    it("does not press Escape after a single-choice (radio) click even when a list is expanded", async () => {
+      stubFetchSequence([CLICK_STEP, DONE]);
+      const act = vi.fn(async () => ({}));
+      const radio = { index: 0, tag: "div", role: "radio", label: "Red", ops: ["CLICK"] };
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([radio, OPEN_MENU]) });
+      const t = await runBrowseTaskLoop("pick red", 12, browser);
+      expect(t.status).toBe("done");
+      expect(escapeCalls(act)).toHaveLength(0);
     });
 
     it("does not press Escape when nothing is open", async () => {

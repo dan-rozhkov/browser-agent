@@ -1509,7 +1509,7 @@ describe("value-already-set gate (retyping what a field holds)", () => {
     mockFieldText("Berlin Hauptbahnhof");
     const { result } = await decide(
       { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
-      { goal, elements: [field("Berlin Hauptbahnhof, Germany")] },
+      { goal, elements: [field("  Berlin  HAUPTBAHNHOF ")] },
     );
     expect(result).toMatchObject({ outcome: "done", operation: "DONE" });
     expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
@@ -1531,5 +1531,128 @@ describe("value-already-set gate (retyping what a field holds)", () => {
       { goal: 'Search "LA"', elements: [field("LA")] },
     );
     expect(result).toMatchObject({ operation: "TYPE_TEXT", text: "LA" });
+  });
+});
+
+describe("value-already-set compares by equality, not substring", () => {
+  it("still types when the field holds a longer value that merely contains the text", async () => {
+    mockFieldText("Berlin");
+    const { result } = await decide(
+      { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
+      {
+        goal: 'Search trains to "Berlin"',
+        elements: [{ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value: "Berlin Hauptbahnhof" }],
+      },
+    );
+    expect(result).toMatchObject({ outcome: "act", operation: "TYPE_TEXT", text: "Berlin" });
+  });
+});
+
+describe("literal comparison respects number boundaries", () => {
+  const op = { operation: choice("CLICK", 0.8, { probabilities: { CLICK: 0.8, TYPE_TEXT: 0.15 } }), click_target: choice("1", 0.8) };
+  const opt = (index: number, label: string): BrowseStepElement => ({ index, tag: "div", role: "option", label, ops: ["CLICK"] });
+
+  it('treats "Under $150" as a near miss for "Under 15", not an exact match', async () => {
+    const { result } = await decide(op, { goal: 'Filter to "Under 15"', elements: [opt(1, "Under $150"), opt(2, "Over 15")] });
+    expect(result.outcome).toBe("blocked");
+    expect(result.reason).toContain("is not offered");
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "literal-mismatch" }));
+  });
+
+  it('does not pick "Under $150" as the exact option when "Under 15" exists', async () => {
+    const { result } = await decide(op, { goal: 'Filter to "Under 15"', elements: [opt(1, "Under $150"), opt(2, "Under 15")] });
+    expect(result).toMatchObject({ operation: "CLICK", index: 2 });
+  });
+
+  it('treats "March 15" as a near miss for "March 1"', async () => {
+    const { result } = await decide(op, { goal: 'Pick "March 1"', elements: [opt(1, "March 15"), opt(2, "March 1")] });
+    expect(result).toMatchObject({ operation: "CLICK", index: 2 });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "literal-mismatch" }));
+    const only = await decide(op, { goal: 'Pick "March 1"', elements: [opt(1, "March 15")] });
+    expect(only.result.outcome).toBe("blocked");
+  });
+
+  it("blocks instead of typing when the TYPE_TEXT runner-up is below the minimum probability", async () => {
+    const weak = { operation: choice("CLICK", 0.9, { probabilities: { CLICK: 0.9, TYPE_TEXT: 0.02 } }), click_target: choice("1", 0.9), type_text_target: choice("3", 0.9) };
+    const { result } = await decide(weak, {
+      goal: 'Filter to "Under 15"',
+      elements: [opt(1, "Under 20"), { index: 3, tag: "input", label: "Max price", ops: ["TYPE_TEXT"], value: "" }],
+    });
+    expect(result.outcome).toBe("blocked");
+    expect(result.reason).toContain("is not offered");
+  });
+});
+
+describe("option-like is limited to real choice controls", () => {
+  it('does not block a stepper button labelled "Adults: 1, increase"', async () => {
+    const { result } = await decide(
+      { operation: choice("CLICK", 0.8), click_target: choice("1", 0.8) },
+      {
+        goal: "Book for 2 adults",
+        elements: [{ index: 1, tag: "button", label: "Adults: 1, increase", ops: ["CLICK"] }],
+      },
+    );
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 1 });
+    expect(result.diag?.gates.some((g) => g.head === "literal-mismatch")).toBe(false);
+  });
+
+  it('does not block a stepper whose goal quotes "2 adults"', async () => {
+    const { result } = await decide(
+      { operation: choice("CLICK", 0.8), click_target: choice("1", 0.8) },
+      {
+        goal: 'Set the guests to "2 adults"',
+        elements: [{ index: 1, tag: "button", label: "Adults: 1, increase", ops: ["CLICK"] }],
+      },
+    );
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 1 });
+  });
+});
+
+describe("unanswered-choice gate: native inputs, peak and accounting", () => {
+  const nativeRadio = (index: number, label: string, inputType = "radio"): BrowseStepElement => ({
+    index, tag: "input", inputType, label, ops: ["CLICK"], checked: false,
+  });
+  const button: BrowseStepElement = { index: 3, tag: "button", label: "Continue", ops: ["CLICK"], disabled: true };
+  const scroll = { operation: choice("SCROLL_DOWN", 0.9) };
+
+  it("fires for a role-less native radio group above a disabled native button", async () => {
+    const { result } = await decide({ ...scroll, click_target: choice("2", 0.7) }, { elements: [nativeRadio(1, "Standard"), nativeRadio(2, "Extended"), button] });
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 2 });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "unanswered-choice" }));
+  });
+
+  it("does not treat native checkboxes as an unanswered required group", async () => {
+    const { result } = await decide({ ...scroll, click_target: choice("2", 0.7) }, {
+      elements: [nativeRadio(1, "News", "checkbox"), nativeRadio(2, "Offers", "checkbox"), button],
+    });
+    expect(result.operation).toBe("SCROLL_DOWN");
+  });
+
+  it("falls through to the narrow question when the model's own click target is weak", async () => {
+    const seen: Captured[] = [];
+    const result = await decideBrowseStepUltrafast(
+      fakeClient({ ...scroll, click_target: choice("2", 0.3), unanswered_choice: choice("1", 0.8) }, { capture: (p) => seen.push(p) }),
+      config,
+      input({ elements: [nativeRadio(1, "Standard"), nativeRadio(2, "Extended"), button] }),
+    );
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 1 });
+    expect(seen).toHaveLength(2);
+    const gate = result.diag?.gates.find((g) => g.head === "unanswered-choice");
+    expect(gate?.peak).toBe(0.8);
+  });
+
+  it("sends the screenshot with the narrow question and counts its tokens", async () => {
+    const SHOT = "data:image/jpeg;base64,QUJD";
+    const seen: Captured[] = [];
+    const result = await decideBrowseStepUltrafast(
+      fakeClient({ ...scroll, click_target: choice("4", 0.6), unanswered_choice: choice("1", 0.8) }, { capture: (p) => seen.push(p) }),
+      makeOptions({ vision: true }),
+      input({ elements: [nativeRadio(1, "Standard"), nativeRadio(2, "Extended"), button], screenshot: SHOT }),
+    );
+    expect(seen).toHaveLength(2);
+    expect(seen[1]!.state).toEqual(seen[0]!.state);
+    expect(Array.isArray(seen[1]!.state)).toBe(true);
+    expect(JSON.stringify(seen[1]!.questions.unanswered_choice!.instructions)).toContain("screenshot_note");
+    expect(result.diag?.inputTokens).toBe(200);
   });
 });
