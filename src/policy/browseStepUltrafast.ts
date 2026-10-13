@@ -97,16 +97,12 @@ const NEXT_ACTION_RULES = [
   "BLOCKED means no supported operation can make progress, or the page needs credentials the user must enter themselves.",
 ].join("\n");
 
-const LITERAL_VALUE_RULE =
-  "If the goal quotes a value, a candidate with a different number is a different option — do not pick it as a near match.";
-
 // questions.py TARGET.
 const TARGET_RULES = [
   "Choose the best observed target if the next operation is the one specified in this question.",
   "Use the user's entire goal, field values, nearby text, and recent actions. This question chooses only",
   "a target for that operation; another question decides which operation to execute. Do not choose",
   "a field that already contains the requested value. Choose only an offered element index.",
-  LITERAL_VALUE_RULE,
 ].join(" ");
 
 const OPERATION_LABELS: Record<Exclude<BrowseOperation, "DONE" | "BLOCKED">, string> = {
@@ -153,7 +149,6 @@ function lunaInstructions(goal: string, head?: TargetHead, vision = false, calen
     `Goal: ${goal}\n\nChoose only the next single step. Do not repeat an action that already had no effect or was just repeated.\n${COMMIT_EFFECT_RULE}\n${DONE_COMMIT_RULE}\n${DISABLED_CONTROL_RULE}` +
     (head ? "" : `\n${DONE_WHEN_RULE}`) +
     (head ? `\nChoose the target element for the operation ${head}.` : "") +
-    (head ? `\n${LITERAL_VALUE_RULE}` : "") +
     (calendar ? `\n${CALENDAR_HINT}` : "") +
     (modal ? `\n${MODAL_NOTE}` : "") +
     (vision ? `\n${SCREENSHOT_NOTE.screenshot_note}` : "")

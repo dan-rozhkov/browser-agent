@@ -1484,9 +1484,12 @@ describe("literal-mismatch gate (near-miss numeric option)", () => {
     expect(unquoted.result).toMatchObject({ operation: "CLICK", index: 1 });
   });
 
-  it("tells the model that a different number is a different option", async () => {
+  // The prompt-level twin of this gate made Luna refuse every click target
+  // (a submit button has no quoted number) right after a field was filled:
+  // the deterministic gate is the only guard.
+  it("does not put a near-match rule into the click-target instructions", async () => {
     const { captured } = await decide(op, { goal, elements: [under20, range] });
-    expect(JSON.stringify(captured.questions.click_target!.instructions)).toContain("a candidate with a different number is a different option");
+    expect(JSON.stringify(captured.questions.click_target!.instructions)).not.toContain("different number");
   });
 });
 
