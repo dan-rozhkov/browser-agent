@@ -1351,3 +1351,185 @@ describe("pending suggestions for a plain text field reported as expanded", () =
     expect(result.reason).toContain("suggestion");
   });
 });
+
+describe("unanswered-choice gate (SCROLL before a disabled button)", () => {
+  const radio = (index: number, label: string, checked = false): BrowseStepElement => ({ index, tag: "input", role: "radio", label, ops: ["CLICK"], checked });
+  const CHOICE: BrowseStepElement[] = [
+    radio(1, "Standard"),
+    radio(2, "Extended"),
+    { index: 3, tag: "button", role: "button", label: "Continue", ops: ["CLICK"], disabled: true },
+    { index: 4, tag: "a", role: "link", label: "Help", ops: ["CLICK"] },
+  ];
+  const lunaConfig = makeOptions({ decisionModel: "openai/gpt-6-luna-decisions" });
+  const scroll = { operation: choice("SCROLL_DOWN", 0.9) };
+
+  async function run(
+    answers: Record<string, SystemOneAnswer>,
+    elements: BrowseStepElement[] = CHOICE,
+    opts: { luna?: boolean; history?: BrowseStepInput["history"] } = {},
+  ) {
+    let calls = 0;
+    const result = await decideBrowseStepUltrafast(
+      fakeClient(answers, { capture: () => calls++ }),
+      opts.luna ? lunaConfig : config,
+      input({ elements, history: opts.history ?? [] }),
+    );
+    return { result, calls };
+  }
+
+  for (const luna of [false, true]) {
+    const name = luna ? "luna" : "jev";
+    it(`${name}: clicks the model's own click target when it is an unanswered option`, async () => {
+      const { result, calls } = await run({ ...scroll, click_target: choice("2", 0.7) }, CHOICE, { luna });
+      expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 2 });
+      expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "unanswered-choice" }));
+      expect(result.diag?.tier).toBe("rule");
+      expect(calls).toBe(1);
+    });
+
+    it(`${name}: asks one narrow question limited to the options, with the goal and the disabled-control rule`, async () => {
+      const seen: Captured[] = [];
+      const result = await decideBrowseStepUltrafast(
+        fakeClient({ ...scroll, click_target: choice("4", 0.6), unanswered_choice: choice("1", 0.8) }, { capture: (p) => seen.push(p) }),
+        luna ? lunaConfig : config,
+        input({ elements: CHOICE }),
+      );
+      expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 1 });
+      expect(seen).toHaveLength(2);
+      const q = seen[1]!.questions.unanswered_choice!;
+      expect(q.type === "choice" ? Object.keys(q.criteria).sort() : []).toEqual(luna ? ["1", "2", "none"] : ["1", "2"]);
+      const text = JSON.stringify(q.instructions);
+      expect(text).toContain("Register as Anna Petrova");
+      expect(text).toContain(DISABLED_CONTROL_RULE);
+    });
+
+    it(`${name}: keeps SCROLL on low confidence or when the answer is none`, async () => {
+      const low = await run({ ...scroll, click_target: choice("4", 0.6), unanswered_choice: choice("1", 0.3) }, CHOICE, { luna });
+      expect(low.result).toMatchObject({ outcome: "act", operation: "SCROLL_DOWN" });
+      const none = await run({ ...scroll, click_target: choice("4", 0.6), unanswered_choice: choice("none", 0.9) }, CHOICE, { luna });
+      expect(none.result).toMatchObject({ outcome: "act", operation: "SCROLL_DOWN" });
+      expect(none.result.diag?.gates.some((g) => g.head === "unanswered-choice")).toBe(false);
+    });
+  }
+
+  it("keeps SCROLL without a disabled button, with a checked radio, or with a single radio", async () => {
+    const answers = { ...scroll, click_target: choice("2", 0.7) };
+    const enabled = CHOICE.map((e) => (e.index === 3 ? { ...e, disabled: false } : e));
+    expect((await run(answers, enabled)).result.operation).toBe("SCROLL_DOWN");
+    const checked = CHOICE.map((e) => (e.index === 1 ? { ...e, checked: true } : e));
+    expect((await run(answers, checked)).result.operation).toBe("SCROLL_DOWN");
+    const single = CHOICE.filter((e) => e.index !== 2);
+    expect((await run({ ...scroll, click_target: choice("1", 0.7) }, single)).result.operation).toBe("SCROLL_DOWN");
+  });
+
+  it("keeps SCROLL when recent no-effect clicks already ruled the options out", async () => {
+    const history = [
+      { operation: "CLICK", label: "Standard (no effect)", ok: true, index: 1 },
+      { operation: "CLICK", label: "Extended (no effect)", ok: true, index: 2 },
+    ];
+    const { result } = await run({ ...scroll, click_target: choice("2", 0.7) }, CHOICE, { history });
+    expect(result.operation).toBe("SCROLL_DOWN");
+  });
+
+  it("does not touch a non-scroll operation", async () => {
+    const { result } = await run({ operation: choice("WAIT", 0.9) });
+    expect(result.operation).toBe("WAIT");
+  });
+});
+
+describe("literal-mismatch gate (near-miss numeric option)", () => {
+  const goal = 'Filter the price to "Under 15"';
+  const under20: BrowseStepElement = { index: 1, tag: "div", role: "option", label: "Under 20", ops: ["CLICK"] };
+  const range: BrowseStepElement = { index: 2, tag: "div", role: "option", label: "From 10-15", ops: ["CLICK"] };
+  const maxField: BrowseStepElement = { index: 3, tag: "input", label: "Max price", ops: ["TYPE_TEXT"], value: "" };
+  const op = { operation: choice("CLICK", 0.8, { probabilities: { CLICK: 0.8, TYPE_TEXT: 0.15 } }), click_target: choice("1", 0.8) };
+
+  it("picks the option that holds the exact quoted phrase", async () => {
+    const exact: BrowseStepElement = { index: 4, tag: "div", role: "option", label: "Under 15", ops: ["CLICK"] };
+    const { result } = await decide(op, { goal, elements: [under20, range, exact] });
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 4 });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "literal-mismatch" }));
+  });
+
+  it("falls back to typing the value when only a text field can carry it", async () => {
+    mockFieldText("15");
+    const { result } = await decide({ ...op, type_text_target: choice("3", 0.8) }, { goal, elements: [under20, range, maxField] });
+    expect(result).toMatchObject({ outcome: "act", operation: "TYPE_TEXT", index: 3, text: "15" });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "literal-mismatch" }));
+  });
+
+  it("blocks when the exact option is not offered and nothing can be typed", async () => {
+    const { result } = await decide(op, { goal, elements: [under20, range] });
+    expect(result.outcome).toBe("blocked");
+    expect(result.reason).toContain('the exact option "under 15" is not offered');
+  });
+
+  it("matches numbers across thousands separators and currency marks", async () => {
+    const exact: BrowseStepElement = { index: 4, tag: "div", role: "option", label: "Under $1,500", ops: ["CLICK"] };
+    const near: BrowseStepElement = { index: 1, tag: "div", role: "option", label: "Under $2,000", ops: ["CLICK"] };
+    const { result } = await decide(op, { goal: 'Pick "Under 1500"', elements: [near, exact] });
+    expect(result).toMatchObject({ operation: "CLICK", index: 4 });
+  });
+
+  it("leaves a click alone when the label already has the quoted number or the goal has no number", async () => {
+    const same = await decide({ operation: choice("CLICK", 0.8), click_target: choice("4", 0.8) }, {
+      goal,
+      elements: [under20, { index: 4, tag: "div", role: "option", label: "Under 15", ops: ["CLICK"] }],
+    });
+    expect(same.result).toMatchObject({ operation: "CLICK", index: 4 });
+    expect(same.result.diag?.gates.some((g) => g.head === "literal-mismatch")).toBe(false);
+    const plain = await decide(op, { goal: 'Pick "Under budget"', elements: [under20, range] });
+    expect(plain.result).toMatchObject({ operation: "CLICK", index: 1 });
+    const unquoted = await decide(op, { goal: "Pick Under 15", elements: [under20, range] });
+    expect(unquoted.result).toMatchObject({ operation: "CLICK", index: 1 });
+  });
+
+  it("tells the model that a different number is a different option", async () => {
+    const { captured } = await decide(op, { goal, elements: [under20, range] });
+    expect(JSON.stringify(captured.questions.click_target!.instructions)).toContain("a candidate with a different number is a different option");
+  });
+});
+
+describe("value-already-set gate (retyping what a field holds)", () => {
+  const field = (value: string): BrowseStepElement => ({ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value });
+  const go: BrowseStepElement = { index: 2, tag: "button", label: "Search", ops: ["CLICK"] };
+  const goal = 'Search trains to "Berlin Hauptbahnhof"';
+
+  it("does not retype; continues with the runner-up operation", async () => {
+    mockFieldText("Berlin Hauptbahnhof");
+    const { result } = await decide(
+      { operation: choice("TYPE_TEXT", 0.8, { probabilities: { TYPE_TEXT: 0.8, CLICK: 0.3 } }), type_text_target: choice("1", 0.8), click_target: choice("2", 0.8) },
+      { goal, elements: [field("berlin  Hauptbahnhof"), go] },
+    );
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 2 });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
+  });
+
+  it("ends with DONE rather than BLOCKED when nothing else is left", async () => {
+    mockFieldText("Berlin Hauptbahnhof");
+    const { result } = await decide(
+      { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
+      { goal, elements: [field("Berlin Hauptbahnhof, Germany")] },
+    );
+    expect(result).toMatchObject({ outcome: "done", operation: "DONE" });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
+  });
+
+  it("still types when the field holds a different value", async () => {
+    mockFieldText("Berlin Hauptbahnhof");
+    const { result } = await decide(
+      { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
+      { goal, elements: [field("Munich")] },
+    );
+    expect(result).toMatchObject({ outcome: "act", operation: "TYPE_TEXT", index: 1, text: "Berlin Hauptbahnhof" });
+  });
+
+  it("still types a short value (under 3 characters) into a field that holds it", async () => {
+    mockFieldText("LA");
+    const { result } = await decide(
+      { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
+      { goal: 'Search "LA"', elements: [field("LA")] },
+    );
+    expect(result).toMatchObject({ operation: "TYPE_TEXT", text: "LA" });
+  });
+});

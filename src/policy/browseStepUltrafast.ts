@@ -97,12 +97,16 @@ const NEXT_ACTION_RULES = [
   "BLOCKED means no supported operation can make progress, or the page needs credentials the user must enter themselves.",
 ].join("\n");
 
+const LITERAL_VALUE_RULE =
+  "If the goal quotes a value, a candidate with a different number is a different option — do not pick it as a near match.";
+
 // questions.py TARGET.
 const TARGET_RULES = [
   "Choose the best observed target if the next operation is the one specified in this question.",
   "Use the user's entire goal, field values, nearby text, and recent actions. This question chooses only",
   "a target for that operation; another question decides which operation to execute. Do not choose",
   "a field that already contains the requested value. Choose only an offered element index.",
+  LITERAL_VALUE_RULE,
 ].join(" ");
 
 const OPERATION_LABELS: Record<Exclude<BrowseOperation, "DONE" | "BLOCKED">, string> = {
@@ -149,6 +153,7 @@ function lunaInstructions(goal: string, head?: TargetHead, vision = false, calen
     `Goal: ${goal}\n\nChoose only the next single step. Do not repeat an action that already had no effect or was just repeated.\n${COMMIT_EFFECT_RULE}\n${DONE_COMMIT_RULE}\n${DISABLED_CONTROL_RULE}` +
     (head ? "" : `\n${DONE_WHEN_RULE}`) +
     (head ? `\nChoose the target element for the operation ${head}.` : "") +
+    (head ? `\n${LITERAL_VALUE_RULE}` : "") +
     (calendar ? `\n${CALENDAR_HINT}` : "") +
     (modal ? `\n${MODAL_NOTE}` : "") +
     (vision ? `\n${SCREENSHOT_NOTE.screenshot_note}` : "")
@@ -196,6 +201,91 @@ function quotedPhrases(goal: string): string[] {
   }
   return out;
 }
+
+/** Numbers in a text, thousands separators and currency marks ignored. */
+function numberTokens(text: string): string[] {
+  const t = text.toLowerCase().replace(/(?<=\d)[,.\u202f\u00a0 ](?=\d{3}(?!\d))/g, "");
+  return [...t.matchAll(/\d+(?:[.,]\d+)?/g)].map((m) => m[0].replace(",", "."));
+}
+
+/** The words of a text without its numbers, currency marks or punctuation. */
+function wordTokens(text: string): string[] {
+  return foldWords(text.replace(/\d+(?:[.,]\d+)?/g, " ").replace(/\p{Sc}/gu, " ")).split(" ").filter(Boolean);
+}
+
+/** The text with thousands separators and currency marks dropped, for an exact-phrase match. */
+function literalForm(text: string): string {
+  return normalize(text.replace(/\p{Sc}/gu, "").replace(/(?<=\d)[,.\u202f\u00a0 ](?=\d{3}(?!\d))/g, ""));
+}
+
+/** The digit-bearing quoted phrases of a goal (goal clauses stripped). */
+function numericQuotedPhrases(goal: string): string[] {
+  return quotedPhrases(stripGoalClauses(goal)).filter((p) => /\d/.test(p));
+}
+
+/** The quoted number-bearing phrase a label nearly matches: same words,
+ * different numbers ("under 20" for a goal that quotes "Under 15"). */
+function nearMissPhrase(goal: string, label: string): string | undefined {
+  const labelNums = numberTokens(label);
+  if (labelNums.length === 0) return undefined;
+  const labelWords = new Set(wordTokens(label));
+  return numericQuotedPhrases(goal).find((phrase) => {
+    const words = wordTokens(phrase);
+    if (words.length === 0 || !words.every((w) => labelWords.has(w))) return false;
+    const a = numberTokens(phrase).join("|");
+    return a !== labelNums.join("|") && !literalForm(label).includes(literalForm(phrase));
+  });
+}
+
+const OPTION_ROLE_RE = /^(option|menuitem|menuitemradio|menuitemcheckbox|radio|checkbox)$/;
+const SHORT_OPTION_LABEL_CHARS = 40;
+
+function isOptionLike(el: BrowseStepElement): boolean {
+  return OPTION_ROLE_RE.test(el.role ?? "") || el.label.length <= SHORT_OPTION_LABEL_CHARS;
+}
+
+const RADIO_ROLES = new Set(["radio", "menuitemradio"]);
+const BUTTON_ROLES = new Set(["button", "link"]);
+
+/** A disabled control that looks like a button (Continue, Next, Submit). */
+function isDisabledButton(el: BrowseStepElement): boolean {
+  if (el.disabled !== true) return false;
+  if (el.role) return BUTTON_ROLES.has(el.role);
+  return el.tag === "button" || el.tag === "a";
+}
+
+/** The first run of >= 2 adjacent radio-like options, none checked, that no
+ * recent no-effect click rules out; its options, or [] when there is none. */
+function unansweredRadioRun(
+  elements: BrowseStepElement[],
+  history: BrowseStepInput["history"],
+  excluded: Set<number>,
+): BrowseStepElement[] {
+  const landedNoEffect = (el: BrowseStepElement) =>
+    excluded.has(el.index) || history.some((_, i) => repeatsNoEffectClick(history.slice(0, i + 1), el));
+  let run: BrowseStepElement[] = [];
+  const done = (): BrowseStepElement[] | undefined => {
+    const open = run.filter((el) => !el.disabled && el.ops.includes("CLICK") && !landedNoEffect(el));
+    const ok = run.length >= 2 && run.every((el) => el.checked !== true) && open.length >= 2;
+    return ok ? open : undefined;
+  };
+  for (const el of elements) {
+    if (RADIO_ROLES.has(el.role ?? "")) {
+      run.push(el);
+      continue;
+    }
+    const found = done();
+    if (found) return found;
+    run = [];
+  }
+  return done() ?? [];
+}
+
+/** The unanswered-choice question needs at least this much probability. */
+export const UNANSWERED_CHOICE_MIN_PEAK = 0.5;
+
+const UNANSWERED_CHOICE_RULE =
+  "Required options are still unanswered above a disabled control. Pick the option the goal asks for; if the goal does not mention this choice, decline an optional extra; otherwise take the standard or no-cost option.";
 
 /** True when the current sub-goal already landed a TYPE_TEXT into a field
  * with this label (entries carried over from an earlier sub-goal ignored). */
@@ -1020,14 +1110,14 @@ export async function decideBrowseStepUltrafast(
   let model: string;
   let answers: Partial<Record<string, SystemOneAnswer>>;
   const jevStart = Date.now();
+  const stateObject = {
+    page: { url: scrubPii(input.url), title: scrubPii(input.title), text: pageText },
+    elements: elements.map((el) => stateElement(el, input.history)),
+    recent_actions: history,
+    ...(input.scroll ? { scroll: input.scroll } : {}),
+    ...(modalName ? { open_dialog: modalName } : {}),
+  };
   try {
-    const stateObject = {
-      page: { url: scrubPii(input.url), title: scrubPii(input.title), text: pageText },
-      elements: elements.map((el) => stateElement(el, input.history)),
-      recent_actions: history,
-      ...(input.scroll ? { scroll: input.scroll } : {}),
-      ...(modalName ? { open_dialog: modalName } : {}),
-    };
     const result = await client.evaluate({
       state: vision
         ? [JSON.stringify(stateObject), { type: "image_url", image_url: { url: input.screenshot } }]
@@ -1130,8 +1220,15 @@ export async function decideBrowseStepUltrafast(
   }
 
   const head = targetHeadFor(operation);
-  if (!head) return finish({ outcome: "act", operation, confidence, model });
+  if (!head) {
+    if (operation.startsWith("SCROLL_")) {
+      const picked = await unansweredChoiceBeforeDisabledButton();
+      if (picked) return picked;
+    }
+    return finish({ outcome: "act", operation, confidence, model });
+  }
 
+  let literalTypeTried = false;
   const targetAnswer = choiceAnswer(answers[TARGET_QUESTION_ID[head]]);
   if (luna && targetAnswer?.choice === NONE_KEY) {
     // The model says no candidate fits this operation: take its next-best
@@ -1145,6 +1242,45 @@ export async function decideBrowseStepUltrafast(
     return decideTarget(alt as BrowseOperation, altHead, choiceAnswer(answers[TARGET_QUESTION_ID[altHead]]), altConfidence);
   }
   return decideTarget(operation, head, targetAnswer);
+
+  /** A SCROLL while required radio options sit unanswered next to a disabled
+   * button: the scroll cannot enable the button, answering the choice can.
+   * Clicks the model's own click target when it is one of the options, else
+   * asks one narrow question limited to them. Anything unsure keeps SCROLL. */
+  async function unansweredChoiceBeforeDisabledButton(): Promise<BrowseStepResult | undefined> {
+    if (!elements.some(isDisabledButton)) return undefined;
+    const options = unansweredRadioRun(elements, input.history, noEffectExcluded);
+    if (options.length < 2) return undefined;
+    const fire = (el: BrowseStepElement, peak: number, conf: number, reason: string): BrowseStepResult => {
+      gates.push({ head: "unanswered-choice", peak, threshold: UNANSWERED_CHOICE_MIN_PEAK, jevPick: operation });
+      ruleTier = true;
+      return finish({ outcome: "act", operation: "CLICK", index: el.index, confidence: conf, model, reason });
+    };
+    const reason = "required options are unanswered and the button is disabled: answer the choice instead of scrolling";
+    const own = choiceAnswer(answers[TARGET_QUESTION_ID.CLICK]);
+    const ownEl = own ? options.find((el) => String(el.index) === own.choice) : undefined;
+    if (own && ownEl) return fire(ownEl, peakProbability(own), own.confidence, reason);
+    const criteria: Record<string, Record<string, unknown> | string> = {};
+    for (const el of options) criteria[String(el.index)] = targetCriterion(el);
+    if (luna) criteria[NONE_KEY] = NONE_LABEL;
+    const instructions = luna
+      ? `${lunaInstructions(goal, "CLICK", vision, false, modalName !== undefined)}\n${UNANSWERED_CHOICE_RULE}`
+      : { goal, operation: "CLICK", rules: [TARGET_RULES, DISABLED_CONTROL_RULE, UNANSWERED_CHOICE_RULE] };
+    let answer: SystemOneChoiceAnswer | null;
+    try {
+      const res = await client.evaluate({
+        state: stateObject,
+        questions: { unanswered_choice: { type: "choice", criteria, instructions } },
+        signal: AbortSignal.timeout(BROWSE_STEP_TIMEOUT_MS),
+      });
+      answer = choiceAnswer(res.answers.unanswered_choice);
+    } catch {
+      return undefined;
+    }
+    const el = answer ? options.find((e) => String(e.index) === answer!.choice) : undefined;
+    if (!answer || !el || peakProbability(answer) < UNANSWERED_CHOICE_MIN_PEAK) return undefined;
+    return fire(el, peakProbability(answer), answer.confidence, reason);
+  }
 
   async function decideTarget(
     operation: BrowseOperation,
@@ -1160,6 +1296,38 @@ export async function decideBrowseStepUltrafast(
 
   if (operation === "SELECT") {
     return finish({ outcome: "act", operation, index: target.index, text: target.option, confidence: stepConfidence, model });
+  }
+  if (operation === "CLICK" && isOptionLike(el)) {
+    const phrase = nearMissPhrase(goal, el.label);
+    if (phrase !== undefined) {
+      // The goal quotes a value; this option has the same words but another
+      // number. Prefer an option that holds the exact phrase, then a field to
+      // type the value into; never settle for the near match.
+      const exact = [...targets.CLICK.values()]
+        .map((t) => elements.find((e) => e.index === t.index))
+        .filter((e): e is BrowseStepElement => !!e && isOptionLike(e) && literalForm(e.label).includes(literalForm(phrase)))
+        .sort((a, b) => (targetAnswer.probabilities[String(b.index)] ?? 0) - (targetAnswer.probabilities[String(a.index)] ?? 0))[0];
+      gates.push({ head: "literal-mismatch", peak: peakProbability(targetAnswer), threshold: 0, jevPick: `CLICK ${target.index}` });
+      ruleTier = true;
+      if (exact) {
+        return finish({
+          outcome: "act",
+          operation,
+          index: exact.index,
+          confidence: stepConfidence,
+          model,
+          reason: `the goal quotes "${truncateLabel(phrase, 60)}": picked the option that says so`,
+        });
+      }
+      if (!literalTypeTried) {
+        literalTypeTried = true;
+        const alt = pickRunnerUp({ minP: 0, requireTarget: true, exclude: (op) => op !== "TYPE_TEXT" });
+        if (alt) {
+          return decideTarget("TYPE_TEXT", "TYPE_TEXT", choiceAnswer(answers[TARGET_QUESTION_ID.TYPE_TEXT]), opProbabilities[alt] ?? 0);
+        }
+      }
+      return finish(blocked(`the exact option "${truncateLabel(phrase, 60)}" is not offered`, model, stepConfidence));
+    }
   }
   if (operation === "CLICK" && luna) {
     // Luna never submits a typed query (PRESS_ENTER 0.03 vs Jev 0.65 after
@@ -1304,7 +1472,9 @@ export async function decideBrowseStepUltrafast(
     return finish(retry(`failed to write text for "${el.label}": ${err instanceof Error ? err.message : String(err)}`, model, stepConfidence));
   }
   timings.textMs = Date.now() - textStart;
-  if (text === null) {
+  const norm = (v: string) => normalize(v);
+  const alreadySet = text !== null && norm(text).length >= 3 && norm(el.value ?? "").includes(norm(text));
+  if (text === null || alreadySet) {
     // No text to type is not a dead end: continue with the best other
     // non-terminal operation that has a real target (or needs none).
     // Pending suggestions keep their own rule: stay BLOCKED rather than guess.
@@ -1322,11 +1492,24 @@ export async function decideBrowseStepUltrafast(
         });
     if (alt) {
       const altP = opProbabilities[alt] ?? 0;
-      gates.push({ head: "no-text-runner-up", peak: altP, threshold: NO_TEXT_RUNNER_UP_MIN_PROBABILITY, jevPick: operation });
+      gates.push({ head: alreadySet ? "value-already-set" : "no-text-runner-up", peak: altP, threshold: NO_TEXT_RUNNER_UP_MIN_PROBABILITY, jevPick: operation });
       ruleTier = true;
       const altHead = targetHeadFor(alt as BrowseOperation);
       if (!altHead) return finish({ outcome: "act", operation: alt as BrowseOperation, confidence: altP, model });
       return decideTarget(alt as BrowseOperation, altHead, choiceAnswer(answers[TARGET_QUESTION_ID[altHead]]), altP);
+    }
+    if (alreadySet) {
+      // Nothing else to do on the page: the field already holds the value, so
+      // retyping would change nothing. End the sub-goal instead of BLOCKED.
+      gates.push({ head: "value-already-set", peak: peakProbability(targetAnswer), threshold: 0, jevPick: `TYPE_TEXT ${target.index}` });
+      ruleTier = true;
+      return finish({
+        outcome: "done",
+        operation: "DONE",
+        confidence: stepConfidence,
+        model,
+        reason: `the field "${truncateLabel(el.label, 60)}" already holds the value`,
+      });
     }
     return finish(blocked(`the goal gives no value for the field "${truncateLabel(el.label, 60)}"`, model, stepConfidence));
   }

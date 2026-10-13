@@ -572,7 +572,7 @@ export interface BrowseStepResult {
  * (never its label) for "select", and the chosen CANDIDATE'S INDEX (never
  * its text — `"none"` is a valid pick) for "text". */
 export interface BrowseStepGateDiag {
-  head: "op" | "target" | "select" | "text" | "suggestion" | "none" | "enter" | "refocus-type" | "already-done" | "done-after-no-effect" | "no-text-runner-up" | "click-empty-field-typed" | "repeat-no-effect" | "retype-shorten";
+  head: "op" | "target" | "select" | "text" | "suggestion" | "none" | "enter" | "refocus-type" | "already-done" | "done-after-no-effect" | "no-text-runner-up" | "click-empty-field-typed" | "repeat-no-effect" | "retype-shorten" | "unanswered-choice" | "literal-mismatch" | "value-already-set";
   peak: number;
   threshold: number;
   jevPick: string;
