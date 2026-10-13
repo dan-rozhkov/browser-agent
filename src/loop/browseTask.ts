@@ -1080,6 +1080,8 @@ interface PendingEffect {
   result: unknown;
   step: TranscriptStep;
   hist: StepHistoryEntry;
+  /** The clicked choice control as the click saw it (its `checked` before). */
+  choice?: ChoiceTarget | null;
 }
 
 function actedElementOf(snapshot: SnapshotResult, index: number | undefined): ActedElement | undefined {
@@ -1109,11 +1111,28 @@ function relabelOf(acted: ActedElement, next: SnapshotResult): { old: string; ne
 /** Appends the effect note to the recorded CLICK (transcript + history). */
 function applyPendingEffect(pending: PendingEffect, next: SnapshotResult): BecameLabel | undefined {
   const { note, became } = describeEffectDetailed(pending.prev, next, pending.acted, pending.result);
-  if (!note) return undefined;
-  const label = appendKeepingSuffix(pending.step.label, note, HISTORY_LABEL_MAX_CHARS);
-  pending.step.label = label;
-  pending.hist.label = label;
-  return became;
+  let label = pending.step.label;
+  if (note) label = appendKeepingSuffix(label, note, HISTORY_LABEL_MAX_CHARS);
+  const toggled = toggleNoteOf(pending.choice, next, pending.acted?.index);
+  if (toggled) label = appendKeepingSuffix(label, toggled, HISTORY_LABEL_MAX_CHARS);
+  if (label !== pending.step.label) {
+    pending.step.label = label;
+    pending.hist.label = label;
+  }
+  return note ? became : undefined;
+}
+
+/** " → now checked" / " → now unchecked" when the clicked choice control
+ * flipped between the click's snapshot and `next` (same index and role; the
+ * label equal or differing only in digits and punctuation). The policy reads
+ * this in its history, so it need not guess whether a click toggled. */
+function toggleNoteOf(before: ChoiceTarget | null | undefined, next: SnapshotResult, index: number | undefined): string | null {
+  if (!before || before.checked === undefined) return null;
+  const now = choiceTargetOf(next, index);
+  if (!now || now.checked === undefined || now.role !== before.role || now.checked === before.checked) return null;
+  const letters = (t: string): string => t.replace(/[^\p{L}]+/gu, "").toLowerCase();
+  if (now.label !== before.label && letters(now.label) !== letters(before.label)) return null;
+  return now.checked ? " → now checked" : " → now unchecked";
 }
 
 /** Sub-goal bookkeeping shared with the caller: `seed` goes in front of the
@@ -1320,37 +1339,52 @@ export async function runBrowseTaskLoop(
    * (see pickerClickOf) — a picker may still be open and apply
    * its selection only once closed. Any other landed step clears it. */
   let lastPickerClick: PickerClick | null = null;
-  /** Toggle controls (role+label) this run's own landed click turned ON. A
-   * second click on one still checked would toggle it back off. */
+  /** Toggle controls (url + role + label) this run's own landed click turned
+   * ON. A second click on one still checked would toggle it back off. Safety
+   * net behind the " → now checked" history note; cleared on a URL change or
+   * a landed TYPE_TEXT (a typed-into list re-marks its active row). */
   const turnedOn = new Set<string>();
+  let turnedOnUrl = "";
+  const syncTurnedOn = (url: string): void => {
+    const here = comparableUrl(url);
+    if (here !== turnedOnUrl) turnedOn.clear();
+    turnedOnUrl = here;
+  };
+  const toggleKey = (snapshot: SnapshotResult, t: ChoiceTarget): string =>
+    `${comparableUrl(snapshot.url)}\u0000${t.role || t.inputType}\u0000${t.label.trim().replace(/\s+/g, " ").toLowerCase()}`;
   /** Consecutive clicks suppressed by that guard (a policy that insists). */
   let toggleSuppressed = 0;
   /** True when the sub-goal action asks to remove a selection. */
-  const wantsUncheck = UNCHECK_INTENT.test(subGoalAction(goal));
+  const wantsUncheck = UNCHECK_INTENT.test(subGoalAction(subGoalOfGoal(goal)));
   /** Records the "already selected" step instead of a toggling click. */
   const suppressToggleClick = (snapshot: SnapshotResult, index: number | undefined): Transcript | typeof SUPPRESSED | null => {
-    const toggle = toggleTargetOf(snapshot, index);
-    if (wantsUncheck || !toggle || toggle.checked !== true || !turnedOn.has(toggle.key)) return null;
+    const toggle = choiceTargetOf(snapshot, index);
+    if (wantsUncheck || !toggle || toggle.isRadio || toggle.checked !== true) return null;
+    syncTurnedOn(snapshot.url);
+    if (!turnedOn.has(toggleKey(snapshot, toggle))) return null;
     toggleSuppressed++;
-    const stalled = note({
-      operation: "CLICK",
-      label: `${toggle.label} — already selected, not clicking again`,
-      // The first suppression is a rule step; a policy that insists counts as unproductive.
-      ok: toggleSuppressed <= 1,
-      index,
-      via: "rule",
-    });
-    if (stalled) return stalled;
+    const label = `${toggle.label} — already selected, not clicking again`;
+    if (toggleSuppressed <= 1) {
+      // A rule step off the stall counters, like the quantity veto.
+      const rec = recordStep(steps, history, { operation: "CLICK", label, ok: true, index, via: "rule", ...(pendingShot ?? {}) });
+      pendingShot = undefined;
+      stepUrls.set(rec.step, lastUrl);
+    } else {
+      // A policy that insists counts as unproductive.
+      const stalled = note({ operation: "CLICK", label, ok: false, index, via: "rule" });
+      if (stalled) return stalled;
+    }
     lastPickerClick = pickerClickOf(snapshot, index);
     return SUPPRESSED;
   };
   /** After a landed CLICK on a toggle: remember whether it turned on or off. */
   const trackToggle = (snapshot: SnapshotResult, index: number | undefined): void => {
-    toggleSuppressed = 0;
-    const toggle = toggleTargetOf(snapshot, index);
-    if (!toggle) return;
-    if (toggle.checked === false) turnedOn.add(toggle.key);
-    else if (toggle.checked === true) turnedOn.delete(toggle.key);
+    const toggle = choiceTargetOf(snapshot, index);
+    if (!toggle || toggle.isRadio) return;
+    syncTurnedOn(snapshot.url);
+    const key = toggleKey(snapshot, toggle);
+    if (toggle.checked === false) turnedOn.add(key);
+    else if (toggle.checked === true) turnedOn.delete(key);
   };
   /** One-shot guard: the loop closes an open popup at most once before
    * accepting DONE (a second DONE is taken as is). */
@@ -1437,6 +1471,7 @@ export async function runBrowseTaskLoop(
     if (cycle) return cycle;
     if (entry.ok) {
       unproductive = 0;
+      toggleSuppressed = 0;
       lastLandedOperation = entry.operation;
       lastPickerClick = null;
       return null;
@@ -1543,6 +1578,7 @@ export async function runBrowseTaskLoop(
     }
 
     lastUrl = snapshot.url;
+    syncTurnedOn(snapshot.url);
     lastTitle = snapshot.title;
 
     // The landed CLICK's effect suffix is now part of its label, so a cycle
@@ -1628,20 +1664,26 @@ export async function runBrowseTaskLoop(
               via: "cache",
             });
             stepUrls.set(recorded.step, lastUrl);
-            markPageState(recorded.step, cached.operation, snapshot, cachedIndex, lastUrl);
-            if (cached.operation === "CLICK") {
+            // A click that opened a tab left this page: the new tab's snapshot
+            // says nothing about the control that was clicked here.
+            const replayOpenedTab = hasOpenedTab(replay.result);
+            if (!replayOpenedTab) markPageState(recorded.step, cached.operation, snapshot, cachedIndex, lastUrl);
+            if (cached.operation === "CLICK" && !replayOpenedTab) {
               pendingEffect = {
                 prev: snapshot,
                 acted: actedElementOf(snapshot, cachedIndex),
                 result: replay.result,
                 step: recorded.step,
                 hist: recorded.hist,
+                choice: choiceTargetOf(snapshot, cachedIndex),
               };
             }
             unproductive = 0;
+            toggleSuppressed = 0;
             lastLandedOperation = cached.operation;
-            lastPickerClick = cached.operation === "CLICK" ? pickerClickOf(snapshot, cachedIndex) : null;
-            if (cached.operation === "CLICK") trackToggle(snapshot, cachedIndex);
+            lastPickerClick = cached.operation === "CLICK" && !replayOpenedTab ? pickerClickOf(snapshot, cachedIndex) : null;
+            if (cached.operation === "CLICK" && !replayOpenedTab) trackToggle(snapshot, cachedIndex);
+            if (cached.operation === "TYPE_TEXT") turnedOn.clear();
             if (cached.operation === "TYPE_TEXT" && cachedIndex != null) {
               lastTypeText = { index: cachedIndex, text: readTextFromRange(goal, cached.textRange) ?? "" };
             }
@@ -2060,13 +2102,17 @@ export async function runBrowseTaskLoop(
             }
       );
       if (stalled) return stalled;
+      // A click that opened a tab left this page: the new tab's snapshot says
+      // nothing about the control that was clicked here, so none of the
+      // post-click bookkeeping below applies (the cache write still does).
+      const openedTab = hasOpenedTab(performed);
       if (!rejected && !noEffect && lastRecorded) {
-        markPageState((lastRecorded as { step: TranscriptStep }).step, operation, snapshot, decision.index, lastUrl);
-        lastPickerClick = operation === "CLICK" ? pickerClickOf(snapshot, decision.index) : null;
-        if (operation === "CLICK") trackToggle(snapshot, decision.index);
+        if (!openedTab) markPageState((lastRecorded as { step: TranscriptStep }).step, operation, snapshot, decision.index, lastUrl);
+        lastPickerClick = operation === "CLICK" && !openedTab ? pickerClickOf(snapshot, decision.index) : null;
+        if (operation === "CLICK" && !openedTab) trackToggle(snapshot, decision.index);
       }
       // A landed CLICK: the next snapshot tells what it did (effect note).
-      if (operation === "CLICK" && !rejected && !noEffect && (lastRecorded as { step: TranscriptStep; hist: StepHistoryEntry } | null)) {
+      if (operation === "CLICK" && !rejected && !noEffect && !openedTab && (lastRecorded as { step: TranscriptStep; hist: StepHistoryEntry } | null)) {
         const rec = lastRecorded as unknown as { step: TranscriptStep; hist: StepHistoryEntry };
         pendingEffect = {
           prev: snapshot,
@@ -2074,11 +2120,13 @@ export async function runBrowseTaskLoop(
           result: performed,
           step: rec.step,
           hist: rec.hist,
+          choice: choiceTargetOf(snapshot, decision.index),
         };
       }
       // Track the just-landed TYPE_TEXT for the next iteration's dedup
       // rule above — only on a genuinely landed (not rejected, not
       // no-effect) TYPE_TEXT.
+      if (operation === "TYPE_TEXT" && !rejected && !noEffect) turnedOn.clear();
       if (operation === "TYPE_TEXT" && !rejected && !noEffect && decision.index != null) {
         lastTypeText = { index: decision.index, text: decision.text ?? "" };
       }
@@ -2317,9 +2365,13 @@ function subGoalAction(subGoal: string): string {
  * part is the text before the first marker; the condition is the "Done when"
  * clause only ("Does not count" says what to ignore, not what to reach). */
 const DONE_WHEN_CLAUSE = /\bdone\s+when\s*:([\s\S]*?)(?=\bdoes\s+not\s+count\s*:|$)/i;
-function quantityTargetOf(goal: string): TargetQuantity | null {
+/** The goal without its "Already done earlier" list. */
+function subGoalOfGoal(goal: string): string {
   const cut = goal.indexOf(ALREADY_DONE_MARKER);
-  const subGoal = cut >= 0 ? goal.slice(0, cut) : goal;
+  return cut >= 0 ? goal.slice(0, cut) : goal;
+}
+function quantityTargetOf(goal: string): TargetQuantity | null {
+  const subGoal = subGoalOfGoal(goal);
   const m = SUBGOAL_CONDITION_MARKER.exec(subGoal);
   if (!m) return parseTarget(subGoal, "");
   return parseTarget(subGoal.slice(0, m.index), DONE_WHEN_CLAUSE.exec(subGoal)?.[1] ?? "");
@@ -2399,45 +2451,53 @@ interface PickerClick {
 }
 
 const SUPPRESSED = Symbol("toggle click suppressed");
-const UNCHECK_INTENT = /(?<!\p{L})(?:remove|uncheck|un-check|deselect|de-select|unselect|clear|turn\s+off|untick|снять|убрать|сбросить|отключи)/iu;
-const TOGGLE_ROLES = new Set(["option", "menuitemcheckbox", "menuitemradio", "checkbox", "switch"]);
+const UNCHECK_INTENT = /(?<!\p{L})(?:remove|uncheck|un-check|deselect|de-select|unselect|clear|turn\s+off|untick|снять|убрать|сбросить|отключи)(?!\p{L})/iu;
+const CHOICE_CONTROL_ROLES = new Set(["option", "menuitemcheckbox", "menuitemradio", "checkbox", "switch", "radio"]);
+const PICKER_LISTED_ROLES = new Set(["option", "menuitemcheckbox"]);
 
-/** The element at `index` when a click toggles it (a checkable choice role,
- * or a native checkbox/radio), with its `checked` state in the snapshot. */
-function toggleTargetOf(
-  snapshot: SnapshotResult,
-  index: number | undefined
-): { key: string; label: string; checked: boolean | undefined } | null {
+/** A choice control: a checkable role or a native checkbox/radio input. */
+interface ChoiceTarget {
+  role: string;
+  /** Native input type when role-less ("checkbox" / "radio"), else "". */
+  inputType: string;
+  label: string;
+  /** Undefined when the snapshot reports no on/off state. */
+  checked: boolean | undefined;
+  /** A radio never turns off by being clicked again. */
+  isRadio: boolean;
+  isNativeInput: boolean;
+}
+
+/** The element at `index` as a choice control, or null. One classifier for
+ * the picker-close guard and the toggle guard / " → now checked" note. */
+function choiceTargetOf(snapshot: SnapshotResult, index: number | undefined): ChoiceTarget | null {
   if (index == null) return null;
   const el = findElementByIndex(snapshot.elements, index) as
     | { role?: unknown; tag?: unknown; inputType?: unknown; label?: unknown; checked?: unknown }
     | undefined;
-  if (!el || typeof el.label !== "string") return null;
+  if (!el) return null;
   const role = elementRole(el);
   const native = !role && el.tag === "input" && (el.inputType === "checkbox" || el.inputType === "radio");
-  if (!TOGGLE_ROLES.has(role) && !native) return null;
+  if (!CHOICE_CONTROL_ROLES.has(role) && !native) return null;
+  const inputType = native ? String(el.inputType) : "";
   return {
-    key: `${role || String(el.inputType)}\u0000${el.label}`,
-    label: el.label,
+    role,
+    inputType,
+    label: typeof el.label === "string" ? el.label : "",
     checked: typeof el.checked === "boolean" ? el.checked : undefined,
+    isRadio: role === "radio" || role === "menuitemradio" || inputType === "radio",
+    isNativeInput: native,
   };
 }
-
-const PICKER_LISTED_ROLES = new Set(["option", "menuitemcheckbox"]);
 
 /** The element at `index` as a picker choice click, or null when it is not
  * one. A radio / single-choice control closes its own list. */
 function pickerClickOf(snapshot: SnapshotResult, index: number | undefined): PickerClick | null {
-  if (index == null) return null;
-  const el = findElementByIndex(snapshot.elements, index) as
-    | { role?: unknown; tag?: unknown; inputType?: unknown; label?: unknown }
-    | undefined;
-  if (!el) return null;
-  const role = elementRole(el);
-  const label = typeof el.label === "string" ? el.label : "";
-  if (PICKER_LISTED_ROLES.has(role)) return { role, label, checkbox: false };
-  if (role === "checkbox" || (!role && el.tag === "input" && el.inputType === "checkbox")) {
-    return { role: role || "checkbox", label, checkbox: true };
+  const t = choiceTargetOf(snapshot, index);
+  if (!t) return null;
+  if (PICKER_LISTED_ROLES.has(t.role)) return { role: t.role, label: t.label, checkbox: false };
+  if (t.role === "checkbox" || t.inputType === "checkbox") {
+    return { role: t.role || "checkbox", label: t.label, checkbox: true };
   }
   return null;
 }

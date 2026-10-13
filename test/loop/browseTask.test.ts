@@ -761,6 +761,103 @@ describe("browse_task", () => {
       expect(t.steps.some((s) => /already selected/.test(s.label))).toBe(false);
     });
 
+    it("tells the policy the click flipped the control: ' → now checked' / ' → now unchecked' in the history label", async () => {
+      stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE, DONE]);
+      const { perform, snapshot } = togglingPage(false);
+      const t = await runBrowseTaskLoop("Uncheck Red", 12, stubBrowser({ perform, snapshot }));
+      expect(t.steps[0]!.label).toMatch(/ → now checked$/);
+      expect(t.steps[1]!.label).toMatch(/ → now unchecked$/);
+    });
+
+    it("never suppresses radios (a checked radio stays checked when clicked)", async () => {
+      for (const el of [
+        { index: 0, tag: "input", inputType: "radio", label: "Red", ops: ["CLICK"] },
+        { index: 0, tag: "div", role: "radio", label: "Red", ops: ["CLICK"] },
+        { index: 0, tag: "div", role: "menuitemradio", label: "Red", ops: ["CLICK"] },
+      ]) {
+        stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE]);
+        let on = false;
+        const perform = vi.fn(async () => {
+          on = true;
+          return {};
+        });
+        const snapshot = async () => pageOf([{ ...el, checked: on }]);
+        const t = await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot }));
+        expect(perform).toHaveBeenCalledTimes(2);
+        expect(t.steps.some((s) => /already selected/.test(s.label))).toBe(false);
+      }
+    });
+
+    it("forgets what it turned on after a URL change", async () => {
+      stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE, DONE]);
+      let on = false;
+      let url = "https://example.com/list";
+      const perform = vi.fn(async () => {
+        on = !on;
+        if (!on) return {};
+        // after the first click the page navigates away and back with the box still checked
+        url = "https://example.com/other";
+        return {};
+      });
+      let calls = 0;
+      const snapshot = async () => {
+        calls++;
+        if (calls === 3) url = "https://example.com/list";
+        return { ...pageOf([optionAt(on), MENU]), url } as SnapshotResult;
+      };
+      await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot }));
+      expect(perform).toHaveBeenCalledTimes(2);
+    });
+
+    it("forgets what it turned on after a landed TYPE_TEXT", async () => {
+      const type = { outcome: "act", operation: "TYPE_TEXT", index: 2, text: "re", confidence: 0.9, model: "jev" };
+      stubFetchSequence([CLICK_STEP, type, CLICK_STEP, DONE, DONE]);
+      let on = false;
+      const input = { index: 2, tag: "input", label: "Search colors", ops: ["TYPE_TEXT"] };
+      const perform = vi.fn(async (a: { operation: string }) => {
+        if (a.operation === "CLICK") on = !on;
+        return {};
+      });
+      const snapshot = async () => pageOf([optionAt(on), MENU, input]);
+      await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot }));
+      expect(perform.mock.calls.filter((c) => c[0].operation === "CLICK")).toHaveLength(2);
+    });
+
+    it("reads only the action: 'Already done earlier' tail and words like 'Clearance' do not lift the guard", async () => {
+      for (const goal of [
+        "filter by red\n\nAlready done earlier (do not redo): remove old filters.",
+        "tick the Clearance box",
+      ]) {
+        stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE, DONE]);
+        const { perform, snapshot } = togglingPage(false);
+        await runBrowseTaskLoop(goal, 12, stubBrowser({ perform, snapshot, act: vi.fn(async () => ({})) }));
+        expect(perform).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it("a landed step resets the suppression streak: the second suppression after a landed step is still ok", async () => {
+      stubFetchSequence([CLICK_STEP, CLICK_STEP, PRESS_ESCAPE_STEP, CLICK_STEP, DONE, DONE]);
+      const { perform, snapshot } = togglingPage(false);
+      const act = vi.fn(async () => ({}));
+      const t = await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot, act }));
+      const supp = t.steps.filter((s) => /already selected/.test(s.label));
+      expect(supp.length).toBe(2);
+      expect(supp.every((s) => s.ok)).toBe(true);
+    });
+
+    it("skips toggle bookkeeping when the click opened a tab", async () => {
+      stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE, DONE]);
+      let on = false;
+      const perform = vi.fn(async () => {
+        on = true;
+        return { changed: false, openedTab: { url: "https://example.com/new", title: "New" } };
+      });
+      const snapshot = async () => pageOf([optionAt(on), MENU]);
+      const t = await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot }));
+      expect(perform).toHaveBeenCalledTimes(2);
+      expect(t.steps[0]!.label).not.toMatch(/now checked|already selected/);
+    });
+
     it("does not suppress an option the page checked itself", async () => {
       stubFetchSequence([CLICK_STEP, DONE, DONE]);
       const { perform, snapshot } = togglingPage(true);
