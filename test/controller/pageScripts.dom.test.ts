@@ -103,6 +103,34 @@ describe("SIGNATURE_JS controlsHash", () => {
     expect(signature("after").controlsHash).not.toBe(before.controlsHash);
   });
 
+  it("scopes to a big overlay-positioned dialog without aria-modal, not to a small one", () => {
+    const orig = Element.prototype.getBoundingClientRect;
+    const rectFor = (el: Element) => {
+      const big = el.id === "big";
+      const w = big ? window.innerWidth : 100;
+      const h = big ? window.innerHeight : 20;
+      return { x: 0, y: 0, top: 0, left: 0, right: w, bottom: h, width: w, height: h, toJSON() {} } as DOMRect;
+    };
+    Element.prototype.getBoundingClientRect = function () {
+      return rectFor(this);
+    };
+    try {
+      document.body.innerHTML =
+        '<input id="out" value="1"><div id="big" role="dialog" style="position:fixed"><input value="2"></div>';
+      const before = signature("before");
+      (document.getElementById("out") as HTMLInputElement).value = "9";
+      expect(signature("after").controlsHash).toBe(before.controlsHash);
+
+      document.body.innerHTML =
+        '<input id="out" value="1"><div id="small" role="dialog" style="position:fixed"><input value="2"></div>';
+      const b2 = signature("before");
+      (document.getElementById("out") as HTMLInputElement).value = "9";
+      expect(signature("after").controlsHash).not.toBe(b2.controlsHash);
+    } finally {
+      Element.prototype.getBoundingClientRect = orig;
+    }
+  });
+
   it("ignores ambient aria state: slider progress, tab selection, range input", () => {
     document.body.innerHTML =
       '<div id="s" role="slider" aria-valuenow="10"></div><div id="t" role="tab" aria-selected="true"></div><input id="r" type="range" value="3">';

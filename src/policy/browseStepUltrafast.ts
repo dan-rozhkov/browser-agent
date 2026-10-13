@@ -219,24 +219,42 @@ function numericQuotedPhrases(goal: string): string[] {
 }
 
 /** True when the label says the phrase exactly: every word of the phrase is
- * a word of the label and the number tokens are identical (so "under 15"
- * is not inside "Under $150", nor "March 1" inside "March 15"). */
+ * a word of the label and every number of the phrase is a whole number
+ * token of the label (a multiset check: "under 15" is not inside "Under
+ * $150", nor "March 1" inside "March 15", but "Sat, March 1, 2026" and
+ * "Under $15 (23 hotels)" do say them). */
 function labelHasPhrase(label: string, phrase: string): boolean {
   const labelWords = new Set(wordTokens(label));
-  const words = wordTokens(phrase);
-  if (!words.every((w) => labelWords.has(w))) return false;
-  return numberTokens(phrase).join("|") === numberTokens(label).join("|");
+  if (!wordTokens(phrase).every((w) => labelWords.has(w))) return false;
+  const pool = numberTokens(label);
+  for (const n of numberTokens(phrase)) {
+    const at = pool.indexOf(n);
+    if (at < 0) return false;
+    pool.splice(at, 1);
+  }
+  return true;
+}
+
+/** A role-less / button / link element whose label is only the phrase's
+ * words plus numbers and currency ("Under $150" chips for "Under 15"). */
+function isPhraseChip(el: BrowseStepElement, phrase: string): boolean {
+  if (el.role && !BUTTON_ROLES.has(el.role)) return false;
+  const words = wordTokens(el.label);
+  if (words.length === 0) return false;
+  const allowed = new Set(wordTokens(phrase));
+  return words.every((w) => allowed.has(w));
 }
 
 /** The quoted number-bearing phrase a label nearly matches: same words,
  * different numbers ("under 20" for a goal that quotes "Under 15"). */
-function nearMissPhrase(goal: string, label: string): string | undefined {
-  if (numberTokens(label).length === 0) return undefined;
-  const labelWords = new Set(wordTokens(label));
+function nearMissPhrase(goal: string, el: BrowseStepElement): string | undefined {
+  if (numberTokens(el.label).length === 0) return undefined;
+  const labelWords = new Set(wordTokens(el.label));
   return numericQuotedPhrases(goal).find((phrase) => {
     const words = wordTokens(phrase);
     if (words.length === 0 || !words.every((w) => labelWords.has(w))) return false;
-    return !labelHasPhrase(label, phrase);
+    if (!isOptionLike(el) && !isPhraseChip(el, phrase)) return false;
+    return !labelHasPhrase(el.label, phrase);
   });
 }
 
@@ -429,10 +447,17 @@ function isBusy(el: BrowseStepElement, history: BrowseStepInput["history"]): boo
   return last.index === el.index || (last.index === undefined && clickTargetLabel(last.label) === el.label);
 }
 
+/** The role shown to the model: a role-less native radio/checkbox reads as
+ * its input type, not "input". Model-facing text only. */
+function modelRole(el: BrowseStepElement): string {
+  if (!el.role && el.tag === "input" && (el.inputType === "radio" || el.inputType === "checkbox")) return el.inputType;
+  return el.role ?? el.tag;
+}
+
 function stateElement(el: BrowseStepElement, history: BrowseStepInput["history"] = []): Record<string, unknown> {
   const out: Record<string, unknown> = {
     index: el.index,
-    role: el.role ?? el.tag,
+    role: modelRole(el),
     label: truncateLabel(el.label, 100),
     operations: el.ops,
   };
@@ -449,12 +474,23 @@ function stateElement(el: BrowseStepElement, history: BrowseStepInput["history"]
 function targetCriterion(el: BrowseStepElement, option?: string): Record<string, unknown> {
   const out: Record<string, unknown> = {
     element: `[${el.index}] ${truncateLabel(el.label, 100)}${option !== undefined ? ` → ${truncateLabel(option, 80)}` : ""}`,
-    role: el.role ?? el.tag,
+    role: modelRole(el),
   };
   if (el.checked !== undefined) out.checked = el.checked;
   else out.current_value = currentValue(el);
   if (el.expanded !== undefined) out.expanded = el.expanded;
   return out;
+}
+
+/** The field value already is the text: equal, or the text followed by a
+ * non-alphanumeric boundary (an autocomplete that appended ", Germany").
+ * Thousands separators between digits are ignored. */
+function valueAlreadyHolds(value: string, text: string): boolean {
+  const flat = (v: string) => normalize(v.replace(/(?<=\d),(?=\d{3}(?!\d))/g, ""));
+  const want = flat(text);
+  if (want.length < 3) return false;
+  const have = flat(value);
+  return have === want || (have.startsWith(want) && !/[\p{L}\p{N}]/u.test(have.charAt(want.length)));
 }
 
 function normalize(text: string): string {
@@ -1314,15 +1350,15 @@ export async function decideBrowseStepUltrafast(
   if (operation === "SELECT") {
     return finish({ outcome: "act", operation, index: target.index, text: target.option, confidence: stepConfidence, model });
   }
-  if (operation === "CLICK" && isOptionLike(el)) {
-    const phrase = nearMissPhrase(goal, el.label);
+  if (operation === "CLICK") {
+    const phrase = nearMissPhrase(goal, el);
     if (phrase !== undefined) {
       // The goal quotes a value; this option has the same words but another
       // number. Prefer an option that holds the exact phrase, then a field to
       // type the value into; never settle for the near match.
       const exact = [...targets.CLICK.values()]
         .map((t) => elements.find((e) => e.index === t.index))
-        .filter((e): e is BrowseStepElement => !!e && isOptionLike(e) && labelHasPhrase(e.label, phrase))
+        .filter((e): e is BrowseStepElement => !!e && (isOptionLike(e) || isPhraseChip(e, phrase)) && labelHasPhrase(e.label, phrase))
         .sort((a, b) => (targetAnswer.probabilities[String(b.index)] ?? 0) - (targetAnswer.probabilities[String(a.index)] ?? 0))[0];
       gates.push({ head: "literal-mismatch", peak: peakProbability(targetAnswer), threshold: 0, jevPick: `CLICK ${target.index}` });
       ruleTier = true;
@@ -1489,8 +1525,7 @@ export async function decideBrowseStepUltrafast(
     return finish(retry(`failed to write text for "${el.label}": ${err instanceof Error ? err.message : String(err)}`, model, stepConfidence));
   }
   timings.textMs = Date.now() - textStart;
-  const norm = (v: string) => normalize(v);
-  const alreadySet = text !== null && norm(text).length >= 3 && norm(el.value ?? "") === norm(text);
+  const alreadySet = text !== null && valueAlreadyHolds(el.value ?? "", text);
   if (text === null || alreadySet) {
     // No text to type is not a dead end: continue with the best other
     // non-terminal operation that has a real target (or needs none).

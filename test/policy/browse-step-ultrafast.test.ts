@@ -1535,13 +1535,34 @@ describe("value-already-set gate (retyping what a field holds)", () => {
 });
 
 describe("value-already-set compares by equality, not substring", () => {
-  it("still types when the field holds a longer value that merely contains the text", async () => {
+  it("is already set when an autocomplete appended after a non-alphanumeric boundary", async () => {
+    mockFieldText("Berlin Hauptbahnhof");
+    const { result } = await decide(
+      { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
+      { goal: 'Search "Berlin Hauptbahnhof"', elements: [{ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value: "Berlin Hauptbahnhof, Germany" }] },
+    );
+    expect(result).toMatchObject({ outcome: "done" });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
+  });
+
+  it("ignores thousands separators, but not a longer number or word", async () => {
+    for (const [text, value, set] of [["1500", "1,500", true], ["100", "1000", false], ["shoes", "red shoes for men", false]] as const) {
+      mockFieldText(text);
+      const { result } = await decide(
+        { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
+        { goal: `Enter "${text}"`, elements: [{ index: 1, tag: "input", label: "Amount", ops: ["TYPE_TEXT"], value }] },
+      );
+      expect(result.diag?.gates.some((g) => g.head === "value-already-set")).toBe(set);
+    }
+  });
+
+  it("still types when the field holds a longer word that merely starts with the text", async () => {
     mockFieldText("Berlin");
     const { result } = await decide(
       { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
       {
         goal: 'Search trains to "Berlin"',
-        elements: [{ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value: "Berlin Hauptbahnhof" }],
+        elements: [{ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value: "Berlinale" }],
       },
     );
     expect(result).toMatchObject({ outcome: "act", operation: "TYPE_TEXT", text: "Berlin" });
@@ -1654,5 +1675,41 @@ describe("unanswered-choice gate: native inputs, peak and accounting", () => {
     expect(Array.isArray(seen[1]!.state)).toBe(true);
     expect(JSON.stringify(seen[1]!.questions.unanswered_choice!.instructions)).toContain("screenshot_note");
     expect(result.diag?.inputTokens).toBe(200);
+  });
+});
+
+describe("number matching by whole tokens, chips and model roles", () => {
+  const op = { operation: choice("CLICK", 0.8, { probabilities: { CLICK: 0.8, TYPE_TEXT: 0.15 } }), click_target: choice("1", 0.8) };
+  const chip = (index: number, label: string): BrowseStepElement => ({ index, tag: "button", label, ops: ["CLICK"] });
+
+  it("accepts labels that carry extra numbers or words around the phrase", async () => {
+    const goal = 'Filter to "Under 15"';
+    const { result } = await decide(op, {
+      goal,
+      elements: [{ index: 1, tag: "div", role: "option", label: "Under $150", ops: ["CLICK"] }, { index: 2, tag: "div", role: "option", label: "Under $15 (23 hotels)", ops: ["CLICK"] }],
+    });
+    expect(result).toMatchObject({ operation: "CLICK", index: 2 });
+    const date = await decide(op, {
+      goal: 'Pick "March 1"',
+      elements: [{ index: 1, tag: "div", role: "option", label: "Sat, March 15, 2026", ops: ["CLICK"] }, { index: 2, tag: "div", role: "option", label: "Sat, March 1, 2026", ops: ["CLICK"] }],
+    });
+    expect(date.result).toMatchObject({ operation: "CLICK", index: 2 });
+  });
+
+  it("treats role-less chips as options for the phrase, but not a stepper", async () => {
+    const { result } = await decide(op, { goal: 'Filter to "Under 15"', elements: [chip(1, "Under $150"), chip(3, "Under $15")] });
+    expect(result).toMatchObject({ operation: "CLICK", index: 3 });
+    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "literal-mismatch" }));
+    const only = await decide(op, { goal: 'Filter to "Under 15"', elements: [chip(1, "Under $150")] });
+    expect(only.result.outcome).toBe("blocked");
+  });
+
+  it("shows a role-less native radio / checkbox to the model by its input type", async () => {
+    const { captured } = await decide(
+      { operation: choice("CLICK", 0.8), click_target: choice("1", 0.8) },
+      { elements: [{ index: 1, tag: "input", inputType: "radio", label: "Std", ops: ["CLICK"], checked: false }] },
+    );
+    expect(JSON.stringify(captured.state)).toContain('"role":"radio"');
+    expect(JSON.stringify(captured.questions.click_target)).toContain('"role":"radio"');
   });
 });

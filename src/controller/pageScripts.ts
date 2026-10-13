@@ -4773,16 +4773,32 @@ export const SIGNATURE_JS = `(() => {
   var controlsHash = 0;
   try {
     var ctlRoot = document;
-    var dlgs = document.querySelectorAll('[aria-modal="true"], dialog[open]');
+    var dlgs = document.querySelectorAll('[aria-modal="true"], dialog[open], [role="dialog"], [role="alertdialog"]');
+    var viewArea = Math.max(1, window.innerWidth * window.innerHeight);
     for (var di = dlgs.length - 1; di >= 0; di--) {
       var dlg = dlgs[di];
       var isModal = dlg.getAttribute("aria-modal") === "true";
-      if (!isModal) {
+      if (!isModal && dlg.tagName.toLowerCase() === "dialog") {
         try {
           isModal = dlg.matches(":modal");
         } catch (e) {}
       }
-      if (isModal && isVisible(dlg)) {
+      if (!isVisible(dlg)) continue;
+      if (!isModal) {
+        // A big overlay-positioned dialog is a custom modal; a small banner
+        // or chat bubble is not and must not narrow the scope.
+        var dr = dlg.getBoundingClientRect();
+        var overlaid = false;
+        for (var an = dlg; an && an !== document.body && an.nodeType === 1; an = an.parentElement) {
+          var pos = getComputedStyle(an).position;
+          if (pos === "fixed" || pos === "absolute") {
+            overlaid = true;
+            break;
+          }
+        }
+        isModal = overlaid && dr.width * dr.height >= viewArea * 0.25;
+      }
+      if (isModal) {
         ctlRoot = dlg;
         break;
       }
@@ -4792,7 +4808,7 @@ export const SIGNATURE_JS = `(() => {
     );
     var ctlKey = "";
     var ctlSeen = 0;
-    for (var ci = 0; ci < ctls.length && ctlSeen < 150; ci++) {
+    for (var ci = 0; ci < ctls.length && ci < 2000 && ctlSeen < 150; ci++) {
       var ctl = ctls[ci];
       var ctlTag = (ctl.tagName || "").toLowerCase();
       var ctlType = String(ctl.type || "").toLowerCase();

@@ -1276,9 +1276,9 @@ export async function runBrowseTaskLoop(
    * first step lands. */
   let lastLandedOperation: string | null = null;
   /** True while the most recent landed step was a CLICK on a choice control
-   * (see isMultiSelectElement) — a multi-select picker may still be open and apply
+   * (see pickerClickOf) — a picker may still be open and apply
    * its selection only once closed. Any other landed step clears it. */
-  let lastLandedChoiceClick = false;
+  let lastPickerClick: PickerClick | null = null;
   /** One-shot guard: the loop closes an open popup at most once before
    * accepting DONE (a second DONE is taken as is). */
   let popupCloseTried = false;
@@ -1365,7 +1365,7 @@ export async function runBrowseTaskLoop(
     if (entry.ok) {
       unproductive = 0;
       lastLandedOperation = entry.operation;
-      lastLandedChoiceClick = false;
+      lastPickerClick = null;
       return null;
     }
     unproductive++;
@@ -1519,7 +1519,7 @@ export async function runBrowseTaskLoop(
             }
             unproductive = 0;
             lastLandedOperation = cached.operation;
-            lastLandedChoiceClick = cached.operation === "CLICK" && isMultiSelectElement(snapshot, cachedIndex);
+            lastPickerClick = cached.operation === "CLICK" ? pickerClickOf(snapshot, cachedIndex) : null;
             if (cached.operation === "TYPE_TEXT" && cachedIndex != null) {
               lastTypeText = { index: cachedIndex, text: readTextFromRange(goal, cached.textRange) ?? "" };
             }
@@ -1623,10 +1623,10 @@ export async function runBrowseTaskLoop(
     // snapshot. Skipped when a dialog is in play (Escape could dismiss it).
     if (
       decision.outcome === "done" &&
-      lastLandedChoiceClick &&
+      lastPickerClick &&
       !popupCloseTried &&
       modalFor(snapshot) === undefined &&
-      hasOpenPopup(snapshot)
+      pickerStillOpen(lastPickerClick, snapshot)
     ) {
       popupCloseTried = true;
       if (signal?.aborted) return cancelledResult();
@@ -1929,7 +1929,7 @@ export async function runBrowseTaskLoop(
       if (stalled) return stalled;
       if (!rejected && !noEffect && lastRecorded) {
         markPageState((lastRecorded as { step: TranscriptStep }).step, operation, snapshot, decision.index, lastUrl);
-        lastLandedChoiceClick = operation === "CLICK" && isMultiSelectElement(snapshot, decision.index);
+        lastPickerClick = operation === "CLICK" ? pickerClickOf(snapshot, decision.index) : null;
       }
       // A landed CLICK: the next snapshot tells what it did (effect note).
       if (operation === "CLICK" && !rejected && !noEffect && (lastRecorded as { step: TranscriptStep; hist: StepHistoryEntry } | null)) {
@@ -2239,22 +2239,43 @@ function elementRole(el: { role?: unknown } | undefined): string {
   return typeof el?.role === "string" ? el.role.toLowerCase() : "";
 }
 
-const MULTI_SELECT_ROLES = new Set(["option", "menuitemcheckbox", "checkbox"]);
-
-/** The element at `index` is a multi-select choice (option, checkbox): a
- * picker that applies the selection on close may still be open after it. A
- * radio / single-choice click closes its own list. */
-function isMultiSelectElement(snapshot: SnapshotResult, index: number | undefined): boolean {
-  if (index == null) return false;
-  const el = findElementByIndex(snapshot.elements, index) as { role?: unknown; tag?: unknown; inputType?: unknown } | undefined;
-  return MULTI_SELECT_ROLES.has(elementRole(el)) || (el?.tag === "input" && el.inputType === "checkbox");
+/** A landed click on a picker choice (option, menu checkbox, checkbox): the
+ * role and label to look for again in the next snapshot. */
+interface PickerClick {
+  role: string;
+  label: string;
+  /** A checkbox: no "still listed" proof, only an expanded control counts. */
+  checkbox: boolean;
 }
 
-/** The snapshot shows an open popup: an element reporting `expanded: true`.
- * A listed option or menu item alone is not proof (persistent navigation
- * menus list them all the time). */
-function hasOpenPopup(snapshot: SnapshotResult): boolean {
-  return snapshot.elements.some((raw) => (raw as { expanded?: unknown } | null)?.expanded === true);
+const PICKER_LISTED_ROLES = new Set(["option", "menuitemcheckbox"]);
+
+/** The element at `index` as a picker choice click, or null when it is not
+ * one. A radio / single-choice control closes its own list. */
+function pickerClickOf(snapshot: SnapshotResult, index: number | undefined): PickerClick | null {
+  if (index == null) return null;
+  const el = findElementByIndex(snapshot.elements, index) as
+    | { role?: unknown; tag?: unknown; inputType?: unknown; label?: unknown }
+    | undefined;
+  if (!el) return null;
+  const role = elementRole(el);
+  const label = typeof el.label === "string" ? el.label : "";
+  if (PICKER_LISTED_ROLES.has(role)) return { role, label, checkbox: false };
+  if (role === "checkbox" || (!role && el.tag === "input" && el.inputType === "checkbox")) {
+    return { role: role || "checkbox", label, checkbox: true };
+  }
+  return null;
+}
+
+/** The picker the last click chose from is probably still open: some element
+ * reports `expanded: true`, or (option / menuitemcheckbox only) the clicked
+ * choice is still listed with the same role and label. A persistent menu
+ * that merely lists menuitems proves nothing by itself. */
+function pickerStillOpen(pick: PickerClick, snapshot: SnapshotResult): boolean {
+  const els = snapshot.elements as Array<{ role?: unknown; label?: unknown; expanded?: unknown } | null>;
+  if (els.some((el) => el?.expanded === true)) return true;
+  if (pick.checkbox) return false;
+  return els.some((el) => el != null && elementRole(el) === pick.role && el.label === pick.label);
 }
 
 /** Record `step` in pageStateSteps when it set a value or a choice: TYPE_TEXT,

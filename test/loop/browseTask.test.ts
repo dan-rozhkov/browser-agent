@@ -744,23 +744,35 @@ describe("browse_task", () => {
       expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
-    it("does not treat a persistent listed menuitem/option as an open popup", async () => {
+    it("presses Escape when the clicked option / menuitemcheckbox is still listed, without aria-expanded", async () => {
+      for (const role of ["option", "menuitemcheckbox"]) {
+        stubFetchSequence([CLICK_STEP, DONE, DONE]);
+        const act = vi.fn(async () => ({}));
+        const el = { index: 0, tag: "div", role, label: "Red", ops: ["CLICK"] };
+        const browser = stubBrowser({ act, snapshot: async () => pageWith([el]) });
+        const t = await runBrowseTaskLoop("filter by red", 12, browser);
+        expect(t.status).toBe("done");
+        expect(escapeCalls(act)).toHaveLength(1);
+      }
+    });
+
+    it("does not press Escape when the clicked option is gone and nothing is expanded", async () => {
       stubFetchSequence([CLICK_STEP, DONE]);
       const act = vi.fn(async () => ({}));
+      let n = 0;
       const nav = { index: 2, tag: "a", role: "menuitem", label: "Home", ops: ["CLICK"] };
-      const browser = stubBrowser({ act, snapshot: async () => pageWith([OPTION, nav]) });
+      const browser = stubBrowser({ act, snapshot: async () => pageWith(n++ === 0 ? [OPTION, nav] : [nav]) });
       const t = await runBrowseTaskLoop("filter by red", 12, browser);
       expect(t.status).toBe("done");
       expect(escapeCalls(act)).toHaveLength(0);
     });
 
-    it("does not press Escape after a single-choice (radio) click even when a list is expanded", async () => {
+    it("does not press Escape after a checkbox click unless something is expanded", async () => {
       stubFetchSequence([CLICK_STEP, DONE]);
       const act = vi.fn(async () => ({}));
-      const radio = { index: 0, tag: "div", role: "radio", label: "Red", ops: ["CLICK"] };
-      const browser = stubBrowser({ act, snapshot: async () => pageWith([radio, OPEN_MENU]) });
-      const t = await runBrowseTaskLoop("pick red", 12, browser);
-      expect(t.status).toBe("done");
+      const box = { index: 0, tag: "input", role: "checkbox", label: "Red", ops: ["CLICK"] };
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([box]) });
+      await runBrowseTaskLoop("tick red", 12, browser);
       expect(escapeCalls(act)).toHaveLength(0);
     });
 
