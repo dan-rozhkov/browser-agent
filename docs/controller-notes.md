@@ -1760,3 +1760,14 @@ above, without touching the human cursor overlay:
   computed `cursor: pointer` (cap 40, scan cap 300). A header that contains a
   button/link/input is not listed itself: the inner control is the target
   (no duplicate). Plain header cells are still not listed.
+
+## Quantity-reached gate (loop)
+
+`src/loop/quantityGate.ts`, wired in `runBrowseTaskLoop`. A sub-goal that asks
+for N units ("Add 2 units ...") used to end with more, because the step policy
+sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
+The loop reads N from the action part (then the Done-when part), counts the
+units each click target produced from the `counter a→b` / `appeared:` effect
+notes (deltas, not absolute values), and finishes the sub-goal as done instead
+of repeating a CLICK on a target that already reached N. It fires only if a
+counter effect was seen, or N is 1 and the first click showed a new element.

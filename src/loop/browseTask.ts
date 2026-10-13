@@ -1,6 +1,7 @@
 import type { BrowserBridge } from "./bridge.js";
 import type { BrowseBackend } from "./backend.js";
 import type { KeyValueStorage } from "./storage.js";
+import { createQuantityGate, parseTargetQuantity } from "./quantityGate.js";
 import {
   appendKeepingSuffix,
   describeEffectDetailed,
@@ -1109,8 +1110,12 @@ export interface HistoryShare {
 /** Label prefix of the synthetic DONE step the auto-confirm records. It is not
  * an action, so multi-sub-goal step accounting skips it (see actionSteps). */
 const AUTO_CONFIRM_LABEL = "auto-confirmed by effect";
+/** Label of the synthetic DONE step the quantity gate records (see quantityGate.ts). */
+const QUANTITY_REACHED_LABEL = "quantity reached — not clicking again";
 const actionSteps = (steps: TranscriptStep[]): number =>
-  steps.filter((s) => !(s.operation === "DONE" && s.label.startsWith(AUTO_CONFIRM_LABEL))).length;
+  steps.filter(
+    (s) => !(s.operation === "DONE" && (s.label.startsWith(AUTO_CONFIRM_LABEL) || s.label.startsWith(QUANTITY_REACHED_LABEL)))
+  ).length;
 
 /** Blank = no elements AND page text that is present but empty. A missing
  * `text` means an older desktop build that never sends it (pageTextFor falls
@@ -1238,6 +1243,8 @@ export async function runBrowseTaskLoop(
   const history: StepHistoryEntry[] = share?.seed ? [...share.seed] : [];
   if (share) share.final = history;
   let pendingEffect: PendingEffect | null = null;
+  const quantityTarget = quantityTargetOf(goal);
+  const quantityGate = quantityTarget === null ? null : createQuantityGate(quantityTarget);
 
   let lastUrl = "";
   let lastTitle = "";
@@ -1389,6 +1396,21 @@ export async function runBrowseTaskLoop(
     cacheHits,
   });
 
+  /** Quantity gate: the finished transcript when `targetLabel` is a repeat
+   * click on a target that already produced the requested quantity, else null. */
+  const quantityStop = (targetLabel: string): Transcript | null => {
+    const reason = quantityGate?.blockedReason(targetLabel);
+    if (!reason) return null;
+    recordStep(steps, history, {
+      operation: "DONE",
+      label: `${QUANTITY_REACHED_LABEL} — ${reason}`,
+      ok: true,
+      ...(pendingShot ?? {}),
+    });
+    pendingShot = undefined;
+    return { status: "done", steps, url: lastUrl, title: lastTitle, reason, cacheHits };
+  };
+
   for (let stepCount = 0; stepCount < cappedMaxSteps; stepCount++) {
     if (signal?.aborted) return cancelledResult();
     // browse-speed-contract.md, "Frontend" item 4: bail before STARTING a
@@ -1421,6 +1443,7 @@ export async function runBrowseTaskLoop(
     let effectApplied = false;
     if (pendingEffect) {
       const became = applyPendingEffect(pendingEffect, snapshot);
+      if (quantityGate && pendingEffect.acted) quantityGate.observe(pendingEffect.acted.label, pendingEffect.step.label);
       pendingEffect = null;
       effectApplied = true;
       const commit = share?.autoConfirmCommit ? isCommitEffect(became) : null;
@@ -1490,6 +1513,10 @@ export async function runBrowseTaskLoop(
         // attempt.
         if (!unsafeAtReplay && (!cached.target || cachedIndex !== undefined)) {
           if (signal?.aborted) return cancelledResult();
+          if (cached.operation === "CLICK" && typeof resolvedElement?.label === "string") {
+            const stopped = quantityStop(resolvedElement.label);
+            if (stopped) return stopped;
+          }
           const replay = await replayCachedStep(
             browser,
             cached,
@@ -1860,6 +1887,11 @@ export async function runBrowseTaskLoop(
       continue;
     }
 
+    if (operation === "CLICK" && decision.index != null) {
+      const stopped = quantityStop(label);
+      if (stopped) return stopped;
+    }
+
     const performArgs: {
       snapshotId: string;
       index?: number;
@@ -2173,6 +2205,23 @@ function subGoalAction(subGoal: string): string {
   const action = m ? subGoal.slice(0, m.index) : subGoal;
   // A sub-goal that starts with the marker has no action part to read.
   return action.trim() === "" ? subGoal : action;
+}
+
+/** The "Done when" / "Does not count" part of a sub-goal ("" without a marker). */
+function subGoalCondition(subGoal: string): string {
+  const m = SUBGOAL_CONDITION_MARKER.exec(subGoal);
+  return m ? subGoal.slice(m.index) : "";
+}
+
+/** The loop's goal is the sub-goal plus a "Already done earlier" list (see
+ * buildSubgoalGoal); that list must not feed the quantity reader. */
+const DONE_LIST_MARKER = "\n\nAlready done earlier (do not redo):";
+function quantityTargetOf(goal: string): number | null {
+  const cut = goal.indexOf(DONE_LIST_MARKER);
+  const subGoal = cut >= 0 ? goal.slice(0, cut) : goal;
+  const action = SUBGOAL_CONDITION_MARKER.test(subGoal) ? subGoalAction(subGoal) : subGoal;
+  const condition = subGoalCondition(subGoal);
+  return parseTargetQuantity(condition ? (action === subGoal ? "" : action) : action, condition);
 }
 
 /** "search" as a noun is not a verb: a noun head before it ("the search",
