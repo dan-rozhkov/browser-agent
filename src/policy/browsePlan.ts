@@ -140,12 +140,15 @@ export interface BrowsePlanResult {
 export async function planBrowseGoal(
   config: BrowsePolicyOptions,
   input: { goal: string; url?: string },
-  signal: AbortSignal = AbortSignal.timeout(BROWSE_PLAN_TIMEOUT_MS),
+  callerSignal?: AbortSignal,
 ): Promise<BrowsePlanResult> {
   const fallback = (reason: string): BrowsePlanResult => ({
     subgoals: [input.goal.slice(0, MAX_GOAL_CHARS)],
     fallbackReason: reason,
   });
+  // The plan's own budget always applies; a caller signal adds to it.
+  const timeout = AbortSignal.timeout(BROWSE_PLAN_TIMEOUT_MS);
+  const signal = callerSignal ? AbortSignal.any([timeout, callerSignal]) : timeout;
   try {
     const { text: promptGoal, tokenMap } = buildNumberedPlaceholderGoal(input.goal);
     const { object } = await config.models.cascade.generateObject({

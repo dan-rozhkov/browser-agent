@@ -1943,8 +1943,9 @@ export function browseTaskOverallDeadlineMs(cloud: boolean): number {
 }
 
 /** Hard bound on one browse_task call, enforced inside the handler: the
- * overall deadline in force (`overallDeadlineMs`, else the browser's default) (single flow ends sooner on its
- * own) + one step-start reserve + settleEmptySnapshot's worst case. The
+ * longer of the overall deadline (`overallDeadlineMs`, else the browser's default;
+ * the multi-sub-goal budget) and the per-sub-goal deadline (`deadlineMs`; the
+ * single-sub-goal flow runs to it) + one step-start reserve + settleEmptySnapshot's worst case. The
  * chat-side timeout is a margin above this. The end-of-loop observation reads
  * (<= OBSERVATIONS_KEPT x OBSERVATION_READ_TIMEOUT_MS) add nothing: each one
  * starts only with OBSERVATION_READ_TIMEOUT_MS left of the overall deadline,
@@ -2573,6 +2574,14 @@ export interface RunBrowseTaskOptions {
  * loop turns them into a `Transcript`); a host wrapper that wants pen-editor's
  * `{"error": ...}` JSON contract can catch what remains.
  */
+/** setTimeout fires at ~1 ms for a delay above this (a 32-bit signed int). */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** A finite number above zero, else undefined (so the default applies). */
+function positiveFinite(v: number | undefined): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
 export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): Promise<Transcript> {
   const cloud = opts.cloud === true;
   const env: LoopEnv = {
@@ -2587,7 +2596,14 @@ export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): P
     typeof opts.maxSteps === "number" && Number.isFinite(opts.maxSteps) ? opts.maxSteps : DEFAULT_MAX_STEPS;
   const url = typeof opts.url === "string" && opts.url.length > 0 ? opts.url : undefined;
 
-  const overallDeadlineMs = opts.overallDeadlineMs ?? browseTaskOverallDeadlineMs(cloud);
+  const overallDeadlineMs = positiveFinite(opts.overallDeadlineMs) ?? browseTaskOverallDeadlineMs(cloud);
+  const deadlineMs = positiveFinite(opts.deadlineMs) ?? browseTaskDeadlineMs(cloud);
+  // The single-sub-goal flow runs to `deadlineMs`, a multi-sub-goal call to
+  // `overallDeadlineMs`: the race must outlast whichever is longer.
+  const boundMs = Math.min(
+    browseTaskInnerBoundMs(cloud, Math.max(overallDeadlineMs, deadlineMs)),
+    MAX_TIMER_DELAY_MS
+  );
   // The race below is the REAL bound on this call.
   const inner = new AbortController();
   const outer = opts.signal;
@@ -2600,7 +2616,7 @@ export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): P
       timer = setTimeout(() => {
         inner.abort();
         resolve({ status: "budget", steps: [], url: "", title: "", reason: "deadline exceeded" });
-      }, browseTaskInnerBoundMs(cloud, overallDeadlineMs));
+      }, boundMs);
     });
     return await Promise.race([
       runBrowseTaskCore(
@@ -2610,7 +2626,7 @@ export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): P
         opts.now,
         opts.sleep,
         url,
-        opts.deadlineMs ?? browseTaskDeadlineMs(cloud),
+        deadlineMs,
         overallDeadlineMs,
         inner.signal
       ),

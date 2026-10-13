@@ -2724,6 +2724,51 @@ describe("browse_task sub-goal planning", () => {
     }
   });
 
+  it("runBrowseTask does not cut a single flow off at the overall bound when deadlineMs is longer", async () => {
+    vi.useFakeTimers();
+    try {
+      stubPlanAndSteps("fail", [DONE]);
+      let settled = false;
+      const pending = runBrowseTaskPublic(
+        "hang forever",
+        publicOpts(stubBrowser({ snapshot: () => new Promise(() => {}) }), {
+          overallDeadlineMs: 60_000,
+          deadlineMs: 300_000,
+        })
+      ).then((t) => {
+        settled = true;
+        return t;
+      });
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false, 60_000) + 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false, 300_000) - browseTaskInnerBoundMs(false, 60_000));
+      expect(await pending).toMatchObject({ status: "budget", reason: "deadline exceeded" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([Infinity, NaN, -5, 0])("runBrowseTask ignores a non-positive/non-finite deadline (%s) instead of firing at once", async (bad) => {
+    vi.useFakeTimers();
+    try {
+      stubPlanAndSteps("fail", [DONE]);
+      let settled = false;
+      const pending = runBrowseTaskPublic(
+        "hang forever",
+        publicOpts(stubBrowser({ snapshot: () => new Promise(() => {}) }), { overallDeadlineMs: bad, deadlineMs: bad })
+      ).then((t) => {
+        settled = true;
+        return t;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false) + 1);
+      expect(await pending).toMatchObject({ status: "budget", reason: "deadline exceeded" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("runBrowseTask bounds a hanging cloud call by the longer cloud bound", async () => {
     vi.useFakeTimers();
     try {

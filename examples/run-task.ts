@@ -2,7 +2,7 @@
 //   TYPESAFE_API_KEY=... OPENROUTER_API_KEY=... npm run example -- "open example.com and find the heading"
 //
 // Env:
-//   TYPESAFE_API_KEY    required; System One (Jev) decisions
+//   TYPESAFE_API_KEY    required unless TYPESAFE_MODEL is an `openai/...` id; System One (Jev) decisions
 //   TYPESAFE_MODEL      optional; default "jev-latest" (an `openai/...` id routes to OpenRouter)
 //   OPENROUTER_API_KEY  required; the two small text models (and Luna decisions)
 //   STRUCTURED_MODEL    optional; OpenRouter model id for TYPE_TEXT / SELECT text
@@ -30,7 +30,7 @@ function requireEnv(name: string): string {
 }
 
 /** OpenRouter through the AI SDK: `generateObject` sends the schema (as a
- * structured-output `json_schema` response format), so replies validate. */
+ * structured-output `json_schema` response format, non-strict), so replies validate. */
 function openRouterTextModel(apiKey: string, id: string): TextModel {
   const openrouter = createOpenAICompatible({
     name: "openrouter",
@@ -38,7 +38,9 @@ function openRouterTextModel(apiKey: string, id: string): TextModel {
     apiKey,
     supportsStructuredOutputs: true,
   });
-  return aiSdkTextModel(openrouter(id));
+  // OpenRouter rejects a strict json_schema for many models: send it non-strict.
+  // The provider reads options under its `name` ("openrouter").
+  return aiSdkTextModel(openrouter(id), { providerOptions: { openrouter: { strictJsonSchema: false } } });
 }
 
 async function openBrowser(): Promise<{ controller: BrowserController; close(): Promise<void>; cloud: boolean }> {
@@ -63,7 +65,8 @@ async function main(): Promise<void> {
   const openRouterKey = requireEnv("OPENROUTER_API_KEY");
   const decisionModel = process.env.TYPESAFE_MODEL;
   const decisions = createSystemOneClient({
-    apiKey: requireEnv("TYPESAFE_API_KEY"),
+    // An `openai/...` decision model goes to OpenRouter, so no System One key is needed.
+    apiKey: decisionModel?.startsWith("openai/") ? (process.env.TYPESAFE_API_KEY ?? "") : requireEnv("TYPESAFE_API_KEY"),
     ...(decisionModel ? { model: decisionModel } : {}),
     openRouterApiKey: openRouterKey,
   });

@@ -19,10 +19,10 @@ export interface TextModel {
   }): Promise<{ object: T; usage?: { inputTokens?: number; outputTokens?: number } }>;
 }
 
-/** The model answered, but not with an object matching the schema (was the
- * AI SDK's `NoObjectGeneratedError`). The cascade retries once on it. */
 const INVALID_OBJECT_MARKER = Symbol.for("@pen/browser-agent.TextModelInvalidObjectError");
 
+/** The model answered, but not with an object matching the schema (was the
+ * AI SDK's `NoObjectGeneratedError`). The cascade retries once on it. */
 export class TextModelInvalidObjectError extends Error {
   /** Marker for `isInstance`: survives duplicate copies of this package, where
    * `instanceof` would not (the AI SDK's errors work the same way). */

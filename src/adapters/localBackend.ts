@@ -1,6 +1,5 @@
 import type { BrowseBackend, BrowseBackendResponse } from "../loop/backend.js";
 import { locateTarget, planGoal, decideStep, type BrowsePolicyOptions } from "../policy/decide.js";
-import { BROWSE_PLAN_TIMEOUT_MS } from "../policy/browsePlan.js";
 import type { DecisionClient } from "../policy/decisions.js";
 import {
   browseLocateBodySchema,
@@ -66,13 +65,17 @@ function mergeSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
  * spending paid calls after the caller has given up. */
 function withRequestSignal(opts: BrowsePolicyOptions, signal: AbortSignal): BrowsePolicyOptions {
   const wrapModel = (m: TextModel): TextModel => ({
-    id: m.id,
+    get id() {
+      return m.id;
+    },
     generateObject: (req) => m.generateObject({ ...req, abortSignal: mergeSignals(req.abortSignal, signal) }),
   });
   const decisions: DecisionClient = {
-    ...(opts.decisions.model !== undefined ? { model: opts.decisions.model } : {}),
+    get model() {
+      return opts.decisions.model;
+    },
     evaluate: (params) =>
-      opts.decisions.evaluate(params.signal ? { ...params, signal: AbortSignal.any([params.signal, signal]) } : params),
+      opts.decisions.evaluate({ ...params, signal: mergeSignals(params.signal, signal) }),
   };
   return {
     ...opts,
@@ -117,11 +120,7 @@ export function createLocalBackend(opts: BrowsePolicyOptions): BrowseBackend {
             if (!parsed.success) return invalid(parsed.error.issues[0]?.message);
             const { subgoals } = await bounded(
               (s) =>
-                planGoal(
-                  withRequestSignal(opts, s),
-                  parsed.data,
-                  AbortSignal.any([AbortSignal.timeout(BROWSE_PLAN_TIMEOUT_MS), s]),
-                ),
+                planGoal(withRequestSignal(opts, s), parsed.data, s),
               timeoutMs,
               signal,
             );

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { BROWSE_PLAN_TIMEOUT_MS } from "../../src/policy/browsePlan.js";
 import { createLocalBackend } from "../../src/adapters/localBackend.js";
 import { runBrowseTask } from "../../src/loop/browseTask.js";
 import { memoryStorage } from "../../src/loop/storage.js";
@@ -141,12 +142,12 @@ describe("createLocalBackend: policy failures never throw", () => {
 });
 
 describe("createLocalBackend: plan budget", () => {
-  it("keeps the 20 s plan budget: a stalled plan model answers 200 with the fallback, not AbortError", async () => {
+  it("keeps the plan budget: a stalled plan model answers 200 with the fallback, not AbortError", async () => {
     const realTimeout = AbortSignal.timeout.bind(AbortSignal);
     // Shrink only the plan budget so the test does not wait 20 s.
     const spy = vi
       .spyOn(AbortSignal, "timeout")
-      .mockImplementation((ms: number) => realTimeout(ms === 20_000 ? 10 : ms));
+      .mockImplementation((ms: number) => realTimeout(ms === BROWSE_PLAN_TIMEOUT_MS ? 10 : ms));
     try {
       const stalled: TextModel = {
         id: "stalled",
@@ -277,5 +278,25 @@ describe("createLocalBackend: end to end with runBrowseTask", () => {
       storage: memoryStorage(),
     });
     expect(transcript.status).toBe("done");
+  });
+});
+
+describe("createLocalBackend: decision client without its own signal", () => {
+  it("still receives a signal that aborts with the request", async () => {
+    let seen: AbortSignal | undefined;
+    const decisions: SystemOneClient = {
+      evaluate: (params) => {
+        seen = params.signal;
+        return new Promise(() => undefined);
+      },
+    };
+    const backend = createLocalBackend(makeOptions({ decisions }));
+    const ac = new AbortController();
+    const p = backend.request("/api/browse/locate", LOCATE_BODY, { ...REQ, signal: ac.signal });
+    p.catch(() => undefined);
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    expect(seen?.aborted).toBe(false);
+    ac.abort();
+    expect(seen?.aborted).toBe(true);
   });
 });

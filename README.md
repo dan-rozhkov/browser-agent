@@ -160,6 +160,10 @@ browseStepBodySchema, browsePlanBodySchema, browseLocateBodySchema   // zod, sam
 normalizeScreenshot(raw: string | undefined): string | undefined;
 ```
 
+When neither `decisionModel` nor `DecisionClient.model` is set, the policy
+assumes `jev-latest`: a text-only model, so screenshots are not sent and the
+Luna branch is off. A custom vision-capable client must set one of them.
+
 Lower-level pieces are exported too: `decideBrowseStep`,
 `decideBrowseStepUltrafast`, `commitGuard`, `detectBotWall`/`botWallResult`,
 `decideBrowseLocate`, `planBrowseGoal`, `scrubPii`/`containsPii`, the

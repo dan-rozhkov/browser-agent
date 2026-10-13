@@ -84,9 +84,8 @@ export async function decideStep(
 }
 
 /** Never throws for a model failure: falls back to `{ subgoals: [goal] }`
- * (with `fallbackReason`, which an HTTP layer should not send). `signal`
- * defaults to the plan timeout; hosts that can detect a client hang-up pass
- * `AbortSignal.any([timeout, gone])` like the route did. */
+ * (with `fallbackReason`, which an HTTP layer should not send). The plan
+ * timeout always applies; `signal` (a client hang-up, say) is combined with it. */
 export function planGoal(
   opts: BrowsePolicyOptions,
   body: BrowsePlanBody,

@@ -1,5 +1,8 @@
 import type { BrowseBackend, BrowseBackendResponse } from "../loop/backend.js";
 
+/** Fetch credentials mode (the DOM `RequestCredentials`, spelled out so the type needs no DOM lib). */
+export type HttpBackendCredentials = "omit" | "include" | "same-origin";
+
 export interface HttpBackendOptions {
   /** Backend origin (and optional path prefix), e.g. `https://api.example.com`. */
   baseUrl: string;
@@ -9,7 +12,7 @@ export interface HttpBackendOptions {
   headers?: Record<string, string> | (() => Record<string, string>);
   /** Fetch credentials mode (`"include"` sends cookies cross-origin, as an
    * accounts-enabled host needs); a function is called per request. */
-  credentials?: RequestCredentials | (() => RequestCredentials | undefined);
+  credentials?: HttpBackendCredentials | (() => HttpBackendCredentials | undefined);
 }
 
 /**
