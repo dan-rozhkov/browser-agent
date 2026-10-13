@@ -2177,7 +2177,7 @@ describe("human cursor", () => {
         expect(settled).toBe(false);
 
         // Push well past timeoutMs alone but still under timeoutMs +
-        // cursorBudgetMs (1000 + min(1000, 1500) = 2000) — still not timed out.
+        // cursorBudgetMs (1000 + min(1000, 900) = 1900) — still not timed out.
         await vi.advanceTimersByTimeAsync(900);
         await vi.advanceTimersByTimeAsync(0);
         expect(settled).toBe(false);
@@ -2186,7 +2186,7 @@ describe("human cursor", () => {
         // and the reported budget in the error message is the extended one.
         await vi.advanceTimersByTimeAsync(300);
         const result = await promise;
-        expect(result).toMatchObject({ error: expect.stringContaining("2000ms") });
+        expect(result).toMatchObject({ error: expect.stringContaining("1900ms") });
       } finally {
         vi.useRealTimers();
       }
@@ -2219,7 +2219,7 @@ describe("human cursor", () => {
 
         await vi.advanceTimersByTimeAsync(600);
         const result = await promise;
-        expect(result).toMatchObject({ error: expect.stringContaining("2000ms") });
+        expect(result).toMatchObject({ error: expect.stringContaining("1900ms") });
       } finally {
         vi.useRealTimers();
       }

@@ -4887,7 +4887,7 @@ export const SIGNATURE_JS = `(() => {
  * The pure motion planner behind CURSOR_JS (cua-derived, MIT): constants,
  * easing/profile/path math, `planMove`, `sampleAt`, `velocityAt`. No DOM, no
  * `args`. CURSOR_JS embeds it the way it embeds FIND_BY_TEXT_JS, and
- * test/cursorMotion.test.ts evaluates this fragment directly. Only
+ * test/controller/cursorPlan.test.ts evaluates this fragment directly. Only
  * `window.__penCursorBowSign` (classic's bow alternation) is touched.
  */
 export const CURSOR_PLAN_JS = `
@@ -4895,10 +4895,14 @@ export const CURSOR_PLAN_JS = `
   var DEFAULT_TARGET_PT = 24; // cua DEFAULT_TARGET_PT: box assumed for a bare point
   var ARRIVAL_TOLERANCE = 1; // cua ARRIVAL_TOLERANCE_PT
   var REDUCED_MOTION_MS = 120; // cua REDUCED_MOTION_MS
-  // Hard cap on the ARRIVAL moment. The 1150ms backstop below must never win
-  // in a visible tab: two rAFs for scrollIntoView come before the move. 700ms
+  // Hard cap on the ARRIVAL moment. The 600ms backstop below must never win
+  // in a visible tab: two rAFs for scrollIntoView come before the move. 300ms
   // keeps the agent's per-action latency low.
-  var ARRIVAL_CAP_MS = 700;
+  var ARRIVAL_CAP_MS = 300;
+  // Agent speed: every planned move plays 2.5x faster than the cua timings.
+  // An action awaits the cursor's arrival; measured ~0.8s of a ~1.2s action
+  // was spent waiting for the cursor.
+  var MOTION_TIME_SCALE = 0.4;
 
   // Heading rotation (cua trajectory.rs finish() / motion-lab applyHeading, MIT).
   // The arrow art rests with its tip up-left: TIP_ANGLE in screen space (y down).
@@ -5163,9 +5167,16 @@ export const CURSOR_PLAN_JS = `
       };
     }, duration);
     pinEnds(out, from, aim);
-    out.push({ t: duration + 8, x: aim.x + (dx / dd) * over, y: aim.y + (dy / dd) * over });
-    out.push({ t: duration + 25, x: aim.x, y: aim.y });
-    return out;
+    // The overshoot/correction samples are NOT part of the timed path: planMove
+    // appends them AFTER retiming, so scaling cannot squash them below one
+    // 60 Hz frame (8ms / 25ms after the last path sample, as in the cua timing).
+    return {
+      samples: out,
+      tail: [
+        { dt: 8, x: aim.x + (dx / dd) * over, y: aim.y + (dy / dd) * over },
+        { dt: 25, x: aim.x, y: aim.y }
+      ]
+    };
   }
 
   function arrivalIndex(samples, to) {
@@ -5238,6 +5249,7 @@ export const CURSOR_PLAN_JS = `
     var style = Object.prototype.hasOwnProperty.call(STYLE_EFFECTS, opts.style) ? opts.style : "signature_arc";
     var samples;
     var snapT = null;
+    var tail = null;
     var effects = STYLE_EFFECTS[style];
     var side = naturalSide(from, to);
     var big = Math.max(d, 1);
@@ -5250,7 +5262,9 @@ export const CURSOR_PLAN_JS = `
       samples = glide(from, to, line, minJerk, REDUCED_MOTION_MS);
       effects = NO_EFFECTS;
     } else if (style === "classic") {
-      samples = classicSamples(from, to, d);
+      var cl = classicSamples(from, to, d);
+      samples = cl.samples;
+      tail = cl.tail;
     } else if (style === "magnetic") {
       var mag = magneticSamples(from, to);
       samples = mag.samples;
@@ -5277,12 +5291,20 @@ export const CURSOR_PLAN_JS = `
       samples = glide(from, to, sgPath, bumpProfile(minJerk, over, 0.82), dcMs(d, w, 1.1));
     }
 
+    // One retime: the cua timing x MOTION_TIME_SCALE, squeezed further only if
+    // the arrival would still pass ARRIVAL_CAP_MS. Reduced motion keeps its glide.
     var arrivalT = samples[arrivalIndex(samples, to)].t;
-    if (arrivalT > ARRIVAL_CAP_MS) {
-      var k = ARRIVAL_CAP_MS / arrivalT;
+    if (!opts.reduce) {
+      var k = Math.min(MOTION_TIME_SCALE, ARRIVAL_CAP_MS / Math.max(arrivalT, 1e-6));
       retime(samples, k);
       if (snapT !== null) snapT *= k;
-      arrivalT = ARRIVAL_CAP_MS;
+      arrivalT *= k;
+    }
+    if (tail) {
+      var endT = samples[samples.length - 1].t;
+      for (var ti = 0; ti < tail.length; ti++) {
+        samples.push({ t: endT + tail[ti].dt, x: tail[ti].x, y: tail[ti].y });
+      }
     }
     // End of the motion proper (before the rotation settle tail): trail/glow
     // lifetimes key off this, not off the tail.
@@ -5362,14 +5384,15 @@ export const CURSOR_PLAN_JS = `
  * independent. `args.style` picks signature_arc (default), spring_settle,
  * comet_swoop, magnetic or classic; the math is derived from trycua/cua's
  * cursor-overlay trajectory.rs (MIT). The Promise resolves at *arrival* (the
- * first sample within 1px of the target, capped at 700ms), while the
+ * first sample within 1px of the target, capped at 300ms; every move is
+ * pre-scaled by MOTION_TIME_SCALE = 0.4, i.e. 2.5x faster than cua), while the
  * follow-through, ripple and press squish keep animating; a new call cancels
  * the previous animation and starts from its final point.
  *
  * Never throws and always settles quickly: every code path is wrapped so a
  * failure resolves `{ error }` rather than rejecting, and a `finish()` guard
- * plus a hard backstop timer (~1.15s, comfortably under this repo's other
- * short page-script budgets) mean the promise always settles even if
+ * plus a hard backstop timer (600ms: twice the 300ms arrival cap, and under
+ * the controller's 900ms CURSOR_TIMEOUT_MS) mean the promise always settles even if
  * `requestAnimationFrame` never fires again — which upstream findings in
  * this same repo (see get_screenshot's rAF-in-a-background-tab gotcha) show
  * does happen. The backstop is disarmed *only* inside `finish()` itself,
@@ -5389,7 +5412,7 @@ export const CURSOR_JS = `(() => {
 
   var TRAIL_MS = 240;
   var RIPPLE_MS = 380;
-  var MAGNET_MS = 700;
+  var MAGNET_MS = 700 * 0.4; // 700ms of cua timing x MOTION_TIME_SCALE (0.4), so the magnet halo does not outlive the faster move
   var PRESS_HOLD_MS = 90;
   var PRESS_IN_MS = 50;
   var PRESS_OUT_MS = 220;
@@ -5707,13 +5730,14 @@ export const CURSOR_JS = `(() => {
     }
     // Hard backstop: requestAnimationFrame can simply stop firing (a
     // backgrounded tab, per this repo's get_screenshot rAF findings), and
-    // this script must settle regardless — "at most ~1.2s" from the design,
-    // kept a little under that so moveCursor's own (longer) timeout on the
+    // this script must settle regardless — bounded well under the
+    // controller timeout (CURSOR_TIMEOUT_MS, 900ms) so moveCursor's own (longer) timeout on the
     // controller side is never the thing that actually fires. Arrival is
-    // capped at 700ms, so in a visible tab this never wins.
+    // capped at 300ms (ARRIVAL_CAP_MS) plus two rAFs for scrollIntoView, so in
+    // a visible tab this never wins. Invariant: backstop < CURSOR_TIMEOUT_MS.
     var backstop = setTimeout(function () {
       settleAtTarget(true);
-    }, 1150);
+    }, 600);
     function abortMe() {
       settleAtTarget(false);
     }

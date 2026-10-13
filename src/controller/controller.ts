@@ -446,8 +446,8 @@ const BUSY_POLL_INTERVAL_MS = 50;
  * re-enable (a busy control) before refusing it as locked. */
 const DISABLED_WAIT_MS = 1_500;
 
-/** Bounds `moveCursor`'s own CURSOR_JS call — a little above CURSOR_JS's own
- * internal ~1.15s backstop, so that backstop (which always resolves with a
+/** Bounds `moveCursor`'s own CURSOR_JS call — a margin above CURSOR_JS's own
+ * internal 600ms backstop (arrival itself is capped at 300ms), so that backstop (which always resolves with a
  * best-effort position rather than hanging) is what normally fires, not
  * this outer timeout.
  *
@@ -459,7 +459,7 @@ const DISABLED_WAIT_MS = 1_500;
  * own call to `withTimeout` is still independently bounded by
  * `Math.min(this.timeoutMs, CURSOR_TIMEOUT_MS)`, so a short caller-supplied
  * `timeoutMs` still gets a correspondingly short-bounded cursor call. */
-const CURSOR_TIMEOUT_MS = 1_500;
+const CURSOR_TIMEOUT_MS = 900;
 
 /** How long the command queue waits for a TIMED-OUT command's abandoned work
  * to settle before letting the next command run anyway — see

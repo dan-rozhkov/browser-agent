@@ -700,7 +700,7 @@ image".
 `CURSOR_JS`'s own value is a Promise, unlike every other script in this
 file — `executeJavaScript` awaits it, and the animation spans several
 `requestAnimationFrame` ticks. It never throws (every path resolves,
-including a `{ error }` shape) and always settles within ~1.15s via its own
+including a `{ error }` shape) and always settles within 600ms via its own
 internal backstop timer, since `requestAnimationFrame` can simply stop
 firing in a backgrounded tab. Every settle path — `finish()` — is what
 clears the backstop, never a caller of `finish()`: an earlier version
@@ -720,7 +720,7 @@ consecutive moves chain from wherever the cursor actually is.
 timeout.** `moveCursor` runs *inside* the same closure `withCommandTimeout`
 bounds for every action that does a cursor step (`act`'s click/type/scroll,
 `perform`) — early versions passed the controller's plain `timeoutMs` as that
-closure's budget, so the cursor's up-to-`CURSOR_TIMEOUT_MS` (1.5s) came out of
+closure's budget, so the cursor's up-to-`CURSOR_TIMEOUT_MS` (0.9s) came out of
 the same 20s the action itself needs, and a slow-but-successful click already
 close to that budget could time out purely because of a cosmetic overlay.
 Those four call sites now pass `this.timeoutMs + this.cursorBudgetMs` instead
@@ -734,7 +734,7 @@ visible.** `TabManager.browserHandle()` (and therefore
 `BrowserController.currentPage()`) can return a browser tab that isn't the
 *active* one, and a hidden `WebContentsView` never fires
 `requestAnimationFrame` — so the animation would only ever settle via its own
-backstop, paying the full ~1.15s per click/type/select for an overlay nobody
+backstop, paying the full 600ms per click/type/select for an overlay nobody
 can see (the same rAF-in-a-hidden-tab failure this repo already hit with
 `get_screenshot`). `BrowserPageHandle` (`controller.ts`) and `TabViewHandle`
 (`tabManager.ts`) both carry an **optional** `isVisible?(): boolean`; the real
@@ -797,7 +797,7 @@ last sample a settle tail (120 Hz, ≤36 samples, until |rot| < 0.002; none if
 rot is already ~0) eases rot home along the shortest arc — at most a half-turn
 — and the final sample is exactly 0. The tail only extends playback after
 arrival: arrival is still the first sample within 1px of the target and still
-≤700ms, and the plan's `motionEndMs` is the pre-tail end that trail/glow
+≤300ms (`ARRIVAL_CAP_MS`), and the plan's `motionEndMs` is the pre-tail end that trail/glow
 lifetimes key off (the tail extends only the arrow transform; the trail canvas
 is cleared once its redraw window ends). When re-enabled, `signature_arc`,
 `spring_settle`, `comet_swoop` rotate (`tangent`); `magnetic` and `classic` never
@@ -810,7 +810,7 @@ arc. `CURSOR_JS` sets one composed transform `rotate(rot rad) scale(squish)` on
 the arrow SVG (`arrowTransform`), with `transform-origin` = `ARROW_PIVOT` =
 (0,0) of the 22×26 viewBox: the hotspot that lands on the target. The "within
 1px" pivot guarantee covers the blue fill's rounded tip
-(`test/cursorMotion.test.ts` checks it, and that the pivot is fixed under
+(`pen-editor-desktop/test/cursorMotion.test.ts` checks it, and that the pivot is fixed under
 rotate+scale); the white rim's rounded tip extends ~1.5–2px past it, as it
 always did. The drop-shadow filter sits on the non-rotating carrier so the
 shadow always falls downward. The current rot is stored on
@@ -831,11 +831,18 @@ animation. `sampleAt` wraps the interpolated rot so `state.rot` stays in (-π, �
 (offset back along the velocity, as in cua), independent of rot.
 `CURSOR_VERSION` is `"6"`.
 
+**Agent speed.** Every non-reduced plan is multiplied by `MOTION_TIME_SCALE` = 0.4
+(2.5× faster than the cua timings; the cursor used to cost ~0.8s of a ~1.2s
+action because the action awaits arrival). `planMove` does one retime with
+`k = min(MOTION_TIME_SCALE, ARRIVAL_CAP_MS / arrivalT)`. `MAGNET_MS` is scaled by
+the same factor; `TRAIL_MS`, `RIPPLE_MS` and the press timings are unchanged.
+Classic's overshoot samples are appended after the retime (+8ms/+25ms).
+
 `dc_ms = clamp(150 + 120·log2(D/W + 1), 300, 1000) × scale`, W = the target
 rect's smaller side (min 4), or a 24px box for an `args.point` (Fitts-aware:
 small targets slower, big ones faster). There is no duration override
 (`args.durationMs` was removed; no caller sent it). **Hard cap: whatever the
-style, the *arrival* moment is retimed to ≤700ms**, so the 1150ms backstop never wins in a visible tab (two rAFs for
+style, the *arrival* moment is retimed to ≤300ms** (`ARRIVAL_CAP_MS`), so the 600ms backstop (itself under `CURSOR_TIMEOUT_MS` = 900ms) never wins in a visible tab (two rAFs for
 `scrollIntoView` come before the move). The magnetic style also fogs
 (glow) like cua's renderer does.
 
@@ -869,7 +876,7 @@ head, opacity k²·0.45, faded out when shorter than 60px; `glow` — one radial
 gradient div offset against velocity, radius/alpha growing with speed
 (alpha is ramped by speed so it is exactly 0 at rest — no lingering halo);
 `magnet` — outline of the target rect when magnetic locks on, fades over
-700ms; `ripple` — the pre-engine click pulse, deliberately quiet: a 24px
+`MAGNET_MS` = 700 × `MOTION_TIME_SCALE` = 280ms; `ripple` — the pre-engine click pulse, deliberately quiet: a 24px
 ring, 2px white border with a 1px dark outline, scaled 0.4→1.6 over 380ms
 (ease-out), opacity 0.9→0 (click/select). The cua ring (bright blue, 8→52px,
 5px line) was replaced on 2026-10-11 as too loud; `squish` — arrow scales to 0.88 over 50ms then springs
@@ -917,10 +924,15 @@ so `cursorBudgetMs` and the cursor step always agree even if the user flips the
 setting mid-command. `controller.ts` forwards the style to CURSOR_JS as
 `args.style` (omitted when unset). Keep `controller.ts` / `pageScripts.ts` (now in the package) free
 of electron imports. Tests:
-`test/cursorMotion.test.ts` evaluates `CURSOR_PLAN_JS` — the pure planner
-(constants, easing/path math, `planMove`, `sampleAt`, `velocityAt`) that
-`pageScripts.ts` exports as its own fragment and CURSOR_JS embeds the way it
-embeds `FIND_BY_TEXT_JS`. Production CURSOR_JS has no test hook.
+`CURSOR_PLAN_JS` is the pure planner (constants, easing/path math, `planMove`,
+`sampleAt`, `velocityAt`) that `pageScripts.ts` exports as its own fragment and
+CURSOR_JS embeds the way it embeds `FIND_BY_TEXT_JS`. Production CURSOR_JS has
+no test hook. `test/controller/cursorPlan.test.ts` evaluates it and covers ONLY
+`planMove` timing: arrival ≤ `ARRIVAL_CAP_MS` (300ms) per style, `MOTION_TIME_SCALE`
+(0.4) being applied to an under-cap move, classic's overshoot samples staying a
+frame apart, and reduced motion keeping its 120ms glide. The pivot, `sampleAt`,
+`velocityAt`, heading and rotation tests live in
+`pen-editor-desktop/test/cursorMotion.test.ts`.
 
 ### Full browser use (2026-09-23)
 
