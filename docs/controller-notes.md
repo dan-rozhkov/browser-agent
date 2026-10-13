@@ -1794,3 +1794,14 @@ sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
 - Primary signal: after a landed click on a choice control, the history label gets " → now checked" / " → now unchecked" when the next snapshot shows the same control flipped, so the policy sees what the click did. Radios are included in the note.
 - Safety net: a non-radio control the loop's own click turned on (keyed by url without hash + role + label) is not clicked again while still `checked` ("already selected, not clicking again": first one is a rule step off the stall counters, a repeat counts unproductive). The set is cleared on a URL change and on a landed TYPE_TEXT. Sub-goals whose action asks to remove/uncheck/clear are exempt (the "Already done earlier" tail is ignored).
 - A click that opened a tab skips the post-click bookkeeping (effect note, quantity observe, page-state mark, toggle tracking, picker tracking); the cache write stays.
+
+## Regression note (v0.2.2 → v0.2.5/0.2.6): form fields got slow
+
+- v0.2.2 put a "different number = different option" line into the click-target
+  prompt. On forms whose goal quotes a value with digits (a phone, "£2,500 pcm")
+  Luna then refused every click target right after a field fill — the submit
+  button has no such number — so the sub-goal stalled ("no candidate fits CLICK"
+  ×3), the site reopened and the form was filled again. Removed in v0.2.5; the
+  deterministic `literal-mismatch` gate is the only guard now.
+- `value-already-set` returned DONE when no runner-up existed, which closed
+  sub-goals on a text-helper mismatch. Since v0.2.6 it falls back to typing.

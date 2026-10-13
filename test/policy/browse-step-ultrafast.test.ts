@@ -1508,14 +1508,15 @@ describe("value-already-set gate (retyping what a field holds)", () => {
     expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
   });
 
-  it("ends with DONE rather than BLOCKED when nothing else is left", async () => {
+  // Ending the sub-goal here closed it on a text-helper mismatch live, so with
+  // nothing else to do the step types as it did before the gate existed.
+  it("types as usual (never DONE) when nothing else is left", async () => {
     mockFieldText("Berlin Hauptbahnhof");
     const { result } = await decide(
       { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
       { goal, elements: [field("  Berlin  HAUPTBAHNHOF ")] },
     );
-    expect(result).toMatchObject({ outcome: "done", operation: "DONE" });
-    expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
+    expect(result).toMatchObject({ outcome: "act", operation: "TYPE_TEXT", index: 1 });
   });
 
   it("still types when the field holds a different value", async () => {
@@ -1541,10 +1542,10 @@ describe("value-already-set compares by equality, not substring", () => {
   it("is already set when an autocomplete appended after a non-alphanumeric boundary", async () => {
     mockFieldText("Berlin Hauptbahnhof");
     const { result } = await decide(
-      { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
-      { goal: 'Search "Berlin Hauptbahnhof"', elements: [{ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value: "Berlin Hauptbahnhof, Germany" }] },
+      { operation: choice("TYPE_TEXT", 0.8, { probabilities: { TYPE_TEXT: 0.8, CLICK: 0.3 } }), type_text_target: choice("1", 0.8), click_target: choice("2", 0.8) },
+      { goal: 'Search "Berlin Hauptbahnhof"', elements: [{ index: 1, tag: "input", label: "Destination", ops: ["TYPE_TEXT"], value: "Berlin Hauptbahnhof, Germany" }, { index: 2, tag: "button", label: "Search", ops: ["CLICK"] }] },
     );
-    expect(result).toMatchObject({ outcome: "done" });
+    expect(result).toMatchObject({ outcome: "act", operation: "CLICK", index: 2 });
     expect(result.diag?.gates).toContainEqual(expect.objectContaining({ head: "value-already-set" }));
   });
 
@@ -1552,8 +1553,8 @@ describe("value-already-set compares by equality, not substring", () => {
     for (const [text, value, set] of [["1500", "1,500", true], ["100", "1000", false], ["shoes", "red shoes for men", false]] as const) {
       mockFieldText(text);
       const { result } = await decide(
-        { operation: choice("TYPE_TEXT", 0.8), type_text_target: choice("1", 0.8) },
-        { goal: `Enter "${text}"`, elements: [{ index: 1, tag: "input", label: "Amount", ops: ["TYPE_TEXT"], value }] },
+        { operation: choice("TYPE_TEXT", 0.8, { probabilities: { TYPE_TEXT: 0.8, CLICK: 0.3 } }), type_text_target: choice("1", 0.8), click_target: choice("2", 0.8) },
+        { goal: `Enter "${text}"`, elements: [{ index: 1, tag: "input", label: "Amount", ops: ["TYPE_TEXT"], value }, { index: 2, tag: "button", label: "Apply", ops: ["CLICK"] }] },
       );
       expect(result.diag?.gates.some((g) => g.head === "value-already-set")).toBe(set);
     }

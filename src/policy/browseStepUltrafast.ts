@@ -1545,20 +1545,9 @@ export async function decideBrowseStepUltrafast(
       if (!altHead) return finish({ outcome: "act", operation: alt as BrowseOperation, confidence: altP, model });
       return decideTarget(alt as BrowseOperation, altHead, choiceAnswer(answers[TARGET_QUESTION_ID[altHead]]), altP);
     }
-    if (alreadySet) {
-      // Nothing else to do on the page: the field already holds the value, so
-      // retyping would change nothing. End the sub-goal instead of BLOCKED.
-      gates.push({ head: "value-already-set", peak: peakProbability(targetAnswer), threshold: 0, jevPick: `TYPE_TEXT ${target.index}` });
-      ruleTier = true;
-      return finish({
-        outcome: "done",
-        operation: "DONE",
-        confidence: stepConfidence,
-        model,
-        reason: `the field "${truncateLabel(el.label, 60)}" already holds the value`,
-      });
-    }
-    return finish(blocked(`the goal gives no value for the field "${truncateLabel(el.label, 60)}"`, model, stepConfidence));
+    // alreadySet with no runner-up: type as usual. Ending the sub-goal here
+    // closed it on a text-helper mismatch (live: "TO RENT" in a location box).
+    if (text === null) return finish(blocked(`the goal gives no value for the field "${truncateLabel(el.label, 60)}"`, model, stepConfidence));
   }
   const finalText = shortenRetypedQuery(input.history, el, elements, text);
   if (finalText !== text) {
