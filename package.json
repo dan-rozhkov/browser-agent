@@ -1,15 +1,16 @@
 {
-  "name": "@pen/browser-agent",
-  "version": "0.1.0",
+  "name": "@sideform/browser-agent",
+  "version": "0.2.0",
   "private": true,
   "description": "Goal-driven browser agent: page controller, step policy and browse_task loop, decoupled from pen-editor.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -120,5 +121,9 @@
         "dist/adapters/controllerBridge.d.ts"
       ]
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dan-rozhkov/browser-agent.git"
   }
 }

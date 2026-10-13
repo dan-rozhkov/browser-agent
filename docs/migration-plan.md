@@ -1,4 +1,4 @@
-# Migration plan: pen-editor repos → `@pen/browser-agent`
+# Migration plan: pen-editor repos → `@sideform/browser-agent`
 
 Status: plan only. Stage 1 did not change `pen-editor`, `pen-editor-backend`
 or `pen-editor-desktop`. Each step below is a separate PR in one repo, with
@@ -6,18 +6,15 @@ its own lint/test/build gate.
 
 ## 0. Preconditions (all repos)
 
-1. **Distribution.** The package is private and not on a registry. Install
-   it from the private GitHub repo, pinned to a tag:
-   `"@pen/browser-agent": "github:dan-rozhkov/browser-agent#v0.1.0"`.
+1. **Distribution.** The repo is public (MIT) and the package is not on a
+   registry. Install it from GitHub, pinned to a tag:
+   `"@sideform/browser-agent": "github:dan-rozhkov/browser-agent#v0.2.0"`.
    npm runs the package's `prepare` script (`npm run build`) on install, so
    `dist/` is built on the consumer side.
-2. **CI access.** Each consumer's GitHub Actions needs read access to the
-   private repo: a fine-grained PAT (contents: read on `browser-agent`
-   only) stored as a repo secret, used by `actions/checkout` or by
-   `git config url."https://x-access-token:${TOKEN}@github.com/".insteadOf`
-   before `npm ci`. Render (backend deploy) needs the same token as a build
-   env var. **This touches prod env — do it by hand, not from an agent.**
-3. **Tag `v0.1.0`** on `browser-agent` `main` after it is green.
+2. **CI access.** None needed: the repo is public, so `npm ci` in GitHub
+   Actions and in the Render build fetches it without a token.
+3. **Tag** on `browser-agent` `main` after it is green. Consumers bump the
+   tag in `package.json`, never point at a branch.
 4. **Freeze window.** While a layer migrates, browser-use fixes land in
    `browser-agent` first, then the consumer bumps the tag. Do not fix the
    same bug in both places.
@@ -25,7 +22,7 @@ its own lint/test/build gate.
 ## 1. Merge order
 
 ```
-browser-agent v0.1.0
+browser-agent v0.2.0
    │
    ├─► (A) pen-editor-backend: policy + cloud browser    ─┐
    ├─► (B) pen-editor-desktop: controller                 ├─ independent of each other
@@ -53,11 +50,11 @@ A1. Add the dependency; keep `ai`, `zod`, `playwright-core` (they become
 
 A2. **Policy.** Replace `src/ai/browseStep.ts`, `browseStepUltrafast.ts`,
     `browseCommitGuard.ts`, `browseCaptcha.ts`, `browseLocate.ts`,
-    `browsePlan.ts` with imports from `@pen/browser-agent/policy`. Build
+    `browsePlan.ts` with imports from `@sideform/browser-agent/policy`. Build
     the options once in `app.ts`:
 
     ```ts
-    import { aiSdkTextModel } from "@pen/browser-agent/adapters/ai-sdk";
+    import { aiSdkTextModel } from "@sideform/browser-agent/adapters/ai-sdk";
     const policy: BrowsePolicyOptions = {
       decisions: systemOneClient,                 // see A3
       models: {
@@ -83,7 +80,7 @@ A3. **System One.** `src/services/systemone.ts` has other callers (taste
     apiKey: config.TYPESAFE_API_KEY, model: config.TYPESAFE_MODEL, baseUrl:
     config.TYPESAFE_BASE_URL, openRouterApiKey: config.OPENROUTER_API_KEY })`
     (returning `null` when the key is empty, as before), and re-export the
-    types from `@pen/browser-agent/policy`.
+    types from `@sideform/browser-agent/policy`.
 
 A4. **PII.** `src/analysis/pii.ts` is used outside browsing (trace
     analysis). Keep it in the backend. The package carries its own copy;
@@ -95,7 +92,7 @@ A5. **Cloud browser vendor.** Delete `src/browser/vendor/`,
     the `browser:sync` script. `src/browser/playwrightHandle.ts`,
     `connect.ts`, `redact.ts` → import `PlaywrightTarget`,
     `connectOverCdp`, `redactedError` from
-    `@pen/browser-agent/adapters/playwright`. `cloudSessions.ts` keeps its
+    `@sideform/browser-agent/adapters/playwright`. `cloudSessions.ts` keeps its
     `CommandRunner` type; `connectOverCdp`'s `controller` satisfies it.
     The vendored copy was pinned to a desktop commit; the package tag now
     plays that role.
@@ -121,7 +118,7 @@ B1. Add the dependency. The desktop is CommonJS (`"module": "commonjs"`)
     with a packaged build (`npm run dist` or equivalent), not only `tsc`.
 
 B2. Replace `src/main/browser/controller.ts`, `pageScripts.ts`, `keys.ts`
-    with imports from `@pen/browser-agent/controller`. `navigation.ts`
+    with imports from `@sideform/browser-agent/controller`. `navigation.ts`
     keeps everything Electron-specific and imports
     `decideBrowserNavigation` from the package (or keeps its own — it is
     10 lines; prefer the import so the two cannot drift).
@@ -149,12 +146,12 @@ C1. Add the dependency. Vite bundles the package's ESM directly; the
 
 C2. Replace `src/lib/tools/browser/browseTask.ts`, `actionCache.ts`,
     `actionEffect.ts`, `loopGuard.ts` and the loop parts of `shared.ts`
-    with `@pen/browser-agent/loop`. The `browseTask` `ToolHandler` stays
+    with `@sideform/browser-agent/loop`. The `browseTask` `ToolHandler` stays
     and becomes glue:
 
     ```ts
-    import { runBrowseTask } from "@pen/browser-agent/loop";
-    import { createHttpBackend } from "@pen/browser-agent/adapters/http-backend";
+    import { runBrowseTask } from "@sideform/browser-agent/loop";
+    import { createHttpBackend } from "@sideform/browser-agent/adapters/http-backend";
     const backend = createHttpBackend({
       baseUrl: resolveApiUrl("/"),
       credentials: credentialsMode, // "include" when accounts are on

@@ -19,7 +19,7 @@ export interface TextModel {
   }): Promise<{ object: T; usage?: { inputTokens?: number; outputTokens?: number } }>;
 }
 
-const INVALID_OBJECT_MARKER = Symbol.for("@pen/browser-agent.TextModelInvalidObjectError");
+const INVALID_OBJECT_MARKER = Symbol.for("@sideform/browser-agent.TextModelInvalidObjectError");
 
 /** The model answered, but not with an object matching the schema (was the
  * AI SDK's `NoObjectGeneratedError`). The cascade retries once on it. */

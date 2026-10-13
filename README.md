@@ -1,4 +1,4 @@
-# @pen/browser-agent
+# @sideform/browser-agent
 
 A goal-driven browser agent as a TypeScript library. Give it a goal and a
 browser; it loops (snapshot the page, decide the next step, act) until the
@@ -35,7 +35,7 @@ three pen-editor repos move onto this package.
 The package is private. Install it from the Git repo:
 
 ```bash
-npm install github:dan-rozhkov/browser-agent#v0.1.0
+npm install github:dan-rozhkov/browser-agent#v0.2.0
 ```
 
 `prepare` builds `dist/` on install. Peer dependencies are optional:
@@ -54,11 +54,11 @@ TYPESAFE_API_KEY=... OPENROUTER_API_KEY=... npm run example -- "open example.com
 The core of it:
 
 ```ts
-import { runBrowseTask, memoryStorage } from "@pen/browser-agent";
-import { controllerBridge } from "@pen/browser-agent/adapters/controller-bridge";
-import { createLocalBackend } from "@pen/browser-agent/adapters/local-backend";
-import { connectOverCdp } from "@pen/browser-agent/adapters/playwright";
-import { createSystemOneClient } from "@pen/browser-agent/adapters/systemone-http";
+import { runBrowseTask, memoryStorage } from "@sideform/browser-agent";
+import { controllerBridge } from "@sideform/browser-agent/adapters/controller-bridge";
+import { createLocalBackend } from "@sideform/browser-agent/adapters/local-backend";
+import { connectOverCdp } from "@sideform/browser-agent/adapters/playwright";
+import { createSystemOneClient } from "@sideform/browser-agent/adapters/systemone-http";
 
 const { controller, close } = await connectOverCdp(process.env.CDP_URL!);
 const transcript = await runBrowseTask("find the cheapest laptop on example.com", {
@@ -100,21 +100,21 @@ await close();
 
 | Import | Contents |
 |---|---|
-| `@pen/browser-agent` | controller + policy + loop barrels (no adapters) |
-| `@pen/browser-agent/controller` | controller layer |
-| `@pen/browser-agent/policy` | policy layer |
-| `@pen/browser-agent/loop` | loop layer |
-| `@pen/browser-agent/adapters/playwright` | `PlaywrightTarget`, `connectOverCdp` |
-| `@pen/browser-agent/adapters/systemone-http` | `createSystemOneClient` |
-| `@pen/browser-agent/adapters/ai-sdk` | `aiSdkTextModel` |
-| `@pen/browser-agent/adapters/http-backend` | `createHttpBackend` |
-| `@pen/browser-agent/adapters/local-backend` | `createLocalBackend` |
-| `@pen/browser-agent/adapters/controller-bridge` | `controllerBridge` |
+| `@sideform/browser-agent` | controller + policy + loop barrels (no adapters) |
+| `@sideform/browser-agent/controller` | controller layer |
+| `@sideform/browser-agent/policy` | policy layer |
+| `@sideform/browser-agent/loop` | loop layer |
+| `@sideform/browser-agent/adapters/playwright` | `PlaywrightTarget`, `connectOverCdp` |
+| `@sideform/browser-agent/adapters/systemone-http` | `createSystemOneClient` |
+| `@sideform/browser-agent/adapters/ai-sdk` | `aiSdkTextModel` |
+| `@sideform/browser-agent/adapters/http-backend` | `createHttpBackend` |
+| `@sideform/browser-agent/adapters/local-backend` | `createLocalBackend` |
+| `@sideform/browser-agent/adapters/controller-bridge` | `controllerBridge` |
 
 **Name collisions at the root.** Two names exist in more than one layer.
 The root barrel exports the controller's `MAX_SNAPSHOT_ELEMENTS` (both are
 `120`) and the loop's `BrowsePermissions` (the type `runBrowseTask` takes).
-The policy's versions stay available from `@pen/browser-agent/policy`.
+The policy's versions stay available from `@sideform/browser-agent/policy`.
 
 ## API: layers
 

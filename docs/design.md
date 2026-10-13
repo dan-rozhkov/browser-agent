@@ -259,7 +259,7 @@ answers 5xx like the route.
 3. `TextModel` is a minimal `generateObject` interface plus an AI SDK
    adapter; `ai` is an optional peer dependency. `zod` is a real
    dependency (schemas are part of the policy).
-4. Package name `@pen/browser-agent`, `private: true`, version 0.1.0.
+4. Package name `@sideform/browser-agent`, `private: true`, version 0.1.0.
    Consumers install it from the private Git repo (`github:` dependency)
    until a registry is chosen.
 5. ESM + NodeNext (`.js` import suffixes) — the backend's convention; the

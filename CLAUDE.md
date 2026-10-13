@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-`@pen/browser-agent`: a goal-driven browser agent library (controller + policy
+`@sideform/browser-agent`: a goal-driven browser agent library (controller + policy
 + loop + adapters), extracted from pen-editor. TypeScript, ESM/NodeNext,
 Vitest 4, ESLint 9. Read `README.md` for the API, `docs/design.md` for the
 design, `docs/migration-plan.md` for how consumers move onto it.

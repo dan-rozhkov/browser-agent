@@ -6,7 +6,7 @@ Code commit: `fda7ddd` on `main` (this report is the commit after it).
 ## Result
 
 - New git repo `browser-agent/` next to the other three. It is a TypeScript
-  library (`@pen/browser-agent`, `private: true`, 0.1.0) with ESM/NodeNext,
+  library (`@sideform/browser-agent`, `private: true`, 0.1.0) with ESM/NodeNext,
   subpath exports and `typesVersions` (so CommonJS/node10 consumers such as
   pen-editor-desktop also resolve the types).
 - `npm run lint` (tsc + eslint), `npm test` (22 files, **1414 tests**) and
