@@ -38,9 +38,10 @@ const QUANTITY_PATTERNS: RegExp[] = [
   new RegExp(String.raw`(?<![\p{L}\p{N}])(?:quantity|qty)\s*(?:of|to|=|:)?\s*${NUM}(?![\p{L}\p{N}])${NOT_MEASURE}`, "giu"),
   new RegExp(String.raw`(?<![\p{L}\p{N}])set\b(?=[^.]{0,40}?(?:quantity|qty|units?|items?|amount|number|count))[^.]{0,40}?\bto\s+${NUM}(?![\p{L}\p{N}])${NOT_MEASURE}`, "giu"),
 ];
-/** "quantity to N" / "qty = N" / "set … to N": N is the final count shown, not an increment. */
+/** "quantity to N" / "qty = N" / "set … to N": N is the final count shown, not an increment.
+ * "a quantity of N" stays a delta: it usually means N more units. */
 const ABSOLUTE_PATTERNS: RegExp[] = [QUANTITY_PATTERNS[3], QUANTITY_PATTERNS[4]].map(
-  (re) => new RegExp(re.source.replace(String.raw`\s*(?:of|to|=|:)?\s*`, String.raw`\s*(?:of|to|=|:)\s*`), "giu")
+  (re) => new RegExp(re.source.replace(String.raw`\s*(?:of|to|=|:)?\s*`, String.raw`\s*(?:to|=|:)\s*`), "giu")
 );
 
 function valueOf(raw: string): number {

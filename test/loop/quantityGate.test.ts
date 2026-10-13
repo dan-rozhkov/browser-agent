@@ -68,5 +68,6 @@ describe("parseTarget", () => {
     expect(parseTarget("Set quantity to 3", "")).toEqual({ quantity: 3, absolute: true });
     expect(parseTarget("Set the number of units to 4", "")).toEqual({ quantity: 4, absolute: true });
     expect(parseTarget("Add 2 units", "")).toEqual({ quantity: 2, absolute: false });
+    expect(parseTarget("Add a quantity of 3", "")).toEqual({ quantity: 3, absolute: false });
   });
 });
