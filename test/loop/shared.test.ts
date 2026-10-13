@@ -1,7 +1,6 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { filterElementsForBackend, sanitizedPageBody, truncateToChars } from "../shared";
+import { filterElementsForBackend, sanitizedPageBody, truncateToChars } from "../../src/loop/shared.js";
+import { browseStepBodySchema } from "../../src/policy/schemas.js";
 
 describe("filterElementsForBackend", () => {
   it("keeps elements with a non-empty ops array", () => {
@@ -67,8 +66,6 @@ describe("filterElementsForBackend", () => {
   });
 });
 
-const BACKEND_STEP_ROUTE = resolve(process.cwd(), "../pen-editor-backend/src/routes/browseStep.ts");
-
 describe("filterElementsForBackend: valid by construction", () => {
   const oversized = {
     index: 3,
@@ -123,11 +120,7 @@ describe("filterElementsForBackend: valid by construction", () => {
     expect(filterElementsForBackend([el])).toEqual([]);
   });
 
-  it.skipIf(!existsSync(BACKEND_STEP_ROUTE))("passes the backend's zod bodySchema", async () => {
-    // Variable path: keeps `tsc` from type-checking the backend sources.
-    const { bodySchema } = (await import(/* @vite-ignore */ BACKEND_STEP_ROUTE)) as {
-      bodySchema: { safeParse: (v: unknown) => { success: boolean; error?: unknown } };
-    };
+  it("passes the step body schema (browseStepBodySchema, the backend route's zod copy)", () => {
     const body = {
       goal: "g",
       url: "https://example.com",
@@ -135,8 +128,8 @@ describe("filterElementsForBackend: valid by construction", () => {
       elements: filterElementsForBackend([oversized, { ...oversized, index: 4, frame: "x" }]),
       history: [],
     };
-    const parsed = bodySchema.safeParse(body);
-    expect(parsed.success, JSON.stringify(parsed.error)).toBe(true);
+    const parsed = browseStepBodySchema.safeParse(body);
+    expect(parsed.success, JSON.stringify(parsed.success ? null : parsed.error)).toBe(true);
   });
 });
 

@@ -1,5 +1,5 @@
-import { scrubPii } from "../analysis/pii.js";
-import type { SystemOneClient } from "../services/systemone.js";
+import { scrubPii } from "./pii.js";
+import type { SystemOneClient } from "./decisions.js";
 import { isCarriedOverEntry, type BrowseStepInput, type BrowseStepResult } from "./browseStep.js";
 
 // Deterministic irreversible-action guard for browse_task. Live finding: with

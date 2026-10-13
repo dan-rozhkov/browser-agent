@@ -1,0 +1,58 @@
+/**
+ * The browser the loop drives. The shape is pen-editor's preload surface
+ * (`window.penDesktop.browser`, docs/superpowers/specs/
+ * 2026-09-18-builtin-browser-design.md §5), so the desktop shell's bridge, the
+ * cloud-browser bridge and `controllerBridge()` all satisfy it as is. A host
+ * passes one in as the `browser` option of `runBrowseTask`.
+ *
+ * Each call always resolves (the controller reports refusals as `{ error }`),
+ * never rejects with anything the loop needs to catch specially — but the
+ * loop still wraps every call in try/catch defensively.
+ */
+export interface BrowserBridge {
+  open(args: { url: string }): Promise<unknown>;
+  act(args: Record<string, unknown>): Promise<unknown>;
+  findImages?(args: Record<string, unknown>): Promise<unknown>;
+  /**
+   * browse_read (docs/superpowers/specs/2026-09-18-browse-task-jev-loop-
+   * design.md, Addendum 2 §2) — a readable digest of the current page:
+   * headings, capped visible text, and links.
+   */
+  read(args: Record<string, unknown>): Promise<unknown>;
+  /**
+   * browse_task loop internals (docs/superpowers/specs/
+   * 2026-09-18-browse-task-jev-loop-design.md §1/§3). `snapshot` returns the
+   * page's element table stamped with a `snapshotId`, and `perform` acts by
+   * index against that same snapshot, rejecting a stale id. Only the
+   * browse_task loop calls these; the model never sees them directly.
+   */
+  snapshot(): Promise<unknown>;
+  perform(args: {
+    snapshotId: string;
+    index?: number;
+    operation: string;
+    text?: string;
+  }): Promise<unknown>;
+  /**
+   * browse_screenshot (docs/superpowers/specs/
+   * 2026-09-23-full-browser-use-design.md, "Desktop bridge") — a viewport
+   * capture of the current browser tab, downscaled and JPEG-encoded on
+   * the main-process side. `annotate: true` additionally takes a fresh
+   * snapshot and overlays numbered labels (set-of-marks), returning
+   * `snapshotId`/`elements` alongside the image so a following
+   * `browse_act`/`browse_snapshot` call can act by index against it.
+   * Optional — absent on bridges older than this feature.
+   */
+  screenshot?(args?: { annotate?: boolean; snapshotId?: string }): Promise<unknown>;
+  /**
+   * browse_tabs (same design doc) — list/switch/close/open the shell's
+   * browser tabs. `new` optionally loads `url` with `open`'s semantics and
+   * makes the new tab the agent's current tab. Optional — absent on bridges
+   * older than this feature.
+   */
+  tabs?(args: {
+    action: "list" | "switch" | "close" | "new";
+    tabId?: number;
+    url?: string;
+  }): Promise<unknown>;
+}

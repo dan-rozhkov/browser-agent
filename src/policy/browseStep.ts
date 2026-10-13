@@ -1,15 +1,14 @@
 import { withRedactedGoal } from "./browseCommitGuard.js";
-import { generateObject, NoObjectGeneratedError } from "ai";
+import { TextModelInvalidObjectError } from "./textModel.js";
 import { z } from "zod";
-import type { Config } from "../config.js";
-import { createModel } from "./provider.js";
+import type { BrowsePolicyOptions } from "./decide.js";
 import type {
   SystemOneAnswer,
   SystemOneChoiceAnswer,
   SystemOneClient,
   SystemOneQuestion,
-} from "../services/systemone.js";
-import { scrubPii, findPiiSpans, PII_KINDS, type PiiSpan } from "../analysis/pii.js";
+} from "./decisions.js";
+import { scrubPii, findPiiSpans, PII_KINDS, type PiiSpan } from "./pii.js";
 
 // The Jev-driven decision core of POST /api/browse/step (see
 // docs/superpowers/specs/2026-09-18-browse-task-jev-loop-design.md §2, and
@@ -128,7 +127,7 @@ export function peakProbability(answer: SystemOneChoiceAnswer): number {
  * bench-shop task, and looked like a clear win while the cascade fallback sat
  * on `deepseek-v4.1-flash` (2.6s per cascade call): decision time 56s→28s
  * over the corpus. But that number bundled two effects together — fewer
- * cascade calls AND a slower cascade model — and once BROWSE_CASCADE_MODEL
+ * cascade calls AND a slower cascade model — and once opts.models.cascade (was BROWSE_CASCADE_MODEL)
  * moved to `openrouter:google/gemini-2.5-flash` (~0.9s per call, 27/30
  * judged-correct on the hardest replay steps) the comparison could be redone
  * cleanly: 9 live runs per config, same cascade model both times. At the
@@ -500,7 +499,7 @@ export interface BrowseStepInput {
    * when one is open (ultrafast policy only; absent from older clients). */
   modal?: string;
   /** Marked (Set-of-Marks) screenshot as a data: URL. Only the ultrafast
-   * policy with BROWSE_STEP_VISION=on reads it. Never logged. */
+   * policy with opts.vision === true (was BROWSE_STEP_VISION=on) reads it. Never logged. */
   screenshot?: string;
   /** User-controlled switches (request body `permissions`). Absent on older
    * clients: allowPasswordEntry=false, confirmIrreversible=true. */
@@ -529,7 +528,7 @@ export interface BrowseStepResult {
   confidence: number;
   model: string;
   reason?: string;
-  /** True when this result came from the BROWSE_CASCADE_MODEL cascade
+  /** True when this result came from the opts.models.cascade cascade (was BROWSE_CASCADE_MODEL)
    * (cascadeStep below) rather than the primary Jev fan-out — see that
    * function's comment. `model` is the cascade model's id in that case,
    * not Jev's. */
@@ -1305,14 +1304,13 @@ export function resolveTypedPlaceholder(
  * generateTypeText's fallback paths). The raw goal itself is never sent —
  * only the placeholder-substituted `promptGoal` is. */
 async function generateTypeText(
-  config: Config,
+  config: BrowsePolicyOptions,
   goal: string,
   fieldLabel: string,
   signal: AbortSignal,
 ): Promise<string> {
   const { text: promptGoal, tokenMap } = buildNumberedPlaceholderGoal(goal);
-  const { object } = await generateObject({
-    model: createModel(config, config.STRUCTURED_MODEL, { reasoningEffort: "none" }),
+  const { object } = await config.models.structured.generateObject({
     schema: typeTextSchema,
     abortSignal: signal,
     prompt: [
@@ -1960,8 +1958,8 @@ async function chooseSelectOption(
  * often perfectly answerable — Jev's per-head Choice/target fan-out is fast
  * but jaggeder on an unusual page than a full-context generative read.
  * `cascadeStep` is that second opinion: a single `generateObject` call
- * against `config.BROWSE_CASCADE_MODEL` (a separate role from
- * `generateTypeText` above's `STRUCTURED_MODEL` — see that config field's
+ * against `opts.models.cascade` (was BROWSE_CASCADE_MODEL) (a separate role from
+ * `generateTypeText` above's `opts.models.structured` (was STRUCTURED_MODEL) — see that field's
  * own comment for why), given the goal, url/title, recent history and the
  * same scrubbed compact element digest Jev saw —
  * never the raw elements, never anything Jev itself wasn't shown. Called
@@ -2282,8 +2280,8 @@ function markCascadeTier(diag: BrowseStepDiagState, cascaded: BrowseStepResult |
  * still caught by the ordinary `!allowDone` check right below and rejected
  * exactly like any other cascade failure (the caller's own gate stays
  * `blocked`, never a special-cased outcome). Runs on
- * `config.BROWSE_CASCADE_MODEL`, a separate, cheaper/faster model than
- * STRUCTURED_MODEL — see that config field's own comment for the
+ * `opts.models.cascade` (was BROWSE_CASCADE_MODEL), a separate, cheaper/faster model than
+ * opts.models.structured (was STRUCTURED_MODEL) — see that field's own comment for the
  * measurement. */
 /** Round 5 review #10: cascadeStep/timedCascadeStep used to take ~10
  * positional parameters, most of them booleans/optionals whose meaning at a
@@ -2291,7 +2289,7 @@ function markCascadeTier(diag: BrowseStepDiagState, cascaded: BrowseStepResult |
  * function signature. One options object, named at every call site,
  * instead. */
 interface CascadeStepOptions {
-  config: Config;
+  config: BrowsePolicyOptions;
   // RAW goal (never scrubbedGoal) — see this function's own doc comment.
   goal: string;
   url: string;
@@ -2368,8 +2366,7 @@ async function cascadeStep({
     }
     try {
       calledModel = true;
-      const result = await generateObject({
-        model: createModel(config, config.BROWSE_CASCADE_MODEL, { reasoningEffort: "none" }),
+      const result = await config.models.cascade.generateObject({
         schema: cascadeSchema,
         abortSignal: AbortSignal.timeout(remainingMs),
         prompt: [
@@ -2427,11 +2424,11 @@ async function cascadeStep({
       object = result.object;
       break;
     } catch (err) {
-      if (NoObjectGeneratedError.isInstance(err) && !retried) {
+      if (TextModelInvalidObjectError.isInstance(err) && !retried) {
         retried = true;
         continue;
       }
-      if (NoObjectGeneratedError.isInstance(err)) {
+      if (TextModelInvalidObjectError.isInstance(err)) {
         return reject("invalid object (after retry)");
       }
       const name = err instanceof Error ? err.name : "error";
@@ -2443,7 +2440,7 @@ async function cascadeStep({
     return reject(`low confidence ${object.confidence.toFixed(2)} for ${object.operation}${object.done ? " (done)" : ""}`);
   }
 
-  const model = config.BROWSE_CASCADE_MODEL;
+  const model = config.models.cascade.id;
 
   if (object.done) {
     // Finding #8: a `done` reading must never end a task on zero recorded
@@ -2606,7 +2603,7 @@ type BrowseStepDiagState = Omit<BrowseStepDiag, "tier"> & { tier?: BrowseStepDia
  */
 export async function decideBrowseStep(
   client: SystemOneClient,
-  config: Config,
+  config: BrowsePolicyOptions,
   rawInput: BrowseStepInput,
 ): Promise<BrowseStepResult> {
   // No model ever sees a password the goal states (see browseCommitGuard.ts).
@@ -2631,7 +2628,7 @@ export async function decideBrowseStep(
  * decideBrowseStepCore's own locals, bundled once so every call site below
  * just passes `ctx` instead of eight separate positional arguments. */
 interface RepeatGuardContext {
-  config: Config;
+  config: BrowsePolicyOptions;
   timing: BrowseStepTiming;
   diag: BrowseStepDiagState;
   rawGoal: string;
@@ -2945,7 +2942,7 @@ async function escalateStalledWait(
 
 async function decideBrowseStepCore(
   client: SystemOneClient,
-  config: Config,
+  config: BrowsePolicyOptions,
   input: BrowseStepInput,
   timing: BrowseStepTiming,
   overallDeadline: number,

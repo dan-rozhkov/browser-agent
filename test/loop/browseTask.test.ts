@@ -1,6 +1,4 @@
-import { useBrowserAgentSettingsStore } from "@/store/browserAgentSettingsStore";
-import { fetchBrowseBackend } from "../shared";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACTION_CACHE_KILL_SWITCH_KEY,
   ACTION_CACHE_STORAGE_KEY,
@@ -8,9 +6,8 @@ import {
   hashCachedLabel,
   lookupStepCache,
   writeStepCacheEntry,
-} from "@/lib/tools/browser/actionCache";
+} from "../../src/loop/actionCache.js";
 import {
-  browseTask,
   browseTaskDeadlineMs,
   browseTaskInnerBoundMs,
   CLOUD_BROWSE_TASK_DEADLINE_MS,
@@ -18,31 +15,62 @@ import {
   capObservations,
   carryOverHistory,
   extractUrlFromGoal,
-  runBrowseTask,
-  runBrowseTaskLoop,
+  runBrowseTask as runBrowseTaskPublic,
+  runBrowseTaskCore,
+  runBrowseTaskLoop as runBrowseTaskLoopImpl,
   wantsTextEntry,
-} from "@/lib/tools/browser/browseTask";
-import { BROWSER_NOT_AVAILABLE_ERROR, type SnapshotResult } from "@/lib/tools/browser/shared";
+  type BrowsePermissions,
+  type LoopEnv,
+  type RunBrowseTaskOptions,
+} from "../../src/loop/browseTask.js";
+import { fetchBrowseBackend, type SnapshotResult } from "../../src/loop/shared.js";
+import { memoryStorage, type KeyValueStorage } from "../../src/loop/storage.js";
+import { createHttpBackend } from "../../src/adapters/httpBackend.js";
 import {
-  setPenDesktop,
   stubBrowser as createBrowserStub,
   stubFetchSequence,
-  type PenDesktopBrowser,
-} from "./helpers";
+  type BrowserBridge,
+} from "./helpers.js";
 
-// These suites pin the desktop-bridge behavior, including the "no bridge at
-// all" degradation path. On the web getBrowserBridge() would otherwise fall
-// back to the cloud bridge (covered in bridge.test.ts / cloudBrowser.test.ts),
-// so the cloud side is stubbed out to keep `window.penDesktop` absence
-// meaning "no browser".
-vi.mock("@/lib/cloudBrowser", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/cloudBrowser")>()),
-  cloudBrowserBridge: undefined,
-  getCloudBrowserBridge: () => undefined,
-}));
+// Per-test host state, in place of what the pen-editor suite got from ambient
+// globals: the Zustand permissions store -> `permissions`, localStorage ->
+// `store` (an in-memory KeyValueStorage), window.penDesktop -> the `browser`
+// argument. The backend is the real HTTP adapter over the stubbed global
+// `fetch` (the /api/browse/* wire is stubbed exactly as before), so every
+// request-shape assertion below is unchanged.
+let store: KeyValueStorage;
+let permissions: BrowsePermissions;
+let stepScreenshots: boolean;
+const backend = createHttpBackend({ baseUrl: "https://backend.test" });
 
-// Most scenarios below want `snapshot()` to resolve to a real single-button
-// page by default, unlike browserTools.test.ts's default `{}`.
+beforeEach(() => {
+  store = memoryStorage();
+  permissions = { allowPasswordEntry: false, confirmIrreversible: true };
+  stepScreenshots = false;
+});
+
+function envFor(browser: BrowserBridge): LoopEnv {
+  return { browser, backend, permissions, storage: store, cloud: false, stepScreenshots };
+}
+
+type LoopRest = Parameters<typeof runBrowseTaskLoopImpl> extends [unknown, unknown, unknown, ...infer R] ? R : never;
+type CoreRest = Parameters<typeof runBrowseTaskCore> extends [unknown, unknown, unknown, ...infer R] ? R : never;
+
+/** The positional loop, with the host state above injected. */
+function runBrowseTaskLoop(goal: string, maxSteps: number, browser: BrowserBridge, ...rest: LoopRest) {
+  return runBrowseTaskLoopImpl(goal, maxSteps, envFor(browser), ...rest);
+}
+
+/** Options for the public `runBrowseTask`, with the host state above injected. */
+function publicOpts(browser: BrowserBridge, extra: Partial<RunBrowseTaskOptions> = {}): RunBrowseTaskOptions {
+  return { browser, backend, permissions, storage: store, stepScreenshots, ...extra };
+}
+
+/** The positional multi-sub-goal core, with the host state above injected. */
+function runBrowseTask(goal: string, maxSteps: number, browser: BrowserBridge, ...rest: CoreRest) {
+  return runBrowseTaskCore(goal, maxSteps, envFor(browser), ...rest);
+}
+
 const EXAMPLE_SNAPSHOT: SnapshotResult = {
   url: "https://example.com",
   title: "Example",
@@ -50,7 +78,7 @@ const EXAMPLE_SNAPSHOT: SnapshotResult = {
   snapshotId: "snap-1",
 };
 
-function stubBrowser(overrides: Partial<PenDesktopBrowser>): PenDesktopBrowser {
+function stubBrowser(overrides: Partial<BrowserBridge>): BrowserBridge {
   return createBrowserStub(overrides, EXAMPLE_SNAPSHOT);
 }
 
@@ -71,23 +99,12 @@ const PRESS_ESCAPE_STEP = { outcome: "act", operation: "PRESS_ESCAPE", confidenc
 const HOVER_STEP = { outcome: "act", operation: "HOVER", index: 0, confidence: 0.9, model: "jev" };
 
 afterEach(() => {
-  useBrowserAgentSettingsStore.setState({ allowPasswordEntry: false, confirmIrreversible: true });
-  delete window.penDesktop;
   vi.unstubAllGlobals();
-  // The action cache (actionCache.ts) persists to real localStorage — clear
-  // it so a write in one test can't be replayed as a cache hit in another.
-  localStorage.clear();
+  // (The per-test `store` / `permissions` are re-created in beforeEach, so a
+  // cache write in one test can't be replayed as a hit in another.)
 });
 
 describe("browse_task", () => {
-  it("returns the documented error when window.penDesktop.browser is absent (web build)", async () => {
-    expect(window.penDesktop).toBeUndefined();
-
-    const result = JSON.parse(await browseTask({ goal: "accept cookies" }));
-
-    expect(result).toEqual({ error: BROWSER_NOT_AVAILABLE_ERROR });
-  });
-
   it("terminates on outcome:done and returns the documented transcript shape", async () => {
     stubFetchSequence([CLICK_STEP, { outcome: "done", confidence: 1, model: "jev", reason: "cookie banner dismissed" }]);
 
@@ -383,7 +400,7 @@ describe("browse_task", () => {
   it("forwards a scroll decision to perform without an `index` key when none is given", async () => {
     stubFetchSequence([{ outcome: "act", operation: "SCROLL_DOWN", confidence: 0.9, model: "jev" }]);
 
-    const perform = vi.fn(async (_args: Parameters<PenDesktopBrowser["perform"]>[0]) => ({}));
+    const perform = vi.fn(async (_args: Parameters<BrowserBridge["perform"]>[0]) => ({}));
     const browser = stubBrowser({ perform });
     const transcript = await runBrowseTaskLoop("scroll down", 1, browser);
 
@@ -467,7 +484,7 @@ describe("browse_task", () => {
     expect(desktop.reason).toBe("deadline exceeded");
 
     clock = 0;
-    localStorage.clear(); // or the action cache replays the first run's steps
+    store = memoryStorage(); // or the action cache replays the first run's steps
     stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE]);
     const cloud = await runBrowseTaskLoop(
       "fill the form",
@@ -482,13 +499,8 @@ describe("browse_task", () => {
   });
 
   it("gives the cloud browser the longer deadline and the desktop the original one", () => {
-    expect(browseTaskDeadlineMs()).toBe(CLOUD_BROWSE_TASK_DEADLINE_MS);
-    window.penDesktop = { onMenuCommand: () => () => {}, browser: {} } as never;
-    try {
-      expect(browseTaskDeadlineMs()).toBe(90_000);
-    } finally {
-      delete window.penDesktop;
-    }
+    expect(browseTaskDeadlineMs(true)).toBe(CLOUD_BROWSE_TASK_DEADLINE_MS);
+    expect(browseTaskDeadlineMs(false)).toBe(90_000);
   });
 
   it("records a failing perform step without ending the task", async () => {
@@ -542,23 +554,19 @@ describe("browse_task", () => {
     ]);
   });
 
-  it("forwards goal and maxSteps from args and returns a real JSON string", async () => {
+  it("runBrowseTask forwards goal and options and resolves a real, JSON-serializable transcript", async () => {
     let receivedBody: unknown;
     stubFetchSequence([DONE], (init) => {
       receivedBody = JSON.parse(init.body as string);
     });
 
-    setPenDesktop(stubBrowser({}));
+    const result = await runBrowseTaskPublic("find a red sneaker", publicOpts(stubBrowser({}), { maxSteps: 5 }));
 
-    const result = await browseTask({ goal: "find a red sneaker", maxSteps: 5 });
-
-    expect(typeof result).toBe("string");
-    expect(() => JSON.parse(result)).not.toThrow();
-    const parsed = JSON.parse(result);
-    expect(parsed.status).toBe("done");
-    expect(parsed).toHaveProperty("steps");
-    expect(parsed).toHaveProperty("url");
-    expect(parsed).toHaveProperty("title");
+    expect(() => JSON.stringify(result)).not.toThrow();
+    expect(result.status).toBe("done");
+    expect(result).toHaveProperty("steps");
+    expect(result).toHaveProperty("url");
+    expect(result).toHaveProperty("title");
     expect(receivedBody).toMatchObject({ goal: "find a red sneaker" });
   });
   // Upstream jev-ultrafast PR #40, ported: a rejected act must be recorded
@@ -1162,7 +1170,7 @@ describe("browse_task", () => {
     ["defaults", { allowPasswordEntry: false, confirmIrreversible: true }, { allowPasswordEntry: false, confirmIrreversible: true }],
     ["toggled values", { allowPasswordEntry: true, confirmIrreversible: false }, { allowPasswordEntry: true, confirmIrreversible: false }],
   ])("step body carries `permissions`: %s", async (_name, toggled, expected) => {
-    useBrowserAgentSettingsStore.setState(toggled);
+    permissions = toggled;
     const receivedBodies: Array<Record<string, unknown>> = [];
     stubFetchSequence([DONE], (init) => {
       receivedBodies.push(JSON.parse(init.body as string));
@@ -1434,20 +1442,17 @@ describe("browse_task", () => {
       expect(snapshot).toHaveBeenCalledTimes(1);
     });
 
-    it("forwards `url` from the tool args through to the loop", async () => {
+    it("forwards the `url` option through to the loop", async () => {
       let receivedBody: unknown;
       stubFetchSequence([DONE], (init) => {
         receivedBody = JSON.parse(init.body as string);
       });
       const open = vi.fn(async () => ({}));
 
-      setPenDesktop(stubBrowser({ open }));
-
-      const result = await browseTask({
-        goal: "search for headphones",
-        url: "https://shop.example.com",
-      });
-      const parsed = JSON.parse(result);
+      const parsed = await runBrowseTaskPublic(
+        "search for headphones",
+        publicOpts(stubBrowser({ open }), { url: "https://shop.example.com" })
+      );
 
       expect(open).toHaveBeenCalledWith({ url: "https://shop.example.com" });
       expect(parsed.status).toBe("done");
@@ -1789,7 +1794,7 @@ describe("browse_task", () => {
 
     it("replays a cached CLICK without ever calling /api/browse/step, tagged via:\"cache\"", async () => {
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -1820,7 +1825,7 @@ describe("browse_task", () => {
       };
       const key = buildStepCacheKey(goal, searchSnapshot.url, searchSnapshot.title, searchSnapshot.elements, []);
       const textStart = goal.indexOf("wireless headphones");
-      writeStepCacheEntry(key, goal, searchSnapshot.elements, {
+      writeStepCacheEntry(store, key, goal, searchSnapshot.elements, {
         operation: "TYPE_TEXT",
         target: cachedTarget("Search", "input"),
         textRange: [textStart, textStart + "wireless headphones".length],
@@ -1842,14 +1847,14 @@ describe("browse_task", () => {
       // Nothing about the actual localStorage-persisted entry carries the
       // raw text — only the offset used to derive it above — and nothing
       // carries the raw target label either, only its hash.
-      const raw = localStorage.getItem(ACTION_CACHE_STORAGE_KEY) ?? "";
+      const raw = store.getItem(ACTION_CACHE_STORAGE_KEY) ?? "";
       expect(raw).not.toContain("wireless headphones");
       expect(raw).not.toContain("Search");
     });
 
     it("self-heals when the cached element no longer resolves uniquely: deletes the entry and falls back to Jev without an extra snapshot", async () => {
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Gone now", "button"),
       });
@@ -1865,7 +1870,7 @@ describe("browse_task", () => {
       expect(transcript.status).toBe("done");
       expect(transcript.cacheHits).toBe(0);
       expect(transcript.steps).toEqual([]); // the miss itself is not recorded as a step
-      expect(lookupStepCache(key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
       // No attempt was dispatched, so nothing may have changed — the SAME
       // snapshot this iteration already took is reused, not re-fetched.
       expect(snapshot).toHaveBeenCalledTimes(1);
@@ -1873,7 +1878,7 @@ describe("browse_task", () => {
 
     it("self-heals when the cached action lands with no effect: deletes the entry, RECORDS a failed step, and takes a FRESH snapshot before falling back to Jev", async () => {
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -1890,7 +1895,7 @@ describe("browse_task", () => {
       expect(transcript.steps).toEqual([
         { operation: "CLICK", label: "cache replay failed: (no effect)", ok: false, index: 0, via: "cache" },
       ]);
-      expect(lookupStepCache(key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
       // The dispatched-but-failed replay may have altered the page — a
       // fresh snapshot is taken (this iteration's own + one more for the
       // next loop iteration) rather than trusting the stale one.
@@ -1899,7 +1904,7 @@ describe("browse_task", () => {
 
     it("self-heals when the cached action is rejected by the bridge, and records why", async () => {
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -1920,12 +1925,12 @@ describe("browse_task", () => {
           via: "cache",
         },
       ]);
-      expect(lookupStepCache(key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
     });
 
     it("a failed cache replay is visible to the NEXT /api/browse/step call's history", async () => {
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -1959,7 +1964,7 @@ describe("browse_task", () => {
       await runBrowseTaskLoop("accept cookies", 12, browser);
 
       const key = cacheKeyFor("accept cookies");
-      expect(lookupStepCache(key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toEqual({
+      expect(lookupStepCache(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements)).toEqual({
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -1988,7 +1993,7 @@ describe("browse_task", () => {
         checkoutSnapshot.elements,
         []
       );
-      expect(lookupStepCache(key, "place the order", checkoutSnapshot.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "place the order", checkoutSnapshot.elements)).toBeUndefined();
     });
 
     it("never writes TYPE_TEXT into a password field to the cache", async () => {
@@ -2014,8 +2019,8 @@ describe("browse_task", () => {
         passwordSnapshot.elements,
         []
       );
-      expect(lookupStepCache(key, "log in with password hunter2", passwordSnapshot.elements)).toBeUndefined();
-      const raw = localStorage.getItem(ACTION_CACHE_STORAGE_KEY) ?? "";
+      expect(lookupStepCache(store, key, "log in with password hunter2", passwordSnapshot.elements)).toBeUndefined();
+      const raw = store.getItem(ACTION_CACHE_STORAGE_KEY) ?? "";
       expect(raw).not.toContain("hunter2");
     });
 
@@ -2042,7 +2047,7 @@ describe("browse_task", () => {
         otpSnapshot.elements,
         []
       );
-      expect(lookupStepCache(key, "enter code 123456", otpSnapshot.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "enter code 123456", otpSnapshot.elements)).toBeUndefined();
     });
 
     it("never writes card-number-shaped TYPE_TEXT text to the cache", async () => {
@@ -2076,7 +2081,7 @@ describe("browse_task", () => {
         []
       );
       expect(
-        lookupStepCache(key, "check out with card 4111 1111 1111 1111", fieldSnapshot.elements)
+        lookupStepCache(store, key, "check out with card 4111 1111 1111 1111", fieldSnapshot.elements)
       ).toBeUndefined();
     });
 
@@ -2112,7 +2117,7 @@ describe("browse_task", () => {
         searchSnapshot.elements,
         []
       );
-      expect(lookupStepCache(key, "find me some cheap earphones", searchSnapshot.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "find me some cheap earphones", searchSnapshot.elements)).toBeUndefined();
     });
 
     it("REPLAY-time re-check: refuses a cached TYPE_TEXT whose fresh resolved element is now a password field, even though the fingerprint still matches", async () => {
@@ -2132,7 +2137,7 @@ describe("browse_task", () => {
         nowPasswordSnapshot.elements,
         []
       );
-      writeStepCacheEntry(key, "log in", nowPasswordSnapshot.elements, {
+      writeStepCacheEntry(store, key, "log in", nowPasswordSnapshot.elements, {
         operation: "TYPE_TEXT",
         target: cachedTarget("Field", "input"),
         textRange: [0, 6],
@@ -2145,7 +2150,7 @@ describe("browse_task", () => {
 
       expect(perform).not.toHaveBeenCalled(); // treated as a miss, never attempted
       expect(transcript.status).toBe("done");
-      expect(lookupStepCache(key, "log in", nowPasswordSnapshot.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "log in", nowPasswordSnapshot.elements)).toBeUndefined();
     });
 
     it("REPLAY-time re-check: refuses a cached CLICK whose target label is irreversible-sounding, even though the fingerprint still matches", async () => {
@@ -2167,7 +2172,7 @@ describe("browse_task", () => {
         dangerousSnapshot.elements,
         []
       );
-      writeStepCacheEntry(key, "clear the cart", dangerousSnapshot.elements, {
+      writeStepCacheEntry(store, key, "clear the cart", dangerousSnapshot.elements, {
         operation: "CLICK",
         target: cachedTarget("Delete", "button"),
       });
@@ -2179,7 +2184,7 @@ describe("browse_task", () => {
 
       expect(perform).not.toHaveBeenCalled(); // treated as a miss, never attempted
       expect(transcript.cacheHits).toBe(0);
-      expect(lookupStepCache(key, "clear the cart", dangerousSnapshot.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "clear the cart", dangerousSnapshot.elements)).toBeUndefined();
     });
 
     it("never replays or writes WAIT", async () => {
@@ -2190,17 +2195,17 @@ describe("browse_task", () => {
       const transcript = await runBrowseTaskLoop("wait for the page to load", 12, browser, undefined, sleep);
 
       const key = cacheKeyFor("wait for the page to load");
-      expect(lookupStepCache(key, "wait for the page to load", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
+      expect(lookupStepCache(store, key, "wait for the page to load", EXAMPLE_SNAPSHOT.elements)).toBeUndefined();
       expect(transcript.cacheHits).toBe(0);
     });
 
     it("does not consult or write the cache when the kill switch is set", async () => {
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
-      localStorage.setItem(ACTION_CACHE_KILL_SWITCH_KEY, "off");
+      store.setItem(ACTION_CACHE_KILL_SWITCH_KEY, "off");
 
       stubFetchSequence([CLICK_STEP, DONE]);
       const perform = vi.fn(async () => ({}));
@@ -2223,7 +2228,7 @@ describe("browse_task", () => {
       // even a run that keeps failing against the same page/goal mints a
       // new key every single step.
       const key = cacheKeyFor("accept cookies");
-      writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -2270,7 +2275,7 @@ describe("browse_task", () => {
         FIXED_URL_SNAPSHOT.elements,
         historyAfterTwoWaits
       );
-      writeStepCacheEntry(key, goal, FIXED_URL_SNAPSHOT.elements, {
+      writeStepCacheEntry(store, key, goal, FIXED_URL_SNAPSHOT.elements, {
         operation: "CLICK",
         target: cachedTarget("Accept all", "button"),
       });
@@ -2313,7 +2318,7 @@ describe("browse_task", () => {
   });
 });
 
-describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
+describe("browse_task step screenshot (the `stepScreenshots` option)", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.useRealTimers();
@@ -2321,9 +2326,9 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
 
   const bodies: Array<Record<string, unknown>> = [];
   const run = async (
-    screenshot: PenDesktopBrowser["screenshot"] | undefined,
+    screenshot: BrowserBridge["screenshot"] | undefined,
     sequence: unknown[] = [DONE],
-    overrides: Partial<PenDesktopBrowser> = {}
+    overrides: Partial<BrowserBridge> = {}
   ) => {
     bodies.length = 0;
     stubFetchSequence(sequence as Record<string, unknown>[], (init) => bodies.push(JSON.parse(String(init.body))));
@@ -2333,7 +2338,7 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   };
 
   it("flag off: no screenshot call, body has no screenshot", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "");
+    stepScreenshots = false;
     const screenshot = vi.fn(async () => ({ imageData: "data:image/jpeg;base64,AAA", snapshotId: "snap-1" }));
     const { body } = await run(screenshot);
     expect(screenshot).not.toHaveBeenCalled();
@@ -2341,34 +2346,34 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   });
 
   it("flag on: captures with the loop's snapshotId and sends imageData untouched (trimmed)", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const screenshot = vi.fn(async () => ({ imageData: "  QUJD\n", snapshotId: "snap-1" }));
     const { body } = await run(screenshot);
     expect(screenshot).toHaveBeenCalledWith({ annotate: true, snapshotId: "snap-1" });
     expect(body.screenshot).toBe("QUJD");
   });
 
-  it.each<[string, PenDesktopBrowser["screenshot"] | undefined]>([
+  it.each<[string, BrowserBridge["screenshot"] | undefined]>([
     ["error result", vi.fn(async () => ({ error: "boom" }))],
     ["throw", vi.fn(async () => { throw new Error("x"); })],
     ["missing method", undefined],
   ])("%s: step still sent without screenshot", async (_name, screenshot) => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const { body } = await run(screenshot);
     expect(body).toBeDefined();
     expect(body).not.toHaveProperty("screenshot");
   });
 
   it("timeout: step is sent without screenshot", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const pending = run(vi.fn(() => new Promise(() => {})) as PenDesktopBrowser["screenshot"]);
+    const pending = run(vi.fn(() => new Promise(() => {})) as BrowserBridge["screenshot"]);
     await vi.advanceTimersByTimeAsync(4_100);
     expect((await pending).body).not.toHaveProperty("screenshot");
   });
 
   it("marked 0: image is not sent and the transcript says unmarked", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const screenshot = vi.fn(async () => ({ imageData: "AAA", snapshotId: "snap-1", marked: 0 }));
     const { body, transcript } = await run(screenshot, [CLICK_STEP, DONE], { perform: vi.fn(async () => ({})) });
     expect(body).not.toHaveProperty("screenshot");
@@ -2376,7 +2381,7 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   });
 
   it("over-cap screenshot: not sent, transcript says too_large", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const screenshot = vi.fn(async () => ({ imageData: "A".repeat(4_000_001), snapshotId: "snap-1", marked: 3 }));
     const { body, transcript } = await run(screenshot, [CLICK_STEP, DONE], { perform: vi.fn(async () => ({})) });
     expect(body).not.toHaveProperty("screenshot");
@@ -2384,7 +2389,7 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   });
 
   it("records the final step's capture info on a done terminal entry", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const screenshot = vi.fn(async () => ({ imageData: "AAA", snapshotId: "snap-1", marked: 4 }));
     const { transcript } = await run(screenshot, [DONE]);
     expect(transcript.status).toBe("done");
@@ -2393,7 +2398,7 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   });
 
   it("records the capture outcome and marked on the step entry", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const screenshot = vi.fn(async () => ({ imageData: "AAA", snapshotId: "snap-1", marked: 7 }));
     const { transcript } = await run(screenshot, [CLICK_STEP, DONE], { perform: vi.fn(async () => ({})) });
     expect(transcript.steps[0]).toMatchObject({ operation: "CLICK", screenshot: "sent", marked: 7 });
@@ -2402,7 +2407,7 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   });
 
   it("bridge ignoring snapshotId: image discarded, capture stops, snapshot re-taken", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const screenshot = vi.fn(async () => ({ imageData: "AAA", snapshotId: "other" }));
     const snapshot = vi
       .fn()
@@ -2418,17 +2423,17 @@ describe("browse_task step screenshot (VITE_BROWSE_STEP_SCREENSHOT)", () => {
   });
 
   it("result without snapshotId counts as ignored", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const { body } = await run(vi.fn(async () => ({ imageData: "AAA" })));
     expect(body).not.toHaveProperty("screenshot");
   });
 
   it("action-cache hit: no capture", async () => {
-    vi.stubEnv("VITE_BROWSE_STEP_SCREENSHOT", "true");
+    stepScreenshots = true;
     const key = buildStepCacheKey(
       "accept cookies", EXAMPLE_SNAPSHOT.url, EXAMPLE_SNAPSHOT.title, EXAMPLE_SNAPSHOT.elements, []
     );
-    writeStepCacheEntry(key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
+    writeStepCacheEntry(store, key, "accept cookies", EXAMPLE_SNAPSHOT.elements, {
       operation: "CLICK",
       target: { labelHash: hashCachedLabel("Accept all"), tag: "button" },
     });
@@ -2684,14 +2689,34 @@ describe("browse_task sub-goal planning", () => {
     expect(t.reason).toBe("cancelled");
   });
 
-  it("handler returns a budget transcript at its own internal bound when the loop hangs", async () => {
+  it("runBrowseTask returns a budget transcript at its own internal bound when the loop hangs", async () => {
     vi.useFakeTimers();
     try {
-      setPenDesktop(stubBrowser({ snapshot: () => new Promise(() => {}) }));
       stubPlanAndSteps("fail", [DONE]);
-      const pending = browseTask({ goal: "hang forever" });
-      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs() + 1);
-      expect(JSON.parse(await pending)).toMatchObject({ status: "budget", reason: "deadline exceeded" });
+      const pending = runBrowseTaskPublic("hang forever", publicOpts(stubBrowser({ snapshot: () => new Promise(() => {}) })));
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false) + 1);
+      expect(await pending).toMatchObject({ status: "budget", reason: "deadline exceeded" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runBrowseTask bounds a hanging cloud call by the longer cloud bound", async () => {
+    vi.useFakeTimers();
+    try {
+      stubPlanAndSteps("fail", [DONE]);
+      let settled = false;
+      const pending = runBrowseTaskPublic(
+        "hang forever",
+        publicOpts(stubBrowser({ snapshot: () => new Promise(() => {}) }), { cloud: true })
+      ).then((t) => {
+        settled = true;
+        return t;
+      });
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false) + 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(true));
+      expect(await pending).toMatchObject({ status: "budget", reason: "deadline exceeded" });
     } finally {
       vi.useRealTimers();
     }
@@ -2748,7 +2773,7 @@ describe("browse_task rate limiting and sub-goal reset", () => {
   it("gives up at once when wait + request timeout + reserve does not fit the deadline", async () => {
     const fetchMock = stubRateLimited([{ status: 429 }, { status: 429 }]);
     const sleeps: number[] = [];
-    const res = await fetchBrowseBackend("/api/browse/step", {}, 20_000, undefined, {
+    const res = await fetchBrowseBackend(backend, "/api/browse/step", {}, 20_000, undefined, {
       now: () => 0,
       sleep: async (ms) => void sleeps.push(ms),
       deadline: 50_000,
@@ -2762,7 +2787,7 @@ describe("browse_task rate limiting and sub-goal reset", () => {
   it("caps Retry-After at 60s and retries at most 4 times", async () => {
     const fetchMock = stubRateLimited(Array.from({ length: 10 }, () => ({ status: 429, retryAfter: "500" })));
     const sleeps: number[] = [];
-    await fetchBrowseBackend("/api/browse/step", {}, 1000, undefined, { now: () => 0, sleep: async (ms) => void sleeps.push(ms) });
+    await fetchBrowseBackend(backend, "/api/browse/step", {}, 1000, undefined, { now: () => 0, sleep: async (ms) => void sleeps.push(ms) });
     expect(sleeps).toEqual([60000, 60000, 60000, 60000]);
     expect(fetchMock).toHaveBeenCalledTimes(5);
   });
@@ -2770,7 +2795,7 @@ describe("browse_task rate limiting and sub-goal reset", () => {
   it("returns promptly when the signal aborts during the backoff sleep", async () => {
     stubRateLimited([{ status: 429 }, { status: 429 }]);
     const ac = new AbortController();
-    const res = await fetchBrowseBackend("/api/browse/step", {}, 1000, ac.signal, {
+    const res = await fetchBrowseBackend(backend, "/api/browse/step", {}, 1000, ac.signal, {
       now: () => 0,
       sleep: () => {
         setTimeout(() => ac.abort(), 0);
@@ -3231,7 +3256,7 @@ describe("browse_task observations", () => {
       return typeof next === "string" ? { text: next } : next;
     });
   }
-  const run = (goal: string, browser: PenDesktopBrowser, ...rest: unknown[]) =>
+  const run = (goal: string, browser: BrowserBridge, ...rest: unknown[]) =>
     (runBrowseTask as (...a: unknown[]) => ReturnType<typeof runBrowseTask>)(goal, 12, browser, ...rest);
   const CUT = " …[cut]";
 
@@ -3371,5 +3396,33 @@ describe("capObservations", () => {
     ]);
     expect(out?.some((o) => o.subgoal === 1)).toBe(false);
     expect(out?.find((o) => o.subgoal === 2)?.text).toBe("(same page as sub-goal 1; its text was not kept)");
+  });
+});
+
+describe("runBrowseTask: optional host options", () => {
+  it("with no storage the action cache is a silent no-op and the task still completes", async () => {
+    const fetchMock = stubFetchSequence([CLICK_STEP, DONE]);
+    const browser = stubBrowser({});
+    // First run would write a cache entry (a landed CLICK on a labelled button).
+    const first = await runBrowseTaskPublic("accept cookies", { browser, backend });
+    expect(first.status).toBe("done");
+    expect(first.cacheHits).toBe(0);
+
+    // Second identical run: with a cache it would replay the CLICK and skip
+    // the step request; with none it asks the backend again.
+    fetchMock.mockClear();
+    const second = await runBrowseTaskPublic("accept cookies", { browser, backend });
+    expect(second.status).toBe("done");
+    expect(second.cacheHits).toBe(0);
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/browse/step")).length).toBeGreaterThan(0);
+  });
+
+  it("with no permissions the step body carries none (the backend defaults apply)", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    stubFetchSequence([DONE], (init) => bodies.push(JSON.parse(String(init.body))));
+    await runBrowseTaskPublic("accept cookies", { browser: stubBrowser({}), backend });
+    const step = bodies.find((b) => "elements" in b);
+    expect(step).toBeDefined();
+    expect(step).not.toHaveProperty("permissions");
   });
 });

@@ -1,12 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { createSystemOneClient } from "../../src/adapters/systemoneHttp.js";
 import {
-  createSystemOne,
   SystemOneAuthError,
   SystemOneRateLimitError,
   SystemOneValidationError,
   type SystemOneQuestion,
-} from "../src/services/systemone.js";
-import { makeConfig } from "./helpers.js";
+} from "../../src/policy/decisions.js";
 
 function jsonResponse(body: unknown, status = 200, headers?: Record<string, string>) {
   return new Response(JSON.stringify(body), { status, headers });
@@ -53,23 +52,19 @@ const goodResponseBody = {
 // factory's injectable sleepFn param.
 const noSleep = vi.fn(async () => {});
 
-describe("createSystemOne", () => {
-  it("returns null without an API key", () => {
-    expect(createSystemOne(makeConfig())).toBeNull();
+describe("createSystemOneClient", () => {
+  it("throws without an API key (the host factory used to return null)", () => {
+    expect(() => createSystemOneClient({ apiKey: "" })).toThrow(/apiKey/);
   });
 
   it("returns a client when the key is set", () => {
-    const client = createSystemOne(makeConfig({ TYPESAFE_API_KEY: "k" }));
+    const client = createSystemOneClient({ apiKey: "k" });
     expect(client).not.toBeNull();
   });
 
   it("sends the exact request shape and parses a mixed response", async () => {
     const fetchFn = vi.fn(async () => jsonResponse(goodResponseBody));
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k", TYPESAFE_MODEL: "jev-latest" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", model: "jev-latest", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
 
     const result = await client!.evaluate({ state: "hello world", questions });
 
@@ -95,15 +90,7 @@ describe("createSystemOne", () => {
 
   it("sends an OpenAI Decisions model to OpenRouter with the OpenRouter key", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ ...goodResponseBody, model: "openai/gpt-6-luna-decisions" }));
-    const client = createSystemOne(
-      makeConfig({
-        TYPESAFE_API_KEY: "typesafe-key",
-        OPENROUTER_API_KEY: "or-key",
-        TYPESAFE_MODEL: "openai/gpt-6-luna-decisions",
-      }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "typesafe-key", openRouterApiKey: "or-key", model: "openai/gpt-6-luna-decisions", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
 
     await client!.evaluate({ state: "hello world", questions });
 
@@ -118,11 +105,7 @@ describe("createSystemOne", () => {
     const fetchFn = vi.fn(async () =>
       jsonResponse({ ...goodResponseBody, answers: partialAnswers }),
     );
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneValidationError,
     );
@@ -135,11 +118,7 @@ describe("createSystemOne", () => {
         answers: { ...goodAnswers, isSpam: { type: "noul" } },
       }),
     );
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneValidationError,
     );
@@ -152,11 +131,7 @@ describe("createSystemOne", () => {
         answers: { ...goodAnswers, isSpam: { type: "mystery", value: 1 } },
       }),
     );
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneValidationError,
     );
@@ -175,11 +150,7 @@ describe("createSystemOne", () => {
         401,
       ),
     );
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "bad" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "bad", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneAuthError,
     );
@@ -195,11 +166,7 @@ describe("createSystemOne", () => {
         422,
       ),
     );
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneValidationError,
     );
@@ -215,11 +182,7 @@ describe("createSystemOne", () => {
       return jsonResponse(goodResponseBody);
     });
     const sleepFn = vi.fn(async () => {});
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      sleepFn,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: sleepFn });
     const result = await client!.evaluate({ state: "x", questions });
     expect(fetchFn).toHaveBeenCalledTimes(2);
     expect(result.model).toBe("jev-latest");
@@ -239,11 +202,7 @@ describe("createSystemOne", () => {
       return jsonResponse(goodResponseBody);
     });
     const sleepFn = vi.fn(async () => {});
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      sleepFn,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: sleepFn });
     await client!.evaluate({ state: "x", questions });
     // sleepFn's second arg is the combined abort signal (see
     // discardResponseBody/defaultSleep) — not asserted here, just present.
@@ -255,11 +214,7 @@ describe("createSystemOne", () => {
       jsonResponse({ detail: { message: "rate limited" } }, 429),
     );
     const sleepFn = vi.fn(async () => {});
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      sleepFn,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: sleepFn });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneRateLimitError,
     );
@@ -272,11 +227,7 @@ describe("createSystemOne", () => {
       jsonResponse({ detail: { message: "overloaded" } }, 529),
     );
     const sleepFn = vi.fn(async () => {});
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      sleepFn,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: sleepFn });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow();
     expect(fetchFn).toHaveBeenCalledTimes(4);
   });
@@ -289,11 +240,7 @@ describe("createSystemOne", () => {
     // wait. If the retry sleep were not abortable, this test would hang
     // (and time out) instead of rejecting promptly.
     const hangingSleep = vi.fn(() => new Promise<void>(() => {}));
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      hangingSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: hangingSleep });
     const controller = new AbortController();
     const promise = client!.evaluate({ state: "x", questions, signal: controller.signal });
     controller.abort(new Error("caller gave up"));
@@ -313,11 +260,7 @@ describe("createSystemOne", () => {
       ),
     );
     const sleepFn = vi.fn(async () => {});
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      sleepFn,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: sleepFn });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneRateLimitError,
     );
@@ -342,11 +285,7 @@ describe("createSystemOne", () => {
       return jsonResponse(goodResponseBody);
     });
     const sleepFn = vi.fn(async () => {});
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      sleepFn,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: sleepFn });
     await client!.evaluate({ state: "x", questions });
     expect(firstBodyCancelSpy).toHaveBeenCalledTimes(1);
   });
@@ -357,11 +296,7 @@ describe("createSystemOne", () => {
     // `response.json()`, escaping the SystemOneError hierarchy every
     // caller is written against.
     const fetchFn = vi.fn(async () => new Response("<html>not json</html>", { status: 200 }));
-    const client = createSystemOne(
-      makeConfig({ TYPESAFE_API_KEY: "k" }),
-      fetchFn as unknown as typeof fetch,
-      noSleep,
-    );
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch, sleep: noSleep });
     await expect(client!.evaluate({ state: "x", questions })).rejects.toThrow(
       SystemOneValidationError,
     );
@@ -376,7 +311,7 @@ describe("createSystemOne", () => {
     const fetchFn = vi.fn(async () =>
       jsonResponse({ detail: { message: "rate limited" } }, 429),
     );
-    const client = createSystemOne(makeConfig({ TYPESAFE_API_KEY: "k" }), fetchFn as unknown as typeof fetch);
+    const client = createSystemOneClient({ apiKey: "k", fetch: fetchFn as unknown as typeof fetch });
     const clearTimeoutSpy = vi.spyOn(global, "clearTimeout");
     try {
       const controller = new AbortController();
@@ -403,14 +338,14 @@ describe("createSystemOne", () => {
   describe("OpenAI Decisions compatibility", () => {
     const sentQuestionIds = (fetchFn: ReturnType<typeof vi.fn>, call: number) =>
       Object.keys(JSON.parse((fetchFn.mock.calls[call]![1] as RequestInit).body as string).questions);
-    const choiceBody = (id: string, p = 0.8) => ({
+    const choiceBody = (_id: string, p = 0.8) => ({
       type: "choice",
       choice: "a",
       probabilities: { a: p, b: 1 - p },
       confidence: p,
     });
     const mk = (fetchFn: unknown, model = "openai/gpt-6-luna-decisions") =>
-      createSystemOne(makeConfig({ TYPESAFE_API_KEY: "k", TYPESAFE_MODEL: model }), fetchFn as typeof fetch, noSleep)!;
+      createSystemOneClient({ apiKey: "k", model: model, fetch: fetchFn as typeof fetch, sleep: noSleep })!;
     const one: Record<string, SystemOneQuestion> = {
       solo: { type: "choice", instructions: "x", criteria: { only: "the only one" } },
     };

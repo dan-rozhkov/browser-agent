@@ -1,37 +1,29 @@
 import { MockLanguageModelV3 } from "ai/test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { makeConfig } from "./helpers.js";
-
-vi.mock("../src/ai/provider.js", async (importOriginal) =>
-  (await import("./structuredModelFakes.js")).mockProviderModule(await importOriginal()),
-);
-
-import { createModel, jsonModel, mockJsonModelOnce } from "./structuredModelFakes.js";
-
-const { buildApp } = await import("../src/app.js");
-const { MAX_SUBGOALS, MAX_SUBGOAL_CHARS, MAX_GOAL_CHARS, buildPlanPrompt, normalizeSubgoals, isReadOnlySubgoal, dropReadOnlySubgoals } = await import("../src/ai/browsePlan.js");
+import { beforeEach, describe, expect, it } from "vitest";
+import { planGoal } from "../../src/policy/decide.js";
+import { browsePlanBodySchema } from "../../src/policy/schemas.js";
+import { makeOptions } from "./browseFakes.js";
+import { textModelCalls, jsonModel, mockJsonModelOnce } from "./structuredModelFakes.js";
+const { MAX_SUBGOALS, MAX_SUBGOAL_CHARS, MAX_GOAL_CHARS, buildPlanPrompt, normalizeSubgoals, isReadOnlySubgoal, dropReadOnlySubgoals } = await import("../../src/policy/browsePlan.js");
 
 const GOAL = "Add a tent, a sleeping bag and a pad to the cart";
 
 beforeEach(() => {
-  createModel.mockReset();
+  textModelCalls.mockReset();
 });
 
-async function postPlan(payload: Record<string, unknown>, config = makeConfig({ TYPESAFE_API_KEY: "key" })) {
-  const app = await buildApp(config, { logger: false });
-  try {
-    return await app.inject({ method: "POST", url: "/api/browse/plan", payload });
-  } finally {
-    await app.close();
+// What POST /api/browse/plan did around planBrowseGoal: validate the body
+// (400 on failure), plan, answer { subgoals } without `fallbackReason`.
+async function postPlan(payload: Record<string, unknown>, opts = makeOptions()) {
+  const parsed = browsePlanBodySchema.safeParse(payload);
+  if (!parsed.success) {
+    return { statusCode: 400, json: () => ({ error: parsed.error.issues[0]?.message ?? "invalid body" }) as { subgoals: string[]; error?: string } };
   }
+  const { subgoals } = await planGoal(opts, parsed.data);
+  return { statusCode: 200, json: () => ({ subgoals }) };
 }
 
-describe("POST /api/browse/plan", () => {
-  it("503s when TYPESAFE_API_KEY is unset", async () => {
-    const res = await postPlan({ goal: GOAL }, makeConfig({ TYPESAFE_API_KEY: undefined }));
-    expect(res.statusCode).toBe(503);
-  });
-
+describe("planGoal (was POST /api/browse/plan)", () => {
   it.each([
     ["an empty goal", { goal: "" }],
     ["a goal over the limit", { goal: "a".repeat(MAX_GOAL_CHARS + 1) }],
@@ -39,7 +31,7 @@ describe("POST /api/browse/plan", () => {
     ["a missing goal", {}],
   ])("400s on %s", async (_name, payload) => {
     expect((await postPlan(payload)).statusCode).toBe(400);
-    expect(createModel).not.toHaveBeenCalled();
+    expect(textModelCalls).not.toHaveBeenCalled();
   });
 
   it("lets the planner choose the items when the goal asks it to, but never personal data", () => {
@@ -118,14 +110,14 @@ describe("POST /api/browse/plan", () => {
   it("drops read-only sub-goals and keeps a real split", async () => {
     const plan = ["Add a tent to the cart.", "Add a pad to the cart.", "Report the cart total."];
     expect(dropReadOnlySubgoals(plan)).toEqual(plan.slice(0, 2));
-    createModel.mockImplementationOnce(() => jsonModel({ subgoals: plan }));
+    textModelCalls.mockImplementationOnce(() => jsonModel({ subgoals: plan }));
     const res = await postPlan({ goal: GOAL });
     expect(res.json()).toEqual({ subgoals: plan.slice(0, 2) });
   });
 
   it("falls back to the whole goal when one action sub-goal is left", async () => {
     const goal = "Search for flats near the station and list the first three prices";
-    createModel.mockImplementationOnce(() =>
+    textModelCalls.mockImplementationOnce(() =>
       jsonModel({ subgoals: ["Search for flats near the station.", "Note the first price.", "Note the second price.", "Report the prices."] }),
     );
     const res = await postPlan({ goal });
@@ -134,7 +126,7 @@ describe("POST /api/browse/plan", () => {
   });
 
   it("returns a single-flow goal unchanged", async () => {
-    createModel.mockImplementationOnce(() => jsonModel({ subgoals: ["Book one hotel in Rome"] }));
+    textModelCalls.mockImplementationOnce(() => jsonModel({ subgoals: ["Book one hotel in Rome"] }));
     const res = await postPlan({ goal: "Book one hotel in Rome" });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ subgoals: ["Book one hotel in Rome"] });
@@ -156,7 +148,7 @@ describe("POST /api/browse/plan", () => {
   });
 
   it("falls back to [goal] when the model throws", async () => {
-    createModel.mockImplementationOnce(() => {
+    textModelCalls.mockImplementationOnce(() => {
       throw new Error("boom");
     });
     const res = await postPlan({ goal: GOAL });
@@ -165,14 +157,14 @@ describe("POST /api/browse/plan", () => {
   });
 
   it("falls back to [goal] when the output is empty", async () => {
-    createModel.mockImplementationOnce(() => jsonModel({ subgoals: ["", " "] }));
+    textModelCalls.mockImplementationOnce(() => jsonModel({ subgoals: ["", " "] }));
     expect((await postPlan({ goal: GOAL })).json()).toEqual({ subgoals: [GOAL] });
   });
 
   it("falls back to [goal] when the abort signal fires mid-call", async () => {
     // The fake model only settles when the signal it was handed aborts, so
     // this hangs (and times out) if planBrowseGoal stops passing abortSignal.
-    createModel.mockImplementationOnce(
+    textModelCalls.mockImplementationOnce(
       () =>
         new MockLanguageModelV3({
           doGenerate: (options: { abortSignal?: AbortSignal }) =>
@@ -181,14 +173,14 @@ describe("POST /api/browse/plan", () => {
             }),
         }),
     );
-    const { planBrowseGoal } = await import("../src/ai/browsePlan.js");
-    const result = await planBrowseGoal(makeConfig(), { goal: GOAL }, AbortSignal.timeout(50));
+    const { planBrowseGoal } = await import("../../src/policy/browsePlan.js");
+    const result = await planBrowseGoal(makeOptions(), { goal: GOAL }, AbortSignal.timeout(50));
     expect(result.subgoals).toEqual([GOAL]);
     expect(result.fallbackReason).toBe("aborted");
   });
 
   it("falls back to [goal] instead of cutting an over-long sub-goal", async () => {
-    createModel.mockImplementationOnce(() =>
+    textModelCalls.mockImplementationOnce(() =>
       jsonModel({ subgoals: ["ok", "x".repeat(MAX_SUBGOAL_CHARS + 1)] }),
     );
     expect((await postPlan({ goal: GOAL })).json()).toEqual({ subgoals: [GOAL] });
@@ -196,7 +188,7 @@ describe("POST /api/browse/plan", () => {
 
   it("passes irreversible tags from the goal through, and scrubs the url", async () => {
     const goal = "Pay with card 4111 1111 1111 1111 for a tent and a stove";
-    const { buildNumberedPlaceholderGoal } = await import("../src/ai/browseStep.js");
+    const { buildNumberedPlaceholderGoal } = await import("../../src/policy/browseStep.js");
     const tag = buildNumberedPlaceholderGoal(goal).text.match(/\[[A-Z_]+\]/)?.[0];
     expect(tag).toBeDefined();
     const probe = mockJsonModelOnce({ subgoals: [`Buy a tent, pay with ${tag}`, `Buy a stove, pay with ${tag}`] });
@@ -219,7 +211,7 @@ describe("POST /api/browse/plan", () => {
   });
 
   it("falls back when the model invents an unknown token", async () => {
-    createModel.mockImplementationOnce(() => jsonModel({ subgoals: ["Use [EMAIL_9]"] }));
+    textModelCalls.mockImplementationOnce(() => jsonModel({ subgoals: ["Use [EMAIL_9]"] }));
     expect((await postPlan({ goal: GOAL })).json()).toEqual({ subgoals: [GOAL] });
   });
 });

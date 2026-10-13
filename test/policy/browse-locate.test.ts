@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { decideBrowseLocate } from "../src/ai/browseLocate.js";
-import { PEAK_THRESHOLD_TARGET, type BrowseStepElement } from "../src/ai/browseStep.js";
+import { decideBrowseLocate } from "../../src/policy/browseLocate.js";
+import { PEAK_THRESHOLD_TARGET, type BrowseStepElement } from "../../src/policy/browseStep.js";
 import type {
   SystemOneAnswer,
   SystemOneClient,
   SystemOneEvaluateParams,
   SystemOneQuestion,
-} from "../src/services/systemone.js";
+} from "../../src/policy/decisions.js";
 import { fakeClient as fakeSystemOneClient, choice } from "./browseFakes.js";
 
 // Mirrors test/browse-step.test.ts's fixtures — decideBrowseLocate is a

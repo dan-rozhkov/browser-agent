@@ -2,8 +2,8 @@ import type {
   SystemOneAnswer,
   SystemOneClient,
   SystemOneQuestion,
-} from "../services/systemone.js";
-import { scrubPii } from "../analysis/pii.js";
+} from "./decisions.js";
+import { scrubPii } from "./pii.js";
 import {
   BROWSE_STEP_TIMEOUT_MS,
   PEAK_THRESHOLD_TARGET,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendKeepingSuffix, describeEffect, describeEffectDetailed, EFFECT_NOTE_MAX_CHARS, fitLabel, isCommitEffect, stripVolatileLabelParts } from "../actionEffect";
+import { appendKeepingSuffix, describeEffect, describeEffectDetailed, EFFECT_NOTE_MAX_CHARS, fitLabel, isCommitEffect, stripVolatileLabelParts } from "../../src/loop/actionEffect.js";
 
 const btn = (index: number, label: string, extra: Record<string, unknown> = {}) => ({
   index,

@@ -1,4 +1,5 @@
-import { hashString } from "./loopGuard";
+import { hashString } from "./loopGuard.js";
+import type { KeyValueStorage } from "./storage.js";
 
 /**
  * Local action cache for browse_task's step loop (Stagehand-style: replay a
@@ -53,12 +54,14 @@ import { hashString } from "./loopGuard";
  * the verify check is what makes a false hit non-catastrophic, not a claim
  * that hashing can't collide.
  *
- * Storage: a single localStorage blob (key `pen.browseActionCache.v1`),
- * capped at MAX_ENTRIES total entries (LRU eviction by `lastUsed`) and
- * TTL_MS old. Every access is wrapped in try/catch and degrades to a no-op
- * — private browsing, a quota error, `localStorage` missing entirely (SSR/
- * non-browser test environments) all just mean "no cache today", never a
- * thrown error. Kill switch: `localStorage.pen.browseActionCache = "off"`.
+ * Storage: a single blob in the injected `KeyValueStorage` (pen-editor passes
+ * `localStorage`; key `pen.browseActionCache.v1`), capped at MAX_ENTRIES total
+ * entries (LRU eviction by `lastUsed`) and TTL_MS old. Every access is wrapped
+ * in try/catch and degrades to a no-op — private browsing, a quota error, a
+ * storage that throws all just mean "no cache today", never a thrown error.
+ * No storage passed at all (the `storage` option of `runBrowseTask` omitted)
+ * means the cache is off: every function below is then a silent no-op.
+ * Kill switch: the storage item `pen.browseActionCache` = "off".
  */
 
 export const ACTION_CACHE_STORAGE_KEY = "pen.browseActionCache.v1";
@@ -73,11 +76,12 @@ interface StoredEntry {
 }
 type StoredCache = Record<string, StoredEntry>;
 
-export function isActionCacheEnabled(): boolean {
+export function isActionCacheEnabled(storage: KeyValueStorage | undefined): boolean {
+  if (!storage) return false;
   try {
-    return localStorage.getItem(ACTION_CACHE_KILL_SWITCH_KEY) !== "off";
+    return storage.getItem(ACTION_CACHE_KILL_SWITCH_KEY) !== "off";
   } catch {
-    // No localStorage at all (SSR, some test environments) — the read/write
+    // A storage that throws (blocked, private mode) — the read/write
     // helpers below independently no-op in that case too, so treating the
     // cache as "not disabled" here is harmless; nothing will ever actually
     // be read or written.
@@ -86,9 +90,9 @@ export function isActionCacheEnabled(): boolean {
 }
 
 /** Reads the store, dropping any entry older than ACTION_CACHE_TTL_MS. */
-function readStore(): StoredCache {
+function readStore(storage: KeyValueStorage): StoredCache {
   try {
-    const raw = localStorage.getItem(ACTION_CACHE_STORAGE_KEY);
+    const raw = storage.getItem(ACTION_CACHE_STORAGE_KEY);
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return {};
@@ -112,41 +116,42 @@ function readStore(): StoredCache {
 
 /** Writes the store, evicting the least-recently-used entries first when
  * over ACTION_CACHE_MAX_ENTRIES. */
-function writeStore(store: StoredCache): void {
+function writeStore(storage: KeyValueStorage, store: StoredCache): void {
   try {
     const entries = Object.entries(store).sort((a, b) => b[1].lastUsed - a[1].lastUsed);
     const trimmed: StoredCache = {};
     for (const [key, entry] of entries.slice(0, ACTION_CACHE_MAX_ENTRIES)) {
       trimmed[key] = entry;
     }
-    localStorage.setItem(ACTION_CACHE_STORAGE_KEY, JSON.stringify(trimmed));
+    storage.setItem(ACTION_CACHE_STORAGE_KEY, JSON.stringify(trimmed));
   } catch {
-    // Quota exceeded, private mode, no localStorage — degrade to a no-op
+    // Quota exceeded, private mode, a throwing storage — degrade to a no-op
     // write rather than throwing out of a browse_* tool handler.
   }
 }
 
-function getRawEntry(key: string): StoredEntry | undefined {
-  if (!isActionCacheEnabled()) return undefined;
-  return readStore()[key];
+function getRawEntry(storage: KeyValueStorage | undefined, key: string): StoredEntry | undefined {
+  if (!storage || !isActionCacheEnabled(storage)) return undefined;
+  return readStore(storage)[key];
 }
 
-function setRawEntry(key: string, value: unknown): void {
-  if (!isActionCacheEnabled()) return;
-  const store = readStore();
+function setRawEntry(storage: KeyValueStorage | undefined, key: string, value: unknown): void {
+  if (!storage || !isActionCacheEnabled(storage)) return;
+  const store = readStore(storage);
   store[key] = { value, hits: 0, lastUsed: Date.now() };
-  writeStore(store);
+  writeStore(storage, store);
 }
 
 /** Deletes one entry — the self-heal path used the moment a replay turns
  * out to be wrong, or a `verify` check fails at lookup time. Never
  * throws. */
-export function deleteCacheEntry(key: string): void {
+export function deleteCacheEntry(storage: KeyValueStorage | undefined, key: string): void {
+  if (!storage) return;
   try {
-    const store = readStore();
+    const store = readStore(storage);
     if (key in store) {
       delete store[key];
-      writeStore(store);
+      writeStore(storage, store);
     }
   } catch {
     // no-op
@@ -155,14 +160,14 @@ export function deleteCacheEntry(key: string): void {
 
 /** Bumps `hits`/`lastUsed` on a successful replay — the first successful
  * replay of a freshly-written entry (hits: 0) takes it to hits: 1. */
-export function touchCacheEntry(key: string): void {
-  if (!isActionCacheEnabled()) return;
-  const store = readStore();
+export function touchCacheEntry(storage: KeyValueStorage | undefined, key: string): void {
+  if (!storage || !isActionCacheEnabled(storage)) return;
+  const store = readStore(storage);
   const entry = store[key];
   if (!entry) return;
   entry.hits += 1;
   entry.lastUsed = Date.now();
-  writeStore(store);
+  writeStore(storage, store);
 }
 
 // --- key normalization -----------------------------------------------
@@ -363,7 +368,7 @@ export function buildStepCacheKey(
 
 export interface CachedStepTarget {
   /** Hash of the element's normalized label — never the raw label text (a
-   * code review requirement: no raw page text persisted to localStorage).
+   * code review requirement: no raw page text persisted to storage).
    * See `hashCachedLabel`. */
   labelHash: string;
   tag: string;
@@ -428,18 +433,23 @@ export function hashCachedLabel(label: string): string {
  * A malformed/pre-migration entry (no `verify` block at all) fails the same
  * check and is deleted the same way — never trusted just because it's old.
  */
-export function lookupStepCache(key: string, goal: string, elements: unknown[]): CachedStep | undefined {
-  const entry = getRawEntry(key);
+export function lookupStepCache(
+  storage: KeyValueStorage | undefined,
+  key: string,
+  goal: string,
+  elements: unknown[]
+): CachedStep | undefined {
+  const entry = getRawEntry(storage, key);
   if (!entry) return undefined;
   if (!isStoredCachedStep(entry.value)) {
-    deleteCacheEntry(key);
+    deleteCacheEntry(storage, key);
     return undefined;
   }
   const { verify, ...cachedStep } = entry.value;
   const expectedGoal = secondHash(goal);
   const expectedElements = secondHash(elementSetFingerprint(elements));
   if (verify.goal !== expectedGoal || verify.elements !== expectedElements) {
-    deleteCacheEntry(key);
+    deleteCacheEntry(storage, key);
     return undefined;
   }
   return cachedStep;
@@ -452,6 +462,7 @@ export function lookupStepCache(key: string, goal: string, elements: unknown[]):
  * key also has identical verify hashes.
  */
 export function writeStepCacheEntry(
+  storage: KeyValueStorage | undefined,
   key: string,
   goal: string,
   elements: unknown[],
@@ -464,13 +475,13 @@ export function writeStepCacheEntry(
       elements: secondHash(elementSetFingerprint(elements)),
     },
   };
-  setRawEntry(key, stored);
+  setRawEntry(storage, key, stored);
 }
 
 /** Slices `text` back out of `goal` by offset, or `undefined` when the
  * entry carries no `textRange` (a non-text operation) or the range is out
  * of bounds for the current goal (defensive — should be unreachable since
- * the goal is part of the key, but a hand-edited/corrupted localStorage
+ * the goal is part of the key, but a hand-edited/corrupted stored
  * blob must not throw or read garbage). */
 export function readTextFromRange(goal: string, textRange: [number, number] | undefined): string | undefined {
   if (!textRange) return undefined;
@@ -543,7 +554,7 @@ export function isCacheableStepOperation(operation: string): boolean {
 /** A crude but deliberately permissive card-number/password heuristic —
  * false positives just mean an ordinary value doesn't get cached (a
  * harmless miss on the next run, re-learned the same way), which is the
- * safe direction for a check guarding what we write to localStorage. This
+ * safe direction for a check guarding what we write to storage. This
  * checks the VALUE a step is about to type; `isUnsafeCachedTarget` below
  * separately checks the FIELD it's about to type into. */
 const CARD_NUMBER_PATTERN = /(?:\d[ -]?){13,19}/;

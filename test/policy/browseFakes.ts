@@ -9,7 +9,29 @@ import type {
   SystemOneClient,
   SystemOneEvaluateParams,
   SystemOneQuestion,
-} from "../src/services/systemone.js";
+} from "../../src/policy/decisions.js";
+import type { BrowsePolicyOptions } from "../../src/policy/decide.js";
+import { fakeTextModel } from "./structuredModelFakes.js";
+
+/** Replaces the backend tests' `makeConfig`: BrowsePolicyOptions with fake
+ * TextModels (see structuredModelFakes.ts) and a `decisions` client that
+ * fails loudly — the policy functions under test take their System One client
+ * as a separate argument, tests of decideStep pass `decisions` explicitly. */
+export function makeOptions(overrides: Partial<BrowsePolicyOptions> = {}): BrowsePolicyOptions {
+  return {
+    decisions: {
+      async evaluate() {
+        throw new Error("makeOptions: unexpected decisions.evaluate call (pass `decisions`)");
+      },
+    },
+    models: {
+      structured: fakeTextModel("openrouter:deepseek/deepseek-v4.1-flash"),
+      cascade: fakeTextModel("openrouter:google/gemini-2.5-flash"),
+    },
+    decisionModel: "jev-latest",
+    ...overrides,
+  };
+}
 
 // A fake SystemOneClient that answers every evaluate() call with the same
 // `answers` record (e.g. `{ locate: choice(...) }` for browse-locate, or a

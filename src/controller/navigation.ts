@@ -1,6 +1,4 @@
-// VENDORED from pen-editor-desktop/src/main/navigation.ts @ 3d8f975.
-// Do not edit: regenerate with `npm run browser:sync` (scripts/sync-browser-vendor.mjs).
-// ---- end of vendor header ----
+// Ported from pen-editor-desktop/src/main/navigation.ts (decideBrowserNavigation only).
 /**
  * Pure policy for browser tabs (design doc `2026-09-18-builtin-browser-design.md`
  * §1): any http(s) navigation is allowed in place — a browser tab is a real

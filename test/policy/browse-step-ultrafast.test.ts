@@ -1,20 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { makeConfig } from "./helpers.js";
 
-// See test/structuredModelFakes.ts's HOISTING CONTRACT comment.
-vi.mock("../src/ai/provider.js", async (importOriginal) =>
-  (await import("./structuredModelFakes.js")).mockProviderModule(await importOriginal()),
-);
+import { textModelCalls, mockJsonModelOnce } from "./structuredModelFakes.js";
+import { choice, fakeClient, makeOptions } from "./browseFakes.js";
+import { shortenRetypedQuery, DONE_WHEN_RULE, MAX_DECISION_CHOICES, containsWholeTyped, goalWantsMultipleUnits, matchesTyped, pickSuggestion, repeatsCommittedClick, repeatsNoEffectClick } from "../../src/policy/browseStepUltrafast.js";
+import type { SystemOneAnswer, SystemOneEvaluateParams, SystemOneQuestion } from "../../src/policy/decisions.js";
+import { DISABLED_CONTROL_RULE, type BrowseStepElement, type BrowseStepInput } from "../../src/policy/browseStep.js";
 
-import { createModel, mockJsonModelOnce } from "./structuredModelFakes.js";
-import { choice, fakeClient } from "./browseFakes.js";
-import { shortenRetypedQuery, DONE_WHEN_RULE, MAX_DECISION_CHOICES, containsWholeTyped, goalWantsMultipleUnits, matchesTyped, pickSuggestion, repeatsCommittedClick, repeatsNoEffectClick } from "../src/ai/browseStepUltrafast.js";
-import type { SystemOneAnswer, SystemOneEvaluateParams, SystemOneQuestion } from "../src/services/systemone.js";
-import { DISABLED_CONTROL_RULE, type BrowseStepElement, type BrowseStepInput } from "../src/ai/browseStep.js";
+const { decideBrowseStepUltrafast, buildUltrafastQuestions, withRememberedSelections } = await import("../../src/policy/browseStepUltrafast.js");
 
-const { decideBrowseStepUltrafast, buildUltrafastQuestions, withRememberedSelections } = await import("../src/ai/browseStepUltrafast.js");
-
-const config = makeConfig({ TYPESAFE_API_KEY: "key" });
+const config = makeOptions();
 
 const FORM: BrowseStepElement[] = [
   { index: 0, tag: "input", label: "First name", ops: ["TYPE_TEXT"], value: "Anna" },
@@ -176,10 +170,10 @@ describe("decideBrowseStepUltrafast", () => {
   });
 
   it("returns a SELECT with the chosen option's text and no text-model call", async () => {
-    createModel.mockClear();
+    textModelCalls.mockClear();
     const { result } = await decide({ operation: choice("SELECT", 0.9), select_target: choice("3:3", 0.9) });
     expect(result).toMatchObject({ outcome: "act", operation: "SELECT", index: 3, text: "Germany" });
-    expect(createModel).not.toHaveBeenCalled();
+    expect(textModelCalls).not.toHaveBeenCalled();
   });
 
   it("asks the text model for the value of the CHOSEN field", async () => {
@@ -262,14 +256,14 @@ describe("decideBrowseStepUltrafast", () => {
     const typePw = { operation: choice("TYPE_TEXT", 0.9), type_text_target: choice("9", 0.9) };
 
     it("types exactly the password the goal states, without the text helper", async () => {
-      vi.mocked(createModel).mockClear();
+      vi.mocked(textModelCalls).mockClear();
       const { result } = await decide(typePw, {
         ...withPassword,
         goal: 'Log in as me@x.com with password "hunter2"',
         permissions: { allowPasswordEntry: true },
       });
       expect(result).toMatchObject({ outcome: "act", operation: "TYPE_TEXT", index: 9, text: "hunter2" });
-      expect(createModel).not.toHaveBeenCalled();
+      expect(textModelCalls).not.toHaveBeenCalled();
     });
 
     it("never sends the plaintext password in the Jev evaluate call", async () => {
@@ -290,7 +284,7 @@ describe("decideBrowseStepUltrafast", () => {
     });
 
     it("honors the flag in the Luna click-to-Enter rewrite", async () => {
-      const lunaCfg = makeConfig({ TYPESAFE_API_KEY: "key", TYPESAFE_MODEL: "openai/gpt-6-luna-decisions" });
+      const lunaCfg = makeOptions({ decisionModel: "openai/gpt-6-luna-decisions" });
       const run = async (permissions?: { allowPasswordEntry: boolean }) =>
         decideBrowseStepUltrafast(
           fakeClient({ operation: choice("CLICK", 0.9), click_target: choice("1", 0.9) }, { model: "openai/gpt-6-luna-decisions" }),
@@ -532,9 +526,9 @@ describe("suggestion matching", () => {
   });
 });
 
-describe("vision (BROWSE_STEP_VISION)", () => {
+describe("vision (opts.vision, was BROWSE_STEP_VISION)", () => {
   const SHOT = "data:image/jpeg;base64,QUJD";
-  const visionConfig = makeConfig({ TYPESAFE_API_KEY: "key", BROWSE_STEP_VISION: "on" });
+  const visionConfig = makeOptions({ vision: true });
   const answers = { operation: choice("CLICK", 0.9), click_target: choice("5", 0.9) };
 
   async function run(cfg: typeof config, screenshot?: string) {
@@ -571,7 +565,7 @@ describe("vision (BROWSE_STEP_VISION)", () => {
 });
 
 describe("OpenAI Decisions (Luna) profile", () => {
-  const lunaConfig = makeConfig({ TYPESAFE_API_KEY: "key", TYPESAFE_MODEL: "openai/gpt-6-luna-decisions" });
+  const lunaConfig = makeOptions({ decisionModel: "openai/gpt-6-luna-decisions" });
   const SCROLLED = { y: 100, height: 900, atBottom: false };
 
   async function decideLuna(answers: Record<string, SystemOneAnswer>, overrides: Partial<BrowseStepInput> = {}) {
@@ -585,7 +579,7 @@ describe("OpenAI Decisions (Luna) profile", () => {
   }
 
   it("recognises openai/ models only", async () => {
-    const { isOpenAIDecisions } = await import("../src/ai/browseStepUltrafast.js");
+    const { isOpenAIDecisions } = await import("../../src/policy/browseStepUltrafast.js");
     expect(isOpenAIDecisions("openai/gpt-6-luna-decisions")).toBe(true);
     expect(isOpenAIDecisions("jev-latest")).toBe(false);
     expect(isOpenAIDecisions(undefined)).toBe(false);
@@ -696,7 +690,7 @@ describe("OpenAI Decisions (Luna) profile", () => {
 });
 
 describe("open dialog (modal) and repeated no-effect clicks", () => {
-  const lunaConfig = makeConfig({ TYPESAFE_API_KEY: "key", TYPESAFE_MODEL: "openai/gpt-6-luna-decisions" });
+  const lunaConfig = makeOptions({ decisionModel: "openai/gpt-6-luna-decisions" });
   const SEARCH: BrowseStepElement[] = [
     { index: 0, tag: "input", label: "Search", ops: ["CLICK", "TYPE_TEXT"], value: "old query" },
     { index: 1, tag: "button", label: "Close", ops: ["CLICK"] },
@@ -1086,10 +1080,10 @@ describe("click-empty-field-typed gate", () => {
   });
 
   it("does not read an apostrophe as a quote", async () => {
-    createModel.mockClear();
+    textModelCalls.mockClear();
     const { result } = await decide(clickAnswers, { elements: field(), goal: "Don't stop, it's a tent" });
     expect(result).toMatchObject({ operation: "CLICK", index: 0 });
-    expect(createModel).not.toHaveBeenCalled();
+    expect(textModelCalls).not.toHaveBeenCalled();
   });
 
   it("keeps the click when the field already has a value", async () => {
@@ -1104,10 +1098,10 @@ describe("click-empty-field-typed gate", () => {
   });
 
   it("keeps the click and skips the text helper when the goal quotes nothing", async () => {
-    createModel.mockClear();
+    textModelCalls.mockClear();
     const { result } = await decide(clickAnswers, { elements: field() });
     expect(result).toMatchObject({ operation: "CLICK", index: 0 });
-    expect(createModel).not.toHaveBeenCalled();
+    expect(textModelCalls).not.toHaveBeenCalled();
     expect(result.diag?.gates.some((g) => g.head === "click-empty-field-typed")).toBe(false);
   });
 
@@ -1185,7 +1179,7 @@ describe("disabled elements (Luna profile)", () => {
     { index: 1, tag: "input", role: "radio", label: "Display standard", ops: ["CLICK"] },
   ];
   it("puts the rule in the operation and target instructions and flags the state element", async () => {
-    const lunaConfig = makeConfig({ TYPESAFE_API_KEY: "key", TYPESAFE_MODEL: "openai/gpt-6-luna-decisions" });
+    const lunaConfig = makeOptions({ decisionModel: "openai/gpt-6-luna-decisions" });
     let captured: Captured | undefined;
     await decideBrowseStepUltrafast(
       fakeClient({ operation: choice("CLICK", 0.9), click_target: choice("1", 0.9) }, { capture: (p) => (captured = p) }),

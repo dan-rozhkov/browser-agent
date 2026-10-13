@@ -1,7 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { PlaywrightTarget } from "../src/browser/playwrightHandle.js";
-import { connectOverCdp } from "../src/browser/connect.js";
+import { PlaywrightTarget, connectOverCdp } from "../../src/adapters/playwright.js";
 
 vi.mock("playwright-core", () => ({
   chromium: {

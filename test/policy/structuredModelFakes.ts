@@ -1,56 +1,63 @@
-// Shared `createModel` mock for routes/helpers that call `generateObject()`
-// against a small structured-output model (STRUCTURED_MODEL) rather than
-// streaming chat: prototype-link.test.ts, user-skills-route.test.ts, and
-// browse-step(-route).test.ts's TYPE_TEXT/SELECT cascade calls all scripted
-// their own byte-identical `createModel` + `vi.mock("../src/ai/provider.js",
-// ...)` pair before this file existed.
-//
-// HOISTING CONTRACT — same as chatMocks.ts. `vi.mock` calls are hoisted
-// above every import in a test file, so a factory cannot close over a
-// statically imported binding. Each test file must write:
-//
-//   vi.mock("../src/ai/provider.js", async (importOriginal) =>
-//     (await import("./structuredModelFakes.js")).mockProviderModule(await importOriginal()));
-//
-// and separately `import { createModel, jsonModel } from "./structuredModelFakes.js"`
-// normally — the factory's dynamic import and the file's static import
-// resolve to the SAME module instance (vitest isolates the module graph per
-// test file, so `createModel`'s mock state never leaks between files).
+// Shared fake TextModels for tests whose policy code calls a small
+// structured-output model (generateObject) rather than System One: the
+// TYPE_TEXT / SELECT / cascade / plan / field-text calls of browse-step,
+// browse-step-ultrafast and browse-plan. They used to script a `createModel`
+// mock via vi.mock of the backend's provider module; now the models are
+// injected through BrowsePolicyOptions (see makeOptions in browseFakes.ts),
+// built with aiSdkTextModel over a MockLanguageModelV3 so the AI SDK
+// generateObject + error mapping path stays real.
 import { vi } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
+import { aiSdkTextModel } from "../../src/adapters/aiSdk.js";
+import type { TextModel } from "../../src/policy/textModel.js";
+
+// The parts of a LanguageModelV3 generate result every fake here shares
+// (a clean stop, 1+1 tokens, no warnings) — spread it and add `content`.
+export const generateResultBase = {
+  finishReason: { unified: "stop" as const, raw: "stop" },
+  usage: {
+    inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+    outputTokens: { total: 1, text: 1, reasoning: undefined },
+  },
+  warnings: [] as never[],
+};
 
 // A one-shot structured-output response containing `json` as the model's
 // entire text output (generateObject parses this as the schema result).
 // Tests script a different response per case with
-// `createModel.mockImplementationOnce/mockReturnValueOnce(() => jsonModel(...))`,
-// exactly like they did with their own local MockLanguageModelV3 literal.
+// `textModelCalls.mockImplementationOnce/mockReturnValueOnce(() => jsonModel(...))`.
 export function jsonModel(json: unknown): MockLanguageModelV3 {
   return new MockLanguageModelV3({
     doGenerate: async () => ({
-      finishReason: "stop",
-      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-      warnings: [],
+      ...generateResultBase,
       content: [{ type: "text", text: JSON.stringify(json) }],
     }),
   });
 }
 
-// The vi.fn() itself, so call sites can set a default implementation at
-// module scope (`createModel.mockImplementation(() => jsonModel({...}))`)
-// and still use `.mockClear()`/`.mockImplementationOnce()`/
-// `.mockReturnValueOnce()`/`expect(createModel).toHaveBeenCalled()` per test,
-// same as when it was a local const.
-export const createModel = vi.fn();
+// Called once at the start of EVERY generateObject() of a fake TextModel
+// (structured and cascade roles share it) and returns the model that call
+// should be answered by — so `expect(textModelCalls).toHaveBeenCalled()` /
+// `.not.toHaveBeenCalled()` asserts that a text-model generateObject did /
+// did not happen, exactly like asserting on `createModel` did. Set a default
+// implementation at module scope and use `.mockClear()` /
+// `.mockImplementationOnce()` / `.mockReturnValueOnce()` per test.
+export const textModelCalls = vi.fn();
 
-// Only createModel is faked — every other export (bareModelId,
-// parseModelRef, ...) stays the REAL implementation, since GET /api/models
-// (registered by the same buildApp in the route-level tests) resolves the
-// model list through it.
-export function mockProviderModule<T extends object>(actual: T): T {
-  return { ...actual, createModel: (...args: unknown[]) => createModel(...(args as [])) };
+/** A TextModel whose every generateObject() asks `textModelCalls` which
+ * MockLanguageModelV3 answers it. A throw from `textModelCalls` surfaces from
+ * generateObject, like a throwing `createModel` did. */
+export function fakeTextModel(id: string): TextModel {
+  return {
+    id,
+    async generateObject(req) {
+      const model = textModelCalls() as MockLanguageModelV3;
+      return aiSdkTextModel(model, { id }).generateObject(req);
+    },
+  };
 }
 
-// Scripts the NEXT createModel() call to answer `json`, capturing the
+// Scripts the NEXT generateObject() to answer `json`, capturing the
 // abortSignal and prompt its generation was given — for tests asserting
 // what a small structured-model call was told and how it was bounded.
 export function mockJsonModelOnce(json: unknown): {
@@ -59,16 +66,14 @@ export function mockJsonModelOnce(json: unknown): {
 } {
   let seenSignal: AbortSignal | undefined;
   let seenPrompt = "";
-  createModel.mockImplementationOnce(
+  textModelCalls.mockImplementationOnce(
     () =>
       new MockLanguageModelV3({
         doGenerate: async (options: { abortSignal?: AbortSignal; prompt?: unknown }) => {
           seenSignal = options.abortSignal;
           seenPrompt = JSON.stringify(options.prompt ?? "");
           return {
-            finishReason: "stop",
-            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-            warnings: [],
+            ...generateResultBase,
             content: [{ type: "text", text: JSON.stringify(json) }],
           };
         },

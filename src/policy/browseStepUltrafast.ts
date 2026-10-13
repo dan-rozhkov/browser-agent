@@ -1,16 +1,14 @@
 import { withRedactedGoal } from "./browseCommitGuard.js";
-import { generateObject } from "ai";
 import { z } from "zod";
-import type { Config } from "../config.js";
-import { scrubPii } from "../analysis/pii.js";
+import type { BrowsePolicyOptions } from "./decide.js";
+import { scrubPii } from "./pii.js";
 import type {
   SystemOneAnswer,
   SystemOneChoiceAnswer,
   SystemOneClient,
   SystemOneQuestion,
-} from "../services/systemone.js";
-import { isOpenAIDecisions } from "../services/systemone.js";
-import { createModel } from "./provider.js";
+} from "./decisions.js";
+import { isOpenAIDecisions } from "./decisions.js";
 import {
   BROWSE_STEP_TIMEOUT_MS,
   BROWSE_TEXT_TIMEOUT_MS,
@@ -581,7 +579,7 @@ function targetHeadFor(op: BrowseOperation): TargetHead | undefined {
 }
 
 // Added to every question's instructions only when a marked screenshot rides
-// along in `state` (BROWSE_STEP_VISION=on).
+// along in `state` (opts.vision === true (was BROWSE_STEP_VISION=on)).
 const SCREENSHOT_NOTE = {
   screenshot_note:
     "The screenshot shows the visible part of the current page. Interactive elements are outlined in blue boxes; each box has a small blue number label touching one of its edges (outside on the left, above, right or below, or inside a corner). The number equals that element's index in the JSON state. Use the screenshot for visual cues (icons, colour, position, layout, disabled look); use the JSON for labels and values.",
@@ -731,7 +729,7 @@ const fieldTextSchema = z.object({ text: z.string().max(200).nullable() });
 /** model.py field_text: the goal (PII as numbered tokens), the CHOSEN field,
  * a slice of page text and recent actions, answered by a small LLM. */
 async function writeFieldText(
-  config: Config,
+  config: BrowsePolicyOptions,
   input: BrowseStepInput,
   field: BrowseStepElement,
   pageText: string,
@@ -742,8 +740,7 @@ async function writeFieldText(
     .slice(-6)
     .map((h) => `- ${h.operation}: ${toCascadePromptSafeText(truncateLabel(scrubPii(h.label), 120))}`)
     .join("\n");
-  const { object } = await generateObject({
-    model: createModel(config, config.BROWSE_CASCADE_MODEL, { reasoningEffort: "none" }),
+  const { object } = await config.models.cascade.generateObject({
     schema: fieldTextSchema,
     abortSignal: signal,
     prompt: [
@@ -972,7 +969,7 @@ export function repeatsCommittedClick(history: BrowseStepInput["history"], el: B
 
 export async function decideBrowseStepUltrafast(
   client: SystemOneClient,
-  config: Config,
+  config: BrowsePolicyOptions,
   rawInput: BrowseStepInput,
 ): Promise<BrowseStepResult> {
   // No model ever sees a password the goal states (see browseCommitGuard.ts).
@@ -980,7 +977,7 @@ export async function decideBrowseStepUltrafast(
   const start = Date.now();
   const timings: NonNullable<BrowseStepResult["timings"]> = { jevMs: 0, totalMs: 0 };
   const gates: NonNullable<BrowseStepResult["diag"]>["gates"] = [];
-  const vision = config.BROWSE_STEP_VISION === "on" && !!input.screenshot;
+  const vision = config.vision === true && !!input.screenshot;
   let inputTokens: number | undefined;
   let ruleTier = false;
   const finish = (result: BrowseStepResult): BrowseStepResult => ({
@@ -997,7 +994,7 @@ export async function decideBrowseStepUltrafast(
   const goal = scrubPii(input.goal);
   const elements = withRememberedSelections(capAndScrubElements(input.elements), input.history);
   const pageText = scrubPii((input.pageText ?? "").slice(0, MAX_PAGE_TEXT_CHARS));
-  const luna = isOpenAIDecisions(config.TYPESAFE_MODEL);
+  const luna = isOpenAIDecisions(config.decisionModel);
   const history = input.history.slice(-HISTORY_WINDOW).map((h, i, all) => {
     const base = { action: truncateLabel(scrubPii(h.label), 160), operation: h.operation, ok: h.ok };
     if (!luna) return base;

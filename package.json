@@ -45,13 +45,22 @@
     "./adapters/http-backend": {
       "types": "./dist/adapters/httpBackend.d.ts",
       "default": "./dist/adapters/httpBackend.js"
+    },
+    "./adapters/local-backend": {
+      "types": "./dist/adapters/localBackend.d.ts",
+      "default": "./dist/adapters/localBackend.js"
+    },
+    "./adapters/controller-bridge": {
+      "types": "./dist/adapters/controllerBridge.d.ts",
+      "default": "./dist/adapters/controllerBridge.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "lint": "tsc --noEmit && eslint .",
     "test": "vitest run",
-    "example": "tsx examples/run-task.ts"
+    "example": "tsx examples/run-task.ts",
+    "prepare": "npm run build"
   },
   "peerDependencies": {
     "ai": "^6.0.0",
@@ -79,5 +88,36 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.71.2",
     "vitest": "^4.1.11"
+  },
+  "typesVersions": {
+    "*": {
+      "controller": [
+        "dist/controller/index.d.ts"
+      ],
+      "policy": [
+        "dist/policy/index.d.ts"
+      ],
+      "loop": [
+        "dist/loop/index.d.ts"
+      ],
+      "adapters/playwright": [
+        "dist/adapters/playwright.d.ts"
+      ],
+      "adapters/systemone-http": [
+        "dist/adapters/systemoneHttp.d.ts"
+      ],
+      "adapters/ai-sdk": [
+        "dist/adapters/aiSdk.d.ts"
+      ],
+      "adapters/http-backend": [
+        "dist/adapters/httpBackend.d.ts"
+      ],
+      "adapters/local-backend": [
+        "dist/adapters/localBackend.d.ts"
+      ],
+      "adapters/controller-bridge": [
+        "dist/adapters/controllerBridge.d.ts"
+      ]
+    }
   }
 }

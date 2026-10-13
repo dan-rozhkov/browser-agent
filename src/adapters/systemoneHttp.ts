@@ -1,15 +1,26 @@
 import { z } from "zod";
-import type { Config } from "../config.js";
+import {
+  isOpenAIDecisions,
+  SystemOneAuthError,
+  SystemOneError,
+  SystemOneRateLimitError,
+  SystemOneRefusalError,
+  SystemOneUpstreamError,
+  SystemOneValidationError,
+  type DecisionClient,
+  type SystemOneAnswer,
+  type SystemOneEvaluateParams,
+  type SystemOneQuestion,
+  type SystemOneResult,
+} from "../policy/decisions.js";
 
 // Small HTTP client for TypeSafe AI's "System One" evaluation model (Jev).
-// No SDK dependency — global fetch is enough. Mirrors the shape of
-// src/analysis/embeddings.ts (createEmbedder): a factory that returns null
-// when the feature's API key is unset, and takes an injectable `fetchFn`
-// for testability. Error-class + timeout-constant style follows
-// src/services/github.ts.
+// No SDK dependency — global fetch is enough. A factory that takes an
+// injectable `fetch` for testability. The types, errors and model predicates
+// live in policy/decisions.ts.
 //
 // Vendor contract (verified live 2026-09):
-//   POST {TYPESAFE_BASE_URL}/systemone
+//   POST {baseUrl}/systemone
 //   Headers: Authorization: Bearer <key>, Content-Type: application/json
 //   Body: { state, model, questions }
 //   Response: { model, answers, usage: { input_tokens, output_tokens } }
@@ -27,72 +38,8 @@ const RETRY_BASE_DELAY_MS = 500;
 // still leaves room for the retry's own fetch.
 const MAX_RETRY_AFTER_MS = 10_000;
 // OpenAI Decisions (e.g. openai/gpt-6-luna-decisions) speak the same
-// System One contract on OpenRouter; see createSystemOne.
+// System One contract on OpenRouter; see createSystemOneClient.
 export const OPENROUTER_DECISIONS_BASE_URL = "https://openrouter.ai/api/v1";
-
-// --- Question types (request side) -----------------------------------
-
-// The vendor accepts structured JSON here as well as plain text —
-// jev-ultrafast sends `{ goal, rules }` objects as instructions and per-option
-// objects (label + current value + state) as choice criteria.
-export type SystemOneInstructions = string | Record<string, unknown>;
-
-export interface SystemOneNoulQuestion {
-  type: "noul";
-  instructions: SystemOneInstructions;
-  criteria?: { true?: string; false?: string };
-}
-
-export interface SystemOneChoiceQuestion {
-  type: "choice";
-  instructions: SystemOneInstructions;
-  // Option -> description. A null description is allowed by the vendor, and
-  // so is a structured object.
-  criteria: Record<string, string | null | Record<string, unknown>>;
-}
-
-export interface SystemOneScoreQuestion {
-  type: "score";
-  instructions: SystemOneInstructions;
-  // Ordered level descriptions, low to high. At least 2.
-  criteria: string[];
-}
-
-export type SystemOneQuestion =
-  | SystemOneNoulQuestion
-  | SystemOneChoiceQuestion
-  | SystemOneScoreQuestion;
-
-// --- Answer types (response side) -------------------------------------
-
-export interface SystemOneNoulAnswer {
-  type: "noul";
-  // 0..1 probability of "yes". No confidence field — the vendor never sends
-  // one for this answer kind.
-  noul: number;
-}
-
-export interface SystemOneChoiceAnswer {
-  type: "choice";
-  choice: string;
-  probabilities: Record<string, number>;
-  confidence: number;
-}
-
-export interface SystemOneScoreAnswer {
-  type: "score";
-  score: number;
-  legend: Record<string, string>;
-  probabilities: Record<string, number>;
-  confidence: number;
-}
-
-export type SystemOneAnswer =
-  | SystemOneNoulAnswer
-  | SystemOneChoiceAnswer
-  | SystemOneScoreAnswer;
-
-export type SystemOneAnswers = Record<string, SystemOneAnswer>;
 
 // --- Response validation ------------------------------------------------
 
@@ -138,56 +85,6 @@ const openRouterErrorBodySchema = z.object({
   error: z.object({ message: z.string().optional() }),
 });
 
-// --- Errors --------------------------------------------------------------
-
-export class SystemOneError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SystemOneError";
-  }
-}
-
-export class SystemOneAuthError extends SystemOneError {
-  constructor(message: string) {
-    super(message);
-    this.name = "SystemOneAuthError";
-  }
-}
-
-export class SystemOneValidationError extends SystemOneError {
-  constructor(message: string) {
-    super(message);
-    this.name = "SystemOneValidationError";
-  }
-}
-
-export class SystemOneRateLimitError extends SystemOneError {
-  constructor(message: string) {
-    super(message);
-    this.name = "SystemOneRateLimitError";
-  }
-}
-
-export class SystemOneUpstreamError extends SystemOneError {
-  constructor(message: string) {
-    super(message);
-    this.name = "SystemOneUpstreamError";
-  }
-}
-
-/** The vendor's exact refusal: HTTP 502 with
- * `{"error":{"message":"OpenAI refused to answer question \"<id>\"","code":502}}`.
- * Any other 502 stays a plain SystemOneUpstreamError. */
-export class SystemOneRefusalError extends SystemOneUpstreamError {
-  constructor(
-    message: string,
-    readonly questionId: string,
-  ) {
-    super(message);
-    this.name = "SystemOneRefusalError";
-  }
-}
-
 // The first call, then up to three resends without the refused questions
 // (a Decisions model can refuse several heads one at a time).
 const MAX_ROUNDS = 4;
@@ -208,33 +105,6 @@ function parseRefusedQuestionId(status: number, text: string | undefined): strin
   const parsed = refusalBodySchema.safeParse(json);
   if (!parsed.success || parsed.data.error.code !== 502) return undefined;
   return REFUSAL_MESSAGE_RE.exec(parsed.data.error.message)?.[1];
-}
-
-// --- Client ---------------------------------------------------------------
-
-export interface SystemOneEvaluateParams<
-  Q extends Record<string, SystemOneQuestion>,
-> {
-  state: string | Record<string, unknown> | unknown[];
-  questions: Q;
-  signal?: AbortSignal;
-}
-
-export interface SystemOneResult<Q extends Record<string, SystemOneQuestion>> {
-  model: string;
-  /** A question the vendor refused to answer is ABSENT here (never filled
-   * with a made-up value): callers must treat a missing key as "no answer"
-   * and take their fail-safe path. */
-  answers: Partial<Record<keyof Q, SystemOneAnswer>>;
-  /** Ids of the questions dropped because the vendor refused them. */
-  refused: string[];
-  usage: { input_tokens: number; output_tokens: number };
-}
-
-export interface SystemOneClient {
-  evaluate<Q extends Record<string, SystemOneQuestion>>(
-    params: SystemOneEvaluateParams<Q>,
-  ): Promise<SystemOneResult<Q>>;
 }
 
 async function readBodyText(response: Response): Promise<string | undefined> {
@@ -360,29 +230,33 @@ function abortableSleep(
   });
 }
 
-/** OpenAI Decisions models ("Luna", `openai/...`). Case-insensitive. */
-export function isOpenAIDecisions(model: string | undefined): boolean {
-  return (model ?? "").toLowerCase().startsWith("openai/");
+export interface SystemOneClientOptions {
+  apiKey: string;
+  /** Default "jev-latest". An `openai/...` id routes to OpenRouter (see below). */
+  model?: string;
+  /** Default: the TypeSafe API URL. */
+  baseUrl?: string;
+  /** Used instead of `apiKey` when `model` is an OpenAI Decisions model. */
+  openRouterApiKey?: string;
+  fetch?: typeof fetch;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
-/** System One "jev*" models (text-only). Case-insensitive. */
-export function isJevModel(model: string | undefined): boolean {
-  return (model ?? "").toLowerCase().startsWith("jev");
-}
+export const DEFAULT_SYSTEMONE_BASE_URL = "https://api.typesafe.ai/v1";
+export const DEFAULT_SYSTEMONE_MODEL = "jev-latest";
 
-export function createSystemOne(
-  config: Config,
-  fetchFn: typeof fetch = fetch,
-  sleepFn: (ms: number, signal: AbortSignal) => Promise<void> = defaultSleep,
-): SystemOneClient | null {
-  if (!config.TYPESAFE_API_KEY) return null;
-  const model = config.TYPESAFE_MODEL;
+export function createSystemOneClient(opts: SystemOneClientOptions): DecisionClient {
+  if (!opts.apiKey) throw new Error("createSystemOneClient: apiKey is required");
+  const fetchFn: typeof fetch = opts.fetch ?? fetch;
+  const sleepFn: (ms: number, signal: AbortSignal) => Promise<void> = opts.sleep ?? defaultSleep;
+  const decisionModel = opts.model ?? DEFAULT_SYSTEMONE_MODEL;
+  const model = decisionModel;
   // OpenAI Decisions models are served by OpenRouter under the same
-  // contract, so switching between Jev and Luna is TYPESAFE_MODEL alone:
+  // contract, so switching between Jev and Luna is `model` alone:
   // the TypeSafe key and base URL stay in place for the way back.
-  const viaOpenRouter = isOpenAIDecisions(model);
-  const apiKey = viaOpenRouter ? config.OPENROUTER_API_KEY : config.TYPESAFE_API_KEY;
-  const url = `${viaOpenRouter ? OPENROUTER_DECISIONS_BASE_URL : config.TYPESAFE_BASE_URL}/systemone`;
+  const viaOpenRouter = isOpenAIDecisions(decisionModel);
+  const apiKey = viaOpenRouter ? opts.openRouterApiKey : opts.apiKey;
+  const url = `${viaOpenRouter ? OPENROUTER_DECISIONS_BASE_URL : (opts.baseUrl ?? DEFAULT_SYSTEMONE_BASE_URL)}/systemone`;
 
   return {
     async evaluate<Q extends Record<string, SystemOneQuestion>>({
@@ -400,7 +274,7 @@ export function createSystemOne(
       // Jev still receives it as before). A question the vendor refuses (its
       // exact 502 refusal error) is dropped — never answered with a made-up
       // value — and the rest resent, up to MAX_ROUNDS rounds in total.
-      const localSingleOption = isOpenAIDecisions(config.TYPESAFE_MODEL);
+      const localSingleOption = viaOpenRouter;
       const answers: Record<string, SystemOneAnswer> = {};
       let pending: Record<string, SystemOneQuestion> = {};
       for (const [id, q] of Object.entries(questions)) {
@@ -417,7 +291,7 @@ export function createSystemOne(
         }
       }
 
-      let model = config.TYPESAFE_MODEL;
+      let model = decisionModel;
       const usage = { input_tokens: 0, output_tokens: 0 };
       const refused: string[] = [];
       for (let round = 0; round < MAX_ROUNDS && Object.keys(pending).length > 0; round++) {

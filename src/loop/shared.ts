@@ -1,73 +1,18 @@
-import { apiFetch } from "../../apiBase";
+import type { BrowserBridge } from "./bridge.js";
+import type { BrowseBackend, BrowseBackendResponse, BrowseEndpoint } from "./backend.js";
 
 /**
- * Shared plumbing for the browse_* forwarding tools (browse_open, browse_act,
- * browse_find_images, browse_read — docs/superpowers/specs/
+ * Shared plumbing for the browse_task loop (docs/superpowers/specs/
  * 2026-09-18-builtin-browser-design.md §4/§6 and the browse_read addendum in
- * 2026-09-18-browse-task-jev-loop-design.md). All are client-executed, thin
- * forwarders onto
- * `window.penDesktop.browser.*` (the preload surface described in §5): the
- * real work happens in the Electron main process's `BrowserController`.
- *
- * Outside the desktop shell `window.penDesktop.browser` is undefined (web
- * builds, and desktop builds older than this feature), so every handler
- * must degrade to a documented error string rather than throw — matching
- * every other ToolHandler's "always resolves" contract.
+ * 2026-09-18-browse-task-jev-loop-design.md). The loop reaches the page
+ * through the injected `BrowserBridge` (the `browser` option of
+ * `runBrowseTask`; in pen-editor's desktop shell that is
+ * `window.penDesktop.browser`, whose real work happens in the Electron main
+ * process's `BrowserController`).
  */
-export const BROWSER_NOT_AVAILABLE_ERROR =
-  "The built-in browser is only available in the Pineapple Editor desktop app.";
 
 /**
- * `window.penDesktop.browser` exists (an older desktop build is running) but
- * the specific method a tool needs (`screenshot`/`tabs`, added in
- * docs/superpowers/specs/2026-09-23-full-browser-use-design.md) is not on
- * it. Distinct from `BROWSER_NOT_AVAILABLE_ERROR` — that one means "no
- * built-in browser at all" (web build, or no desktop shell), this one means
- * "there is a browser, but this command is newer than it" — so the model
- * gets an actionable message instead of a generic "not available" that
- * would suggest retrying is pointless for the wrong reason.
- */
-export const BROWSER_BRIDGE_METHOD_MISSING_ERROR =
-  "This browser command needs a newer version of the Pineapple Editor desktop app.";
-
-/**
- * Runs `call` against the desktop's browser bridge and stringifies the
- * result. Never throws: a missing bridge or a rejecting preload call both
- * come back as a JSON `{"error": "..."}` string, the same shape every other
- * tool handler in this project uses to report failure.
- *
- * `unavailableMessage` lets a caller substitute
- * `BROWSER_BRIDGE_METHOD_MISSING_ERROR` for the default when `call` is
- * `undefined` because the bridge exists but lacks this particular method,
- * rather than because the bridge is absent entirely.
- */
-export async function callBrowserBridge(
-  call: ((args: Record<string, unknown>) => Promise<unknown>) | undefined,
-  args: Record<string, unknown>,
-  unavailableMessage: string = BROWSER_NOT_AVAILABLE_ERROR
-): Promise<string> {
-  if (!call) {
-    return JSON.stringify({ error: unavailableMessage });
-  }
-  try {
-    const result = await call(args);
-    // `call`'s declared return type is `Promise<unknown>`, which permits
-    // `undefined` — JSON.stringify(undefined) yields the value `undefined`,
-    // not a string, violating ToolHandler's `Promise<string>` contract.
-    // `executeToolCall` then calls `result.startsWith('{"error"')` on that
-    // non-string and throws a TypeError, surfacing a bogus error to the
-    // model instead of the (empty) result. Coalesce to `{}` so this always
-    // returns a real JSON string.
-    return JSON.stringify(result ?? {});
-  } catch (err) {
-    return JSON.stringify({
-      error: err instanceof Error ? err.message : "Built-in browser command failed.",
-    });
-  }
-}
-
-/**
- * The shape `window.penDesktop.browser.snapshot()` resolves with on success
+ * The shape `BrowserBridge.snapshot()` resolves with on success
  * (docs/superpowers/specs/2026-09-18-browse-task-jev-loop-design.md §1).
  * Shared between browseTask.ts (the Jev loop) and browseAct.ts (the
  * `element` natural-language targeting path, docs/superpowers/specs/
@@ -100,13 +45,6 @@ export interface SnapshotResult {
 }
 
 /**
- * The desktop bridge's `browser` surface type, pulled out once so every
- * browse_* module can name it instead of repeating the
- * `NonNullable<NonNullable<typeof window.penDesktop>["browser"]>` spelling.
- */
-export type PenDesktopBrowser = NonNullable<NonNullable<typeof window.penDesktop>["browser"]>;
-
-/**
  * Finds a snapshot element by its own `index` field, NOT its position in
  * the array — the element list is not guaranteed dense/positional (e.g.
  * after `filterElementsForBackend`-style upstream filtering). Used by
@@ -137,7 +75,7 @@ export function isSnapshotResult(value: unknown): value is SnapshotResult {
 }
 
 /**
- * The desktop bridge never rejects: `window.penDesktop.browser.*` resolves
+ * The bridge never rejects: `BrowserBridge.*` resolves
  * with `{ error: "..." }` for every refusal the controller makes, including
  * the stale-snapshotId guard that fires when the page re-rendered between
  * snapshot and perform/act. Read as a bare success, such a result would be
@@ -164,7 +102,7 @@ export function resultError(value: unknown): string | null {
  * itself.
  */
 export async function takeSnapshot(
-  browser: NonNullable<NonNullable<typeof window.penDesktop>["browser"]>
+  browser: BrowserBridge
 ): Promise<SnapshotResult | { error: string }> {
   try {
     const raw = await browser.snapshot();
@@ -179,43 +117,6 @@ export async function takeSnapshot(
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
-}
-
-/**
- * Parses a browse_* handler's own JSON-string result back into an object so
- * a caller (browseAct.ts's `actions` batch, the snapshot-attach helpers
- * below) can inspect/merge fields into it. Every browse_* result is
- * produced by `callBrowserBridge`/`resolveByElement`, which always emit a
- * real JSON object string — this only guards the theoretical case where
- * that contract is somehow violated, so it never throws.
- */
-export function safeParseObject(value: string): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // fall through
-  }
-  return { error: "browse_act: malformed result from the browser bridge." };
-}
-
-/**
- * Full browser use follow-up (browse-speed-contract.md, "Frontend" items
- * 1/2): takes a fresh snapshot and merges it into `resultObj` as `snapshot`
- * — the model usually doesn't need a separate browse_snapshot call after an
- * open/act. Best-effort: a failed extra snapshot must not turn an otherwise
- * successful open/act into an error, so this silently returns `resultObj`
- * unchanged when the snapshot itself fails.
- */
-export async function attachSnapshot(
-  browser: PenDesktopBrowser,
-  resultObj: Record<string, unknown>
-): Promise<Record<string, unknown>> {
-  const snap = await takeSnapshot(browser);
-  if ("error" in snap) return resultObj;
-  return { ...resultObj, snapshot: snap };
 }
 
 /**
@@ -347,43 +248,18 @@ export function sanitizedPageBody(snapshot: { url: string; title?: string; eleme
 const BROWSE_BACKEND_REQUEST_TIMEOUT_MS = 20_000;
 
 /**
- * `fetchBrowseBackend`'s result: the parsed body alongside `status`/`ok` —
- * callers still own status-code and JSON-shape handling (browse/step's
- * "any non-ok status is a hard failure" differs from browse/locate's "503
- * means no fast model configured, everything else is a retry-and-fall-back
- * signal"). `body` is `null` when the response wasn't valid JSON (an error
- * page from a proxy in front of the backend, say) — callers already treat
- * a response they can't make sense of as a failure, so this is reported
- * the same way a missing/unrecognized field would be, not as a thrown
- * error.
- */
-export interface BrowseBackendResponse {
-  status: number;
-  ok: boolean;
-  body: unknown;
-  /** `Retry-After` header in seconds, when present and numeric. */
-  retryAfterSec?: number;
-}
-
-/**
  * POSTs `body` to a `/api/browse/*` backend route and returns its parsed
  * result. Centralizes what's genuinely identical between the two `/api/
- * browse/*` routes: the backend base URL (via `resolveApiUrl`, the same one
- * every other backend caller in this project uses), the JSON content-type
- * header, and an abort timeout so a hung backend fails fast instead of
- * riding out the calling tool's whole timeout budget in silence.
- *
- * The timeout bounds `res.json()` too, not just the fetch — it used to only
- * wrap the `fetch()` call, clearing the abort timer as soon as headers
- * arrived; a backend that sent headers promptly but then stalled writing
- * (or streamed) the body could hang `res.json()` indefinitely with no
- * timeout protecting it at all. Doing the parse here, inside the same
- * try/finally, means BROWSE_BACKEND_REQUEST_TIMEOUT_MS now bounds the
- * WHOLE round trip — connect through body-read — for both callers, with no
- * separate timeout needed on their end.
+ * browse/*` routes: the 429 / 503+Retry-After retry loop. The transport (base
+ * URL, JSON content-type header, the abort timeout so a hung backend fails
+ * fast instead of riding out the calling tool's whole timeout budget in
+ * silence) lives in the injected `BrowseBackend`; `timeoutMs` bounds the
+ * WHOLE round trip — connect through body-read — and the backend adapter
+ * (adapters/httpBackend.ts) enforces it.
  */
 export async function fetchBrowseBackend(
-  path: string,
+  backend: BrowseBackend,
+  path: BrowseEndpoint,
   body: Record<string, unknown>,
   timeoutMs: number = BROWSE_BACKEND_REQUEST_TIMEOUT_MS,
   /** Aborts the request in flight (Stop / cancelled browse_task). */
@@ -391,7 +267,7 @@ export async function fetchBrowseBackend(
   /** Opt-in: wait and re-send the SAME request on 429 / 503+Retry-After. */
   retry?: RetryClock
 ): Promise<BrowseBackendResponse> {
-  let res = await fetchBrowseBackendOnce(path, body, timeoutMs, signal);
+  let res = await backend.request(path, body, { timeoutMs, signal });
   if (!retry) return res;
   for (let attempt = 0; attempt < RATE_LIMIT_MAX_RETRIES && isRetryableStatus(res); attempt++) {
     if (signal?.aborted) break;
@@ -403,7 +279,7 @@ export async function fetchBrowseBackend(
     if (retry.deadline !== undefined && retry.now() + waitMs + timeoutMs + (retry.reserveMs ?? 0) > retry.deadline) break;
     await abortableSleep(retry.sleep(waitMs), signal);
     if (signal?.aborted) break;
-    res = await fetchBrowseBackendOnce(path, body, timeoutMs, signal);
+    res = await backend.request(path, body, { timeoutMs, signal });
   }
   return res;
 }
@@ -439,44 +315,4 @@ function abortableSleep(wait: Promise<void>, signal?: AbortSignal): Promise<void
     signal.addEventListener("abort", done, { once: true });
     void wait.then(done, done);
   });
-}
-
-async function fetchBrowseBackendOnce(
-  path: string,
-  body: Record<string, unknown>,
-  timeoutMs: number,
-  signal?: AbortSignal
-): Promise<BrowseBackendResponse> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const onAbort = () => controller.abort();
-  if (signal?.aborted) controller.abort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const res = await apiFetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    let parsedBody: unknown = null;
-    try {
-      parsedBody = await res.json();
-    } catch {
-      // Non-JSON body — report as `null` rather than throwing, same as an
-      // unrecognized/missing field elsewhere on these responses.
-      parsedBody = null;
-    }
-    const rawRetry = res.headers?.get?.("Retry-After");
-    const retryAfterSec = rawRetry != null && rawRetry.trim() !== "" ? Number(rawRetry) : NaN;
-    return {
-      status: res.status,
-      ok: res.ok,
-      body: parsedBody,
-      ...(Number.isFinite(retryAfterSec) && retryAfterSec >= 0 ? { retryAfterSec } : {}),
-    };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
 }

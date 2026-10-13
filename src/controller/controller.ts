@@ -12,13 +12,8 @@
 // how pen-editor's own toolHandlers behave everywhere else in this project
 // (and how dispatcher.ts's ToolCallResult never rejects either).
 
-import { randomUUID } from "node:crypto";
-import { decideBrowserNavigation } from "../navigation";
-import { parseKeySpec, modifiersBitmask, resolveEditCommand, resolveNamedKey } from "./keys";
-// Second-pass review finding 10: BrowserTabInfo is declared once, in
-// tabManager.ts — see the re-export below, where the type used to be
-// declared a second time in this file.
-import type { BrowserTabInfo } from "../tabManager";
+import { decideBrowserNavigation } from "./navigation.js";
+import { parseKeySpec, modifiersBitmask, resolveEditCommand, resolveNamedKey } from "./keys.js";
 import {
   ARGS_MARKER,
   FIND_IMAGES_JS,
@@ -50,7 +45,16 @@ import {
   SLIDER_SCROLL_JS,
   BOT_CHECK_JS,
   IFRAME_RECTS_JS,
-} from "./pageScripts";
+} from "./pageScripts.js";
+
+const randomUUID = () => globalThis.crypto.randomUUID();
+
+export interface BrowserTabInfo {
+  tabId: number;
+  url: string;
+  title: string;
+  current: boolean;
+}
 
 const SCRIPT_TEMPLATES = {
   FIND_IMAGES_JS,
@@ -657,8 +661,6 @@ export interface BrowserPageHandle {
 // silently drift. Re-exported here (imported at the top of this file) so
 // every existing `import { BrowserTabInfo } from "./controller"` keeps
 // working.
-export type { BrowserTabInfo };
-
 export interface BrowserTarget {
   /** Resolves the tab to drive, creating one if none exists. */
   ensurePage(): Promise<BrowserPageHandle>;
@@ -2721,6 +2723,7 @@ export class BrowserController {
       }
       if (found || Date.now() >= deadline) break;
       await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_INTERVAL_MS));
+    // eslint-disable-next-line no-constant-condition -- do/while is deliberate (runs at least once), see doc comment above
     } while (true);
     return { found, url: page.getURL(), title: page.getTitle() };
   }

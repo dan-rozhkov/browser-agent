@@ -1,22 +1,23 @@
 import { vi } from "vitest";
+import type { BrowserBridge } from "../../src/loop/bridge.js";
 
 // Shared arrange helpers for the browser-tool unit tests
-// (browseTask.test.ts, browserTools.test.ts). Extracted to keep
+// (browseTask.test.ts). Extracted to keep
 // check:dup:tests under its ratchet baseline — see CLAUDE.md -> Testing.
 
-export type PenDesktopBrowser = NonNullable<NonNullable<typeof window.penDesktop>["browser"]>;
+export type { BrowserBridge };
 
 /**
- * Builds a `window.penDesktop.browser` stub with every method defaulted to a
+ * Builds a `BrowserBridge` stub with every method defaulted to a
  * no-op resolved value. Pass `overrides` for the methods a test cares about,
  * and `defaultSnapshot` when the suite wants `snapshot()` to resolve to
  * something other than `{}` by default (most browseTask.test.ts scenarios
  * want a real single-button page so the loop has something to act on).
  */
 export function stubBrowser(
-  overrides: Partial<PenDesktopBrowser> = {},
+  overrides: Partial<BrowserBridge> = {},
   defaultSnapshot: unknown = {}
-): PenDesktopBrowser {
+): BrowserBridge {
   return {
     open: async () => ({}),
     act: async () => ({}),
@@ -26,15 +27,6 @@ export function stubBrowser(
     perform: async () => ({}),
     ...overrides,
   };
-}
-
-/** Installs a browser stub as `window.penDesktop.browser` and returns it. */
-export function setPenDesktop(browser: PenDesktopBrowser): PenDesktopBrowser {
-  window.penDesktop = {
-    onMenuCommand: () => () => {},
-    browser,
-  };
-  return browser;
 }
 
 // Every /api/browse/step call in these tests returns one JSON payload from a

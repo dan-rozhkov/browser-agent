@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseKeySpec, resolveNamedKey, modifiersBitmask, resolveEditCommand } from "../src/main/browser/keys";
+import { parseKeySpec, resolveNamedKey, modifiersBitmask, resolveEditCommand } from "../../src/controller/keys.js";
 
 describe("resolveNamedKey", () => {
   it("resolves named keys case-insensitively", () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { COMMIT_LABEL_SAMPLES, commitGuard, commitKind, extractPasswordFromGoal, redactGoalPassword } from "../src/ai/browseCommitGuard.js";
-import type { BrowseStepResult } from "../src/ai/browseStep.js";
-import type { SystemOneAnswer } from "../src/services/systemone.js";
+import { COMMIT_LABEL_SAMPLES, commitGuard, commitKind, extractPasswordFromGoal, redactGoalPassword } from "../../src/policy/browseCommitGuard.js";
+import type { BrowseStepResult } from "../../src/policy/browseStep.js";
+import type { SystemOneAnswer } from "../../src/policy/decisions.js";
 import { choice, fakeClient } from "./browseFakes.js";
 
 describe("COMMIT_LABEL_SAMPLES", () => {

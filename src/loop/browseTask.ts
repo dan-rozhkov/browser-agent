@@ -1,6 +1,6 @@
-import type { ToolHandler } from "../../toolRegistry";
-import { getBrowserAgentPermissions } from "@/store/browserAgentSettingsStore";
-import { getBrowserBridge, isDesktopBrowserAvailable } from "./bridge";
+import type { BrowserBridge } from "./bridge.js";
+import type { BrowseBackend } from "./backend.js";
+import type { KeyValueStorage } from "./storage.js";
 import {
   appendKeepingSuffix,
   describeEffectDetailed,
@@ -10,7 +10,7 @@ import {
   fitLabel,
   stripVolatileLabelParts,
   type ActedElement,
-} from "./actionEffect";
+} from "./actionEffect.js";
 import {
   buildStepCacheKey,
   deleteCacheEntry,
@@ -27,9 +27,8 @@ import {
   writeStepCacheEntry,
   type CachedStep,
   type CachedStepTarget,
-} from "./actionCache";
+} from "./actionCache.js";
 import {
-  BROWSER_NOT_AVAILABLE_ERROR,
   fetchBrowseBackend,
   type RetryClock,
   BACKEND_MAX_GOAL,
@@ -40,9 +39,43 @@ import {
   findElementByIndex,
   resultError,
   takeSnapshot,
-  type PenDesktopBrowser,
   type SnapshotResult,
-} from "./shared";
+} from "./shared.js";
+
+/**
+ * What the browse_task loop was told about its host, threaded through the
+ * loop in place of what pen-editor read from ambient state (the Zustand
+ * permissions store, `window.penDesktop`, `localStorage`, Vite env). Built
+ * once by `runBrowseTask` from its options.
+ */
+export interface LoopEnv {
+  /** The browser being driven (was `window.penDesktop.browser` / the cloud bridge). */
+  browser: BrowserBridge;
+  /** Where `/api/browse/{step,plan}` requests go. */
+  backend: BrowseBackend;
+  /** User switches sent with every step; omitted from the body when absent. */
+  permissions?: BrowsePermissions;
+  /** Action cache storage (was `localStorage`); absent = cache off. */
+  storage?: KeyValueStorage;
+  /** The browser is a remote (cloud) one: longer deadlines (was
+   * `!isDesktopBrowserAvailable()`). */
+  cloud: boolean;
+  /** Send a marked screenshot of the step's snapshot to the backend (was
+   * `VITE_BROWSE_STEP_SCREENSHOT === "true"`). */
+  stepScreenshots: boolean;
+}
+
+/**
+ * User switches that gate what the browser agent may do — the shape of
+ * pen-editor's `BrowserAgentPermissions` (store/browserAgentSettingsStore.ts),
+ * copied here so the loop does not depend on the policy layer or the host.
+ */
+export interface BrowsePermissions {
+  /** The agent may type a password, but only one the user gave in the chat. */
+  allowPasswordEntry: boolean;
+  /** The agent stops and asks before irreversible actions it was not told to do. */
+  confirmIrreversible: boolean;
+}
 
 /**
  * browse_task — a Jev-driven browsing loop
@@ -51,10 +84,10 @@ import {
  * review" at the end of that doc). Unlike browse_open/browse_act/
  * browse_find_images, this handler does not just forward one call to the
  * desktop bridge: it *is* the loop. Per cycle it takes a fresh
- * element-table snapshot from the page (`window.penDesktop.browser.snapshot()`),
+ * element-table snapshot from the page (`BrowserBridge.snapshot()`),
  * POSTs it plus a short history to the backend's `/api/browse/step`
  * (stateless — Jev picks the next operation/target), and applies the
- * decision with `window.penDesktop.browser.perform(...)`. It repeats until
+ * decision with `BrowserBridge.perform(...)`. It repeats until
  * the backend answers `outcome: "done"` or `"blocked"`, or the budget
  * (`maxSteps`/deadline) runs out.
  *
@@ -84,9 +117,10 @@ const BROWSE_TASK_DEADLINE_MS = 90_000;
  */
 export const CLOUD_BROWSE_TASK_DEADLINE_MS = 180_000;
 
-/** The loop budget for whichever browser is driving this call. */
-export function browseTaskDeadlineMs(): number {
-  return isDesktopBrowserAvailable() ? BROWSE_TASK_DEADLINE_MS : CLOUD_BROWSE_TASK_DEADLINE_MS;
+/** The loop budget for whichever browser is driving this call (`cloud`: a
+ * remote browser rather than the local desktop one). */
+export function browseTaskDeadlineMs(cloud: boolean): number {
+  return cloud ? CLOUD_BROWSE_TASK_DEADLINE_MS : BROWSE_TASK_DEADLINE_MS;
 }
 
 /**
@@ -239,7 +273,7 @@ type StepOutcome = "act" | "done" | "blocked" | "retry";
  * step against a fresh snapshot without ever calling /api/browse/step. */
 type StepVia = "cascade" | "rule" | "cache";
 
-interface StepHistoryEntry {
+export interface StepHistoryEntry {
   operation: string;
   label: string;
   ok: boolean;
@@ -271,7 +305,7 @@ interface StepResponse {
   cascade?: boolean;
 }
 
-/** How the per-step screenshot capture went (VITE_BROWSE_STEP_SCREENSHOT). */
+/** How the per-step screenshot capture went (the `stepScreenshots` option). */
 type StepScreenshotOutcome = "sent" | "unsupported" | "failed" | "timeout" | "unmarked" | "too_large";
 
 /** Capture outcome recorded on the step entry the bench reads. JSON-plain. */
@@ -281,7 +315,7 @@ interface StepScreenshotInfo {
   marked?: number | boolean;
 }
 
-type TranscriptStep = StepHistoryEntry & Partial<StepScreenshotInfo> & {
+export type TranscriptStep = StepHistoryEntry & Partial<StepScreenshotInfo> & {
   /** 1-based sub-goal this step belongs to — only set when the task was
    * split into more than one sub-goal. */
   subgoal?: number;
@@ -302,7 +336,7 @@ export interface Observation {
   text: string;
 }
 
-interface Transcript {
+export interface Transcript {
   /** Page text captured when the task (or each sub-goal) ended, so the chat
    * model reads the values the user asked for from here, not from memory.
    * Omitted when nothing was captured. */
@@ -451,7 +485,7 @@ function sameOrigin(a: string, b: string): boolean {
  * loop as normal).
  */
 async function openBeforeLoop(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   targetUrl: string
 ): Promise<Transcript | null> {
   try {
@@ -499,7 +533,7 @@ const PAGE_TEXT_MAX_CHARS = 6_000;
  * on a current desktop build; an older build gets one `read` instead. Never
  * fails the step: no text is just a poorer decision, not an error.
  */
-async function pageTextFor(browser: PenDesktopBrowser, snapshot: SnapshotResult): Promise<string | undefined> {
+async function pageTextFor(browser: BrowserBridge, snapshot: SnapshotResult): Promise<string | undefined> {
   if (typeof snapshot.text === "string") return snapshot.text.slice(0, PAGE_TEXT_MAX_CHARS);
   return (await readPageText(browser, PAGE_TEXT_MAX_CHARS))?.text;
 }
@@ -507,7 +541,7 @@ async function pageTextFor(browser: PenDesktopBrowser, snapshot: SnapshotResult)
 /** One `read` of the page text, cut to `maxChars`; `url` and `truncated` are
  * what the desktop's read result reports. Any failure gives undefined. */
 async function readPageText(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   maxChars: number
 ): Promise<{ text: string; url?: string; truncated: boolean } | undefined> {
   try {
@@ -553,7 +587,7 @@ type RawObservation = Observation & { cut?: boolean; sameAs?: number };
  * no observation. `url` is the page the read result reports.
  */
 async function readObservation(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   fallbackUrl: string,
   subgoal: number | undefined,
   signal: AbortSignal | undefined,
@@ -630,11 +664,6 @@ export function capObservations(all: RawObservation[]): Observation[] | undefine
   return out.length > 0 ? out : undefined;
 }
 
-/** Experiment flag: send a marked screenshot of the step's snapshot to the backend. */
-export function browseStepScreenshotEnabled(): boolean {
-  return import.meta.env.VITE_BROWSE_STEP_SCREENSHOT === "true";
-}
-
 const STEP_SCREENSHOT_TIMEOUT_MS = 4_000;
 
 interface StepCapture {
@@ -660,7 +689,7 @@ interface StepCapture {
  * controller lock after we give up (desktop `withCommandTimeout` bounds it).
  */
 export async function captureStepScreenshot(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   snapshotId: string
 ): Promise<StepCapture> {
   const started = Date.now();
@@ -711,6 +740,7 @@ function modalFor(snapshot: SnapshotResult): string | undefined {
 }
 
 async function requestStep(
+  env: LoopEnv,
   goal: string,
   snapshot: SnapshotResult,
   history: StepHistoryEntry[],
@@ -722,7 +752,7 @@ async function requestStep(
   // 429 / 503+Retry-After retries happen inside, invisible to the loop: no
   // history entry, no stall count, no step budget.
   const modal = modalFor(snapshot);
-  const res = await fetchBrowseBackend("/api/browse/step", {
+  const res = await fetchBrowseBackend(env.backend, "/api/browse/step", {
     goal: truncateToChars(goal, BACKEND_MAX_GOAL),
     ...sanitizedPageBody(snapshot),
     history: history.slice(-HISTORY_LIMIT),
@@ -738,9 +768,10 @@ async function requestStep(
     ...(modal !== undefined ? { modal } : {}),
     ...(pageText !== undefined ? { pageText } : {}),
     ...(screenshot !== undefined ? { screenshot } : {}),
-    // User switches (password entry / confirm irreversible), read now rather
-    // than cached at module load. An older backend's zod object strips it.
-    permissions: getBrowserAgentPermissions(),
+    // User switches (password entry / confirm irreversible), passed in by the
+    // host (`permissions` option) and sent as given. An older backend's zod
+    // object strips it. Omitted when the host gave none.
+    ...(env.permissions !== undefined ? { permissions: { ...env.permissions } } : {}),
   }, undefined, signal, clock);
   if (!res.ok) {
     throw new Error(`/api/browse/step responded ${res.status}`);
@@ -860,7 +891,7 @@ interface CacheReplayResult {
  * only a hash of it, so the caller must hand this in for display purposes.
  */
 async function replayCachedStep(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   cached: CachedStep,
   index: number | undefined,
   snapshotId: string,
@@ -921,6 +952,7 @@ async function replayCachedStep(
  * direction.
  */
 function maybeWriteStepCache(
+  storage: KeyValueStorage | undefined,
   cacheKey: string | undefined,
   operation: PerformOperation,
   index: number | undefined,
@@ -952,7 +984,7 @@ function maybeWriteStepCache(
     if (!textRange) return;
   }
 
-  writeStepCacheEntry(cacheKey, goal, elements, {
+  writeStepCacheEntry(storage, cacheKey, goal, elements, {
     operation,
     target,
     ...(textRange ? { textRange } : {}),
@@ -1086,7 +1118,7 @@ function isEmptySnapshot(snapshot: SnapshotResult): boolean {
 /** Re-snapshots (bounded) while the page is still blank — see EMPTY_SNAPSHOT_POLL_MS.
  * A snapshot error during polling is returned as-is (existing error handling). */
 async function settleEmptySnapshot(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   first: Awaited<ReturnType<typeof takeSnapshot>>,
   sleep: (ms: number) => Promise<void>,
   signal?: AbortSignal
@@ -1116,7 +1148,7 @@ interface Preamble {
  */
 async function runPreamble(
   goal: string,
-  browser: NonNullable<NonNullable<typeof window.penDesktop>["browser"]>,
+  browser: BrowserBridge,
   url?: string
 ): Promise<Preamble> {
   let initialSnapshot: SnapshotResult | undefined;
@@ -1178,7 +1210,7 @@ async function runPreamble(
 export async function runBrowseTaskLoop(
   goal: string,
   maxSteps: number,
-  browser: NonNullable<NonNullable<typeof window.penDesktop>["browser"]>,
+  env: LoopEnv,
   now: () => number = () => Date.now(),
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   url?: string,
@@ -1191,6 +1223,7 @@ export async function runBrowseTaskLoop(
   /** Sub-goal history carry-over (see carryOverHistory). */
   share?: HistoryShare
 ): Promise<Transcript> {
+  const { browser, storage } = env;
   // An empty goal would 400 /api/browse/step (goal min 1) on every cycle.
   if (goal.trim() === "") {
     return { status: "blocked", steps: [], url: "", title: "", reason: "browse_task: the goal is empty — describe what to do in the browser." };
@@ -1409,11 +1442,11 @@ export async function runBrowseTaskLoop(
     // title + exact element set + full history so far + bucketed scroll",
     // exactly what a future identical run would see at the same point (and
     // never anything less exact than that — see the module header for why).
-    let stepCacheKey = isActionCacheEnabled()
+    let stepCacheKey = isActionCacheEnabled(storage)
       ? buildStepCacheKey(goal, snapshot.url, snapshot.title, snapshot.elements, cacheKeyHistory(history), snapshot.scroll, modalFor(snapshot))
       : undefined;
     if (stepCacheKey) {
-      const cached = lookupStepCache(stepCacheKey, goal, snapshot.elements);
+      const cached = lookupStepCache(storage, stepCacheKey, goal, snapshot.elements);
       if (cached) {
         const cachedIndex = cached.target ? resolveCachedIndex(snapshot.elements, cached.target) : undefined;
         const resolvedElement =
@@ -1484,7 +1517,7 @@ export async function runBrowseTaskLoop(
             sameUrlWaitStreak = 0;
             waitStreakUrl = null;
             cacheHits++;
-            touchCacheEntry(stepCacheKey);
+            touchCacheEntry(storage, stepCacheKey);
             const cycle = detectCycle();
             if (cycle) return cycle;
             continue;
@@ -1497,7 +1530,7 @@ export async function runBrowseTaskLoop(
           // other rejected/no-effect action does) and the loop moves on to
           // its NEXT iteration, which takes a FRESH snapshot before falling
           // back to Jev rather than reusing this now-possibly-stale one.
-          deleteCacheEntry(stepCacheKey);
+          deleteCacheEntry(storage, stepCacheKey);
           const stalled = note({
             operation: cached.operation,
             label: `cache replay failed: ${replay.label}`,
@@ -1513,13 +1546,13 @@ export async function runBrowseTaskLoop(
         // Nothing was dispatched, so nothing may have changed: it's safe to
         // just drop the entry and fall through to a normal Jev decision
         // using the SAME snapshot this iteration already has.
-        deleteCacheEntry(stepCacheKey);
+        deleteCacheEntry(storage, stepCacheKey);
       }
     }
 
     let decision: StepResponse;
     try {
-      const capturing = browseStepScreenshotEnabled() && !screenshotsUnsupported;
+      const capturing = env.stepScreenshots && !screenshotsUnsupported;
       let [pageText, capture] = await Promise.all([
         pageTextFor(browser, snapshot),
         capturing ? captureStepScreenshot(browser, snapshot.snapshotId) : undefined,
@@ -1546,7 +1579,7 @@ export async function runBrowseTaskLoop(
           capture = undefined;
         }
       }
-      decision = await requestStep(goal, snapshot, history, pageText, capture?.image, signal, { now, sleep, deadline, reserveMs: STEP_DEADLINE_RESERVE_MS });
+      decision = await requestStep(env, goal, snapshot, history, pageText, capture?.image, signal, { now, sleep, deadline, reserveMs: STEP_DEADLINE_RESERVE_MS });
     } catch (err) {
       const stalled = note({
         operation: "STEP",
@@ -1877,7 +1910,7 @@ export async function runBrowseTaskLoop(
       // (WAIT — moot here, WAIT never reaches `perform` — password fields,
       // card-number/password-shaped text).
       if (!rejected && !noEffect) {
-        maybeWriteStepCache(stepCacheKey, operation, decision.index, decision.text, goal, snapshot.elements);
+        maybeWriteStepCache(storage, stepCacheKey, operation, decision.index, decision.text, goal, snapshot.elements);
       }
     } catch (err) {
       // A failing step (design doc §3/§4: "a failing step is recorded and
@@ -1905,8 +1938,8 @@ export const CLOUD_MULTI_SUBGOAL_DEADLINE_MS = 15 * 60_000;
 /** Overall cap on loop iterations across all sub-goals of one call. */
 export const MULTI_SUBGOAL_MAX_STEPS = 150;
 
-export function browseTaskOverallDeadlineMs(): number {
-  return isDesktopBrowserAvailable() ? MULTI_SUBGOAL_DEADLINE_MS : CLOUD_MULTI_SUBGOAL_DEADLINE_MS;
+export function browseTaskOverallDeadlineMs(cloud: boolean): number {
+  return cloud ? CLOUD_MULTI_SUBGOAL_DEADLINE_MS : MULTI_SUBGOAL_DEADLINE_MS;
 }
 
 /** Hard bound on one browse_task call, enforced inside the handler: the
@@ -1916,8 +1949,8 @@ export function browseTaskOverallDeadlineMs(): number {
  * (<= OBSERVATIONS_KEPT x OBSERVATION_READ_TIMEOUT_MS) add nothing: each one
  * starts only with OBSERVATION_READ_TIMEOUT_MS left of the overall deadline,
  * so it ends inside it. */
-export function browseTaskInnerBoundMs(): number {
-  return browseTaskOverallDeadlineMs() + STEP_DEADLINE_RESERVE_MS + BROWSE_SETTLE_WORST_CASE_MS;
+export function browseTaskInnerBoundMs(cloud: boolean): number {
+  return browseTaskOverallDeadlineMs(cloud) + STEP_DEADLINE_RESERVE_MS + BROWSE_SETTLE_WORST_CASE_MS;
 }
 
 // Above the backend model budget (BROWSE_PLAN_TIMEOUT_MS = 20 s): the plan runs
@@ -1943,6 +1976,7 @@ const DONE_ITEM_MAX_CHARS = 80;
  * one entry — the caller then runs today's single loop unchanged.
  */
 async function planSubgoals(
+  backend: BrowseBackend,
   goal: string,
   url: string | undefined,
   signal: AbortSignal | undefined
@@ -1950,6 +1984,7 @@ async function planSubgoals(
   if (!goal) return [goal];
   try {
     const res = await fetchBrowseBackend(
+      backend,
       "/api/browse/plan",
       { goal, ...(url ? { url } : {}) },
       PLAN_REQUEST_TIMEOUT_MS,
@@ -2000,7 +2035,7 @@ const SCROLL_TO_TOP_TIMEOUT_MS = 8_000;
  * SCROLL_TO_TOP_TIMEOUT_MS in total, every failure swallowed.
  */
 async function scrollToTop(
-  browser: NonNullable<NonNullable<typeof window.penDesktop>["browser"]>
+  browser: BrowserBridge
 ): Promise<void> {
   const work = (async () => {
     const snap = (await browser.snapshot()) as SnapshotResult | undefined;
@@ -2037,7 +2072,7 @@ function hasTextEntry(snapshot: SnapshotResult): boolean {
  * Returns the last snapshot when nothing acted after it (the loop reuses it).
  */
 async function recoverTextEntry(
-  browser: PenDesktopBrowser,
+  browser: BrowserBridge,
   siteUrl: string | undefined,
   k: number,
   records: TranscriptStep[],
@@ -2222,18 +2257,20 @@ function hostOf(u: string | undefined): string | undefined {
 const STATUS_PRIORITY: Transcript["status"][] = ["blocked", "stalled", "budget"];
 
 /**
- * browse_task entry point: opens/probes the tab (cheap, before any paid call),
- * plans, then runs runBrowseTaskLoop once (single flow, byte-for-byte as
- * before) or once per sub-goal on the same tab.
+ * The positional core of `runBrowseTask`: opens/probes the tab (cheap, before
+ * any paid call), plans, then runs runBrowseTaskLoop once (single flow,
+ * byte-for-byte as before) or once per sub-goal on the same tab. Exported for
+ * tests that need its positional clock/deadline seams; hosts call
+ * `runBrowseTask`.
  *
  * `maxSteps` is PER SUB-GOAL (capped at 25); a multi-sub-goal call is further
  * bounded by MULTI_SUBGOAL_MAX_STEPS (150) loop iterations in total and by
  * `overallDeadlineMs`. `signal` aborts the whole call ("cancelled").
  */
-export async function runBrowseTask(
+export async function runBrowseTaskCore(
   goal: string,
   maxSteps: number,
-  browser: NonNullable<NonNullable<typeof window.penDesktop>["browser"]>,
+  env: LoopEnv,
   now: () => number = () => Date.now(),
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   url?: string,
@@ -2241,6 +2278,7 @@ export async function runBrowseTask(
   overallDeadlineMs: number = MULTI_SUBGOAL_DEADLINE_MS,
   signal?: AbortSignal
 ): Promise<Transcript> {
+  const { browser } = env;
   const overallEnd = now() + overallDeadlineMs;
   // The preamble uses the ORIGINAL goal (its URL), never a composed sub-goal
   // string. A failure ends the whole task before any paid plan call.
@@ -2253,7 +2291,7 @@ export async function runBrowseTask(
   let seq = 0;
   let probeSeq = 0;
   let planSeq = 0;
-  const planPromise = planSubgoals(goal, url, planAbort.signal).then((r) => {
+  const planPromise = planSubgoals(env.backend, goal, url, planAbort.signal).then((r) => {
     planSeq = ++seq;
     return r;
   });
@@ -2277,7 +2315,7 @@ export async function runBrowseTask(
   // have moved since): do not reuse that snapshot — the loop takes a fresh one.
   const freshPreamble: Preamble = planSeq > probeSeq ? {} : preamble;
   if (plan.length <= 1) {
-    const single = await runBrowseTaskLoop(goal, maxSteps, browser, now, sleep, url, deadlineMs, freshPreamble, signal);
+    const single = await runBrowseTaskLoop(goal, maxSteps, env, now, sleep, url, deadlineMs, freshPreamble, signal);
     if (single.reason === CANCELLED_REASON || signal?.aborted || overallEnd - now() < OBSERVATION_READ_TIMEOUT_MS) return single;
     const observation = await readObservation(browser, single.url, undefined, signal, OBSERVATION_LAST_MAX_CHARS);
     const observations = observation ? capObservations([observation]) : undefined;
@@ -2377,7 +2415,7 @@ export async function runBrowseTask(
     let t = await runBrowseTaskLoop(
       subGoalText,
       subMaxSteps,
-      browser,
+      env,
       now,
       sleep,
       undefined,
@@ -2408,7 +2446,7 @@ export async function runBrowseTask(
           const t2 = await runBrowseTaskLoop(
             subGoalText,
             leftSteps,
-            browser,
+            env,
             now,
             sleep,
             undefined,
@@ -2491,23 +2529,64 @@ export async function runBrowseTask(
   };
 }
 
-export const browseTask: ToolHandler = async (args, context) => {
-  const browser = getBrowserBridge(context?.sessionId);
-  if (!browser) {
-    return JSON.stringify({ error: BROWSER_NOT_AVAILABLE_ERROR });
-  }
+/** Options of `runBrowseTask` (docs/design.md, "Loop entry point"). */
+export interface RunBrowseTaskOptions {
+  /** The browser to drive. */
+  browser: BrowserBridge;
+  /** Where the step / plan requests go (`createHttpBackend` / `createLocalBackend`). */
+  backend: BrowseBackend;
+  /** Steps PER SUB-GOAL, capped at 25 (default 25). */
+  maxSteps?: number;
+  /** Open this URL before the loop starts. */
+  url?: string;
+  /** Aborts the whole call ("cancelled"). */
+  signal?: AbortSignal;
+  /** User switches sent with every step (was the Zustand settings store). */
+  permissions?: BrowsePermissions;
+  /** Action cache storage (pen-editor passes `localStorage`); omitted = cache off. */
+  storage?: KeyValueStorage;
+  /** The browser is remote (was `isDesktopBrowserAvailable() === false`):
+   * cloud deadlines. Default false. */
+  cloud?: boolean;
+  /** Send a marked screenshot of each step's snapshot to the backend (was a
+   * Vite env flag). Default false. */
+  stepScreenshots?: boolean;
+  /** Clock (default `Date.now`). */
+  now?: () => number;
+  /** Sleep (default `setTimeout`). */
+  sleep?: (ms: number) => Promise<void>;
+  /** Per-sub-goal loop budget (default by `cloud`). */
+  deadlineMs?: number;
+  /** Overall budget of a multi-sub-goal call (default by `cloud`). */
+  overallDeadlineMs?: number;
+}
 
-  const goal = typeof args.goal === "string" ? args.goal : "";
+/**
+ * browse_task entry point: drives `opts.browser` towards `goal` and resolves
+ * with a `Transcript`. The call is bounded by `browseTaskInnerBoundMs(cloud)`
+ * — the REAL bound on it; a host's own tool-call timeout is only a margin
+ * above it. Exceeding it aborts the loop and resolves a `budget` transcript
+ * ("deadline exceeded"). Never throws for a browser or backend failure (the
+ * loop turns them into a `Transcript`); a host wrapper that wants pen-editor's
+ * `{"error": ...}` JSON contract can catch what remains.
+ */
+export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): Promise<Transcript> {
+  const cloud = opts.cloud === true;
+  const env: LoopEnv = {
+    browser: opts.browser,
+    backend: opts.backend,
+    ...(opts.permissions !== undefined ? { permissions: opts.permissions } : {}),
+    ...(opts.storage !== undefined ? { storage: opts.storage } : {}),
+    cloud,
+    stepScreenshots: opts.stepScreenshots === true,
+  };
   const maxSteps =
-    typeof args.maxSteps === "number" && Number.isFinite(args.maxSteps)
-      ? args.maxSteps
-      : DEFAULT_MAX_STEPS;
-  const url = typeof args.url === "string" && args.url.length > 0 ? args.url : undefined;
+    typeof opts.maxSteps === "number" && Number.isFinite(opts.maxSteps) ? opts.maxSteps : DEFAULT_MAX_STEPS;
+  const url = typeof opts.url === "string" && opts.url.length > 0 ? opts.url : undefined;
 
-  // The race below is the REAL bound on this call; the chat-side tool-call
-  // timeout (useDesignChat.ts) is only a margin above it.
+  // The race below is the REAL bound on this call.
   const inner = new AbortController();
-  const outer = context?.signal;
+  const outer = opts.signal;
   const onOuterAbort = () => inner.abort();
   if (outer?.aborted) inner.abort();
   else outer?.addEventListener("abort", onOuterAbort, { once: true });
@@ -2517,34 +2596,24 @@ export const browseTask: ToolHandler = async (args, context) => {
       timer = setTimeout(() => {
         inner.abort();
         resolve({ status: "budget", steps: [], url: "", title: "", reason: "deadline exceeded" });
-      }, browseTaskInnerBoundMs());
+      }, browseTaskInnerBoundMs(cloud));
     });
-    const transcript = await Promise.race([
-      runBrowseTask(
+    return await Promise.race([
+      runBrowseTaskCore(
         goal,
         maxSteps,
-        browser,
-        undefined,
-        undefined,
+        env,
+        opts.now,
+        opts.sleep,
         url,
-        browseTaskDeadlineMs(),
-        browseTaskOverallDeadlineMs(),
+        opts.deadlineMs ?? browseTaskDeadlineMs(cloud),
+        opts.overallDeadlineMs ?? browseTaskOverallDeadlineMs(cloud),
         inner.signal
       ),
       bound,
     ]);
-    // Matches every other browser tool handler's "always resolves a real
-    // JSON string" contract (see shared.ts's callBrowserBridge comment) —
-    // this handler doesn't route through callBrowserBridge since it makes
-    // many bridge/network calls rather than one, but the guarantee is the
-    // same.
-    return JSON.stringify(transcript ?? {});
-  } catch (err) {
-    return JSON.stringify({
-      error: err instanceof Error ? err.message : "browse_task failed.",
-    });
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     outer?.removeEventListener("abort", onOuterAbort);
   }
-};
+}

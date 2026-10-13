@@ -10,7 +10,7 @@ import {
   MAX_SNAPSHOT_ELEMENTS,
   type BrowserPageHandle,
   type BrowserTarget,
-} from "../src/main/browser/controller";
+} from "../../src/controller/controller.js";
 // "Addendum 2, 2026-09-19" §1: act/perform now capture a page signature via
 // SIGNATURE_JS before an action and again after its settle, diffing them
 // into `{ changed, changes }`. Review finding 4 made SIGNATURE_JS take a
@@ -1715,7 +1715,7 @@ describe("BrowserController", () => {
         executeJavaScript: vi.fn(() => Promise.resolve({ url: "https://a.example/", title: "A" })),
       });
       const pageB = makeFakePage({ getURL: vi.fn(() => "https://b.example/") });
-      let current: BrowserPageHandle | null = pageA;
+      const current: BrowserPageHandle | null = pageA;
       const target: BrowserTarget = {
         ensurePage: async () => current!,
         currentPage: () => current,

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACTION_CACHE_KILL_SWITCH_KEY,
   ACTION_CACHE_MAX_ENTRIES,
@@ -20,10 +20,17 @@ import {
   secondHash,
   touchCacheEntry,
   writeStepCacheEntry,
-} from "@/lib/tools/browser/actionCache";
+} from "../../src/loop/actionCache.js";
+import { memoryStorage, type KeyValueStorage } from "../../src/loop/storage.js";
+
+// A fresh in-memory storage per test (was the shared happy-dom localStorage,
+// cleared in afterEach).
+let store: KeyValueStorage;
+beforeEach(() => {
+  store = memoryStorage();
+});
 
 afterEach(() => {
-  localStorage.clear();
   vi.useRealTimers();
 });
 
@@ -323,7 +330,7 @@ describe("actionCache: collision safety (two independently-seeded hashes)", () =
 
   it("lookupStepCache treats a `verify` mismatch as a miss and deletes the entry, even though the key itself matched", () => {
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(key, "accept cookies", ELS, {
+    writeStepCacheEntry(store, key, "accept cookies", ELS, {
       operation: "CLICK",
       target: target("Accept all", "button"),
     });
@@ -332,50 +339,50 @@ describe("actionCache: collision safety (two independently-seeded hashes)", () =
     // DIFFERENT goal — this must never happen from a real hash collision in
     // practice, but simulates exactly what one would look like: the key
     // string matches, yet the context that produced it did not.
-    expect(lookupStepCache(key, "a completely different goal", ELS)).toBeUndefined();
+    expect(lookupStepCache(store, key, "a completely different goal", ELS)).toBeUndefined();
     // And the entry is gone afterward — not just refused this one time.
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeUndefined();
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeUndefined();
   });
 
   it("lookupStepCache treats a mismatched element set as a miss too", () => {
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(key, "accept cookies", ELS, {
+    writeStepCacheEntry(store, key, "accept cookies", ELS, {
       operation: "CLICK",
       target: target("Accept all", "button"),
     });
 
     const differentElements = [{ index: 0, tag: "button", label: "Reject all", ops: ["CLICK"] }];
-    expect(lookupStepCache(key, "accept cookies", differentElements)).toBeUndefined();
+    expect(lookupStepCache(store, key, "accept cookies", differentElements)).toBeUndefined();
   });
 
   it("a malformed/pre-migration entry with no verify block is treated as a miss and deleted", () => {
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
     // Bypass writeStepCacheEntry to simulate a stored value from before the
     // `verify` block existed.
-    localStorage.setItem(
+    store.setItem(
       ACTION_CACHE_STORAGE_KEY,
       JSON.stringify({
         [key]: { value: { operation: "CLICK" }, hits: 0, lastUsed: Date.now() },
       })
     );
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeUndefined();
-    const raw = JSON.parse(localStorage.getItem(ACTION_CACHE_STORAGE_KEY) ?? "{}");
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeUndefined();
+    const raw = JSON.parse(store.getItem(ACTION_CACHE_STORAGE_KEY) ?? "{}");
     expect(raw[key]).toBeUndefined();
   });
 });
 
 describe("actionCache: no raw text persisted", () => {
-  it("localStorage contains neither typed text nor target label text — only hashes", () => {
+  it("storage contains neither typed text nor target label text — only hashes", () => {
     const goal = 'search for "wireless headphones" under $50';
     const key = buildStepCacheKey(goal, "https://example.com", "Example", ELS, []);
     const textStart = goal.indexOf("wireless headphones");
-    writeStepCacheEntry(key, goal, ELS, {
+    writeStepCacheEntry(store, key, goal, ELS, {
       operation: "TYPE_TEXT",
       target: target("Search box", "input"),
       textRange: [textStart, textStart + "wireless headphones".length],
     });
 
-    const raw = localStorage.getItem(ACTION_CACHE_STORAGE_KEY) ?? "";
+    const raw = store.getItem(ACTION_CACHE_STORAGE_KEY) ?? "";
     expect(raw).not.toContain("wireless headphones");
     expect(raw).not.toContain("Search box");
     // tag/role stay plain per the code review decision.
@@ -390,11 +397,11 @@ describe("actionCache: no raw text persisted", () => {
 describe("actionCache: storage (LRU / TTL / kill switch)", () => {
   it("round-trips a step cache entry", () => {
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeUndefined();
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeUndefined();
 
-    writeStepCacheEntry(key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
+    writeStepCacheEntry(store, key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
 
-    expect(lookupStepCache(key, "accept cookies", ELS)).toEqual({
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toEqual({
       operation: "CLICK",
       target: target("Accept all", "button"),
     });
@@ -402,25 +409,25 @@ describe("actionCache: storage (LRU / TTL / kill switch)", () => {
 
   it("deleteCacheEntry removes the entry and is a no-op on an already-missing key", () => {
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
+    writeStepCacheEntry(store, key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
 
-    deleteCacheEntry(key);
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeUndefined();
+    deleteCacheEntry(store, key);
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeUndefined();
 
-    expect(() => deleteCacheEntry(key)).not.toThrow();
-    expect(() => deleteCacheEntry("never-written")).not.toThrow();
+    expect(() => deleteCacheEntry(store, key)).not.toThrow();
+    expect(() => deleteCacheEntry(store, "never-written")).not.toThrow();
   });
 
   it("touchCacheEntry bumps hits without changing the stored value", () => {
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
+    writeStepCacheEntry(store, key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
 
-    touchCacheEntry(key);
-    touchCacheEntry(key);
+    touchCacheEntry(store, key);
+    touchCacheEntry(store, key);
 
-    const raw = JSON.parse(localStorage.getItem(ACTION_CACHE_STORAGE_KEY)!);
+    const raw = JSON.parse(store.getItem(ACTION_CACHE_STORAGE_KEY)!);
     expect(raw[key].hits).toBe(2);
-    expect(lookupStepCache(key, "accept cookies", ELS)).toEqual({
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toEqual({
       operation: "CLICK",
       target: target("Accept all", "button"),
     });
@@ -431,22 +438,22 @@ describe("actionCache: storage (LRU / TTL / kill switch)", () => {
     vi.setSystemTime(0);
 
     const oldestKey = buildStepCacheKey("goal-oldest", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(oldestKey, "goal-oldest", ELS, { operation: "CLICK", target: target("A", "button") });
+    writeStepCacheEntry(store, oldestKey, "goal-oldest", ELS, { operation: "CLICK", target: target("A", "button") });
 
     // Fill the store up to the cap with entries newer than `oldestKey`.
     for (let i = 0; i < ACTION_CACHE_MAX_ENTRIES; i++) {
       vi.setSystemTime(i + 1);
       const goal = `goal-${i}`;
-      writeStepCacheEntry(buildStepCacheKey(goal, "https://example.com", "Example", ELS, []), goal, ELS, {
+      writeStepCacheEntry(store, buildStepCacheKey(goal, "https://example.com", "Example", ELS, []), goal, ELS, {
         operation: "CLICK",
         target: target("A", "button"),
       });
     }
 
-    expect(lookupStepCache(oldestKey, "goal-oldest", ELS)).toBeUndefined();
+    expect(lookupStepCache(store, oldestKey, "goal-oldest", ELS)).toBeUndefined();
     const newestGoal = `goal-${ACTION_CACHE_MAX_ENTRIES - 1}`;
     expect(
-      lookupStepCache(
+      lookupStepCache(store, 
         buildStepCacheKey(newestGoal, "https://example.com", "Example", ELS, []),
         newestGoal,
         ELS
@@ -459,57 +466,61 @@ describe("actionCache: storage (LRU / TTL / kill switch)", () => {
     vi.setSystemTime(0);
 
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
+    writeStepCacheEntry(store, key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
 
     vi.setSystemTime(ACTION_CACHE_TTL_MS - 1);
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeDefined();
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeDefined();
 
     vi.setSystemTime(ACTION_CACHE_TTL_MS + 1);
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeUndefined();
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeUndefined();
   });
 
   it("the kill switch disables both reads and writes without throwing", () => {
-    localStorage.setItem(ACTION_CACHE_KILL_SWITCH_KEY, "off");
-    expect(isActionCacheEnabled()).toBe(false);
+    store.setItem(ACTION_CACHE_KILL_SWITCH_KEY, "off");
+    expect(isActionCacheEnabled(store)).toBe(false);
 
     const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
-    writeStepCacheEntry(key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
+    writeStepCacheEntry(store, key, "accept cookies", ELS, { operation: "CLICK", target: target("Accept all", "button") });
 
-    expect(lookupStepCache(key, "accept cookies", ELS)).toBeUndefined();
-    expect(localStorage.getItem(ACTION_CACHE_STORAGE_KEY)).toBeNull();
+    expect(lookupStepCache(store, key, "accept cookies", ELS)).toBeUndefined();
+    expect(store.getItem(ACTION_CACHE_STORAGE_KEY)).toBeNull();
   });
 
-  it("degrades to a no-op instead of throwing when localStorage itself throws", () => {
-    const original = window.localStorage;
-    Object.defineProperty(window, "localStorage", {
-      configurable: true,
-      get() {
-        throw new Error("SecurityError: storage disabled");
-      },
-    });
+  it("degrades to a no-op instead of throwing when the storage itself throws", () => {
+    const boom = () => {
+      throw new Error("SecurityError: storage disabled");
+    };
+    const throwing: KeyValueStorage = { getItem: boom, setItem: boom, removeItem: boom };
 
-    try {
-      expect(() => isActionCacheEnabled()).not.toThrow();
-      expect(isActionCacheEnabled()).toBe(true);
-      expect(() =>
-        writeStepCacheEntry("k", "goal", ELS, { operation: "CLICK", target: target("A", "button") })
-      ).not.toThrow();
-      expect(() => lookupStepCache("k", "goal", ELS)).not.toThrow();
-      expect(lookupStepCache("k", "goal", ELS)).toBeUndefined();
-      expect(() => deleteCacheEntry("k")).not.toThrow();
-      expect(() => touchCacheEntry("k")).not.toThrow();
-    } finally {
-      Object.defineProperty(window, "localStorage", {
-        configurable: true,
-        value: original,
-      });
-    }
+    expect(() => isActionCacheEnabled(throwing)).not.toThrow();
+    expect(isActionCacheEnabled(throwing)).toBe(true);
+    expect(() =>
+      writeStepCacheEntry(throwing, "k", "goal", ELS, { operation: "CLICK", target: target("A", "button") })
+    ).not.toThrow();
+    expect(() => lookupStepCache(throwing, "k", "goal", ELS)).not.toThrow();
+    expect(lookupStepCache(throwing, "k", "goal", ELS)).toBeUndefined();
+    expect(() => deleteCacheEntry(throwing, "k")).not.toThrow();
+    expect(() => touchCacheEntry(throwing, "k")).not.toThrow();
+  });
+
+  it("with no storage passed the cache is off and every operation is a silent no-op", () => {
+    expect(isActionCacheEnabled(undefined)).toBe(false);
+    const key = buildStepCacheKey("accept cookies", "https://example.com", "Example", ELS, []);
+    expect(() =>
+      writeStepCacheEntry(undefined, key, "accept cookies", ELS, {
+        operation: "CLICK",
+        target: target("Accept all", "button"),
+      })
+    ).not.toThrow();
+    expect(lookupStepCache(undefined, key, "accept cookies", ELS)).toBeUndefined();
+    expect(() => deleteCacheEntry(undefined, key)).not.toThrow();
+    expect(() => touchCacheEntry(undefined, key)).not.toThrow();
   });
 
   it("malformed JSON in storage is treated as an empty cache rather than throwing", () => {
-    localStorage.setItem(ACTION_CACHE_STORAGE_KEY, "{not json");
-    expect(() => lookupStepCache("anything", "goal", ELS)).not.toThrow();
-    expect(lookupStepCache("anything", "goal", ELS)).toBeUndefined();
+    store.setItem(ACTION_CACHE_STORAGE_KEY, "{not json");
+    expect(() => lookupStepCache(store, "anything", "goal", ELS)).not.toThrow();
+    expect(lookupStepCache(store, "anything", "goal", ELS)).toBeUndefined();
   });
 });
 

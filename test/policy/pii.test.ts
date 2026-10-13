@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { scrubPii, containsPii, findPiiSpans } from "../src/analysis/pii.js";
+import { scrubPii, containsPii, findPiiSpans } from "../../src/policy/pii.js";
 
 describe("scrubPii", () => {
   it("replaces emails", () => {

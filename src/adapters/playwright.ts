@@ -1,10 +1,11 @@
-// Playwright-backed BrowserTarget / BrowserPageHandle for the vendored BrowserController.
+// Playwright-backed BrowserTarget / BrowserPageHandle for the BrowserController.
 // Wraps an EXISTING BrowserContext (from chromium.connectOverCDP to a Steel session) —
 // there is no launch path: no Chromium runs on this host.
 // Implemented optional methods: isVisible, capture, sendCdp, drainDialogs, drainConsoleErrors,
 // onNavigationEvent, networkStats, listFrames, executeJavaScriptInFrame, listPages/selectPage/closePage/newPage/pageHandles.
 import type { BrowserContext, Page, CDPSession, Frame } from "playwright-core";
-import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "./vendor/controller.js";
+import { BrowserController } from "../controller/index.js";
+import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../controller/index.js";
 
 class PwPage implements BrowserPageHandle {
   private loading = false;
@@ -276,5 +277,58 @@ export class PlaywrightTarget implements BrowserTarget {
   }
   async pageHandles() {
     return [...this.pages].map(([tabId, page]) => ({ tabId, page }));
+  }
+}
+
+// The Steel CDP URL carries the account API key (`?apiKey=…`), and Playwright
+// echoes that URL into connectOverCDP error messages — which routes log. Every
+// error crossing the connect boundary goes through here first.
+
+/** Extracts the apiKey query value from a CDP URL, if any. */
+function apiKeyOf(cdpUrl: string): string | null {
+  try {
+    return new URL(cdpUrl).searchParams.get("apiKey");
+  } catch {
+    return null;
+  }
+}
+
+function redactApiKey(text: string, cdpUrl: string): string {
+  let out = text;
+  const key = apiKeyOf(cdpUrl);
+  if (key) {
+    for (const variant of new Set([key, encodeURIComponent(key)])) out = out.split(variant).join("***");
+  }
+  return out.replace(/apiKey=[^&\s"']+/gi, "apiKey=***");
+}
+
+/** A fresh Error with message/stack redacted; the original is deliberately NOT kept as `cause`. */
+export function redactedError(e: unknown, secret: string): Error {
+  const src = e instanceof Error ? e : new Error(String(e));
+  const out = new Error(redactApiKey(src.message, secret));
+  out.name = src.name;
+  if (src.stack) out.stack = redactApiKey(src.stack, secret);
+  return out;
+}
+
+// CDP-connect to a remote browser (e.g. a Steel session) with Playwright and
+// drive it with the BrowserController. Playwright is imported lazily so
+// a deployment (or test) that never opens a cloud browser never loads it.
+export async function connectOverCdp(
+  cdpUrl: string,
+): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }> {
+  try {
+    const { chromium } = await import("playwright-core");
+    const browser = await chromium.connectOverCDP(cdpUrl);
+    const context = browser.contexts()[0] ?? (await browser.newContext());
+    const controller = new BrowserController(new PlaywrightTarget(context));
+    return {
+      controller,
+      close: () => browser.close(),
+      onDisconnected: (cb) => { browser.on("disconnected", () => cb()); },
+    };
+  } catch (e) {
+    // The URL (with the API key) is inside Playwright's error text.
+    throw redactedError(e, cdpUrl);
   }
 }

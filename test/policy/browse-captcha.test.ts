@@ -1,10 +1,8 @@
-import { describe, expect, it, vi, afterEach } from "vitest";
-import { detectBotWall } from "../src/ai/browseCaptcha.js";
-import { makeConfig } from "./helpers.js";
-
-const { buildApp } = await import("../src/app.js");
-
-afterEach(() => vi.unstubAllGlobals());
+import { describe, expect, it, vi } from "vitest";
+import { detectBotWall } from "../../src/policy/browseCaptcha.js";
+import { decideStep } from "../../src/policy/decide.js";
+import { browseStepBodySchema } from "../../src/policy/schemas.js";
+import { makeOptions } from "./browseFakes.js";
 
 const el = (label: string, extra: Record<string, unknown> = {}) => ({
   index: 1,
@@ -101,36 +99,23 @@ describe("detectBotWall", () => {
   });
 });
 
-describe("POST /api/browse/step CAPTCHA guard", () => {
+describe("decideStep CAPTCHA guard", () => {
   for (const policy of ["ultrafast", "legacy"] as const) {
     it(`blocks without calling Jev (${policy})`, async () => {
-      const fetchMock = vi.fn();
-      vi.stubGlobal("fetch", fetchMock);
-      const app = await buildApp(makeConfig({ TYPESAFE_API_KEY: "key", BROWSE_STEP_POLICY: policy }), {
-        logger: false,
+      const evaluate = vi.fn();
+      const body = browseStepBodySchema.parse({
+        goal: "find flights",
+        url: "https://www.google.com/sorry/index?continue=x",
+        title: "https://www.google.com/search?q=flights",
+        elements: [{ index: 2, tag: "div", label: "I'm not a robot", ops: ["CLICK"] }],
+        history: [],
+        pageText: "Our systems have detected unusual traffic from your computer network.",
       });
-      try {
-        const res = await app.inject({
-          method: "POST",
-          url: "/api/browse/step",
-          payload: {
-            goal: "find flights",
-            url: "https://www.google.com/sorry/index?continue=x",
-            title: "https://www.google.com/search?q=flights",
-            elements: [{ index: 2, tag: "div", label: "I'm not a robot", ops: ["CLICK"] }],
-            history: [],
-            pageText: "Our systems have detected unusual traffic from your computer network.",
-          },
-        });
-        expect(res.statusCode).toBe(200);
-        const json = res.json();
-        expect(json.outcome).toBe("blocked");
-        expect(json.operation).toBe("BLOCKED");
-        expect(json.reason).toMatch(/CAPTCHA/);
-        expect(fetchMock).not.toHaveBeenCalled();
-      } finally {
-        await app.close();
-      }
+      const json = await decideStep(makeOptions({ decisions: { evaluate }, policy }), body);
+      expect(json.outcome).toBe("blocked");
+      expect(json.operation).toBe("BLOCKED");
+      expect(json.reason).toMatch(/CAPTCHA/);
+      expect(evaluate).not.toHaveBeenCalled();
     });
   }
 });

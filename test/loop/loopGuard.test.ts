@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyLoopGuard, resetLoopGuard } from "@/lib/tools/browser/loopGuard";
+import { applyLoopGuard, resetLoopGuard } from "../../src/loop/loopGuard.js";
 
 describe("applyLoopGuard", () => {
   it("does not warn on the first two identical calls, only the third", () => {

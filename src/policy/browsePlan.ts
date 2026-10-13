@@ -1,8 +1,6 @@
-import { generateObject } from "ai";
 import { z } from "zod";
-import type { Config } from "../config.js";
-import { createModel } from "./provider.js";
-import { scrubPii } from "../analysis/pii.js";
+import type { BrowsePolicyOptions } from "./decide.js";
+import { scrubPii } from "./pii.js";
 import {
   NUMBERED_PLACEHOLDER_PROMPT_LINES,
   PLACEHOLDER_KIND_PREFIXES,
@@ -140,7 +138,7 @@ export interface BrowsePlanResult {
 /** Never throws: any model failure, timeout or unusable output yields
  * `{ subgoals: [goal] }`. */
 export async function planBrowseGoal(
-  config: Config,
+  config: BrowsePolicyOptions,
   input: { goal: string; url?: string },
   signal: AbortSignal = AbortSignal.timeout(BROWSE_PLAN_TIMEOUT_MS),
 ): Promise<BrowsePlanResult> {
@@ -150,8 +148,7 @@ export async function planBrowseGoal(
   });
   try {
     const { text: promptGoal, tokenMap } = buildNumberedPlaceholderGoal(input.goal);
-    const { object } = await generateObject({
-      model: createModel(config, config.BROWSE_CASCADE_MODEL, { reasoningEffort: "none" }),
+    const { object } = await config.models.cascade.generateObject({
       schema: planSchema,
       abortSignal: signal,
       prompt: buildPlanPrompt(promptGoal, input.url),
