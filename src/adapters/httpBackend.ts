@@ -7,6 +7,9 @@ export interface HttpBackendOptions {
   fetch?: typeof fetch;
   /** Extra request headers (an auth token, say); a function is called per request. */
   headers?: Record<string, string> | (() => Record<string, string>);
+  /** Fetch credentials mode (`"include"` sends cookies cross-origin, as an
+   * accounts-enabled host needs); a function is called per request. */
+  credentials?: RequestCredentials | (() => RequestCredentials | undefined);
 }
 
 /**
@@ -28,6 +31,7 @@ export function createHttpBackend(opts: HttpBackendOptions): BrowseBackend {
     async request(path, body, { timeoutMs, signal }): Promise<BrowseBackendResponse> {
       const doFetch = opts.fetch ?? globalThis.fetch;
       const extra = typeof opts.headers === "function" ? opts.headers() : (opts.headers ?? {});
+      const credentials = typeof opts.credentials === "function" ? opts.credentials() : opts.credentials;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       const onAbort = () => controller.abort();
@@ -39,6 +43,7 @@ export function createHttpBackend(opts: HttpBackendOptions): BrowseBackend {
           headers: { ...extra, "Content-Type": "application/json" },
           body: JSON.stringify(body),
           signal: controller.signal,
+          ...(credentials !== undefined ? { credentials } : {}),
         });
         let parsedBody: unknown = null;
         try {

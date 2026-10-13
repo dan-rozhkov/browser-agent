@@ -46,6 +46,23 @@ describe("createHttpBackend", () => {
     expect(res).toEqual({ status: 200, ok: true, body: { outcome: "done" } });
   });
 
+  it("passes credentials to fetch (value or per-request function), omits it when unset", async () => {
+    const fetchMock = vi.fn<FetchLike>(async () => jsonResponse({}));
+    await createHttpBackend({ baseUrl: "https://api.test", fetch: fetchMock, credentials: "include" }).request(
+      "/api/browse/step", {}, { timeoutMs: 1000 });
+    let mode: RequestCredentials | undefined = "include";
+    const fn = createHttpBackend({ baseUrl: "https://api.test", fetch: fetchMock, credentials: () => mode });
+    await fn.request("/api/browse/step", {}, { timeoutMs: 1000 });
+    mode = undefined;
+    await fn.request("/api/browse/step", {}, { timeoutMs: 1000 });
+    await createHttpBackend({ baseUrl: "https://api.test", fetch: fetchMock }).request(
+      "/api/browse/step", {}, { timeoutMs: 1000 });
+    expect(fetchMock.mock.calls[0]![1]!.credentials).toBe("include");
+    expect(fetchMock.mock.calls[1]![1]!.credentials).toBe("include");
+    expect(fetchMock.mock.calls[2]![1]).not.toHaveProperty("credentials");
+    expect(fetchMock.mock.calls[3]![1]).not.toHaveProperty("credentials");
+  });
+
   it("calls a headers function once per request", async () => {
     const fetchMock = vi.fn<FetchLike>(async () => jsonResponse({}));
     let n = 0;

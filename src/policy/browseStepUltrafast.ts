@@ -8,7 +8,7 @@ import type {
   SystemOneClient,
   SystemOneQuestion,
 } from "./decisions.js";
-import { isOpenAIDecisions } from "./decisions.js";
+import { isOpenAIDecisions, resolveDecisionModel } from "./decisions.js";
 import {
   BROWSE_STEP_TIMEOUT_MS,
   BROWSE_TEXT_TIMEOUT_MS,
@@ -994,7 +994,7 @@ export async function decideBrowseStepUltrafast(
   const goal = scrubPii(input.goal);
   const elements = withRememberedSelections(capAndScrubElements(input.elements), input.history);
   const pageText = scrubPii((input.pageText ?? "").slice(0, MAX_PAGE_TEXT_CHARS));
-  const luna = isOpenAIDecisions(config.decisionModel);
+  const luna = isOpenAIDecisions(resolveDecisionModel(config));
   const history = input.history.slice(-HISTORY_WINDOW).map((h, i, all) => {
     const base = { action: truncateLabel(scrubPii(h.label), 160), operation: h.operation, ok: h.ok };
     if (!luna) return base;

@@ -183,8 +183,9 @@ The HTTP-response shape is kept on purpose: the loop's retry rules (429,
 - `createLocalBackend(policyOptions)` — validates the body with the moved
   zod schemas (400 on failure, like the route), runs `decideStep` /
   `planGoal` / `locate` in-process, answers `{ status: 200, ok: true, body }`
-  without `diag`; a `DecisionClient` rate-limit error maps to 429/503 like
-  the route does.
+  without `diag`; any error thrown by the policy maps to 502 with the
+  route's fixed message, like the route does (no 429: that came from an HTTP
+  rate-limit plugin).
 
 ### Storage (loop layer)
 

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  DEFAULT_DECISION_MODEL,
   isOpenAIDecisions,
   SystemOneAuthError,
   SystemOneError,
@@ -231,22 +232,22 @@ function abortableSleep(
 }
 
 export interface SystemOneClientOptions {
-  apiKey: string;
+  /** TypeSafe key. Required unless `model` is an OpenAI Decisions model. */
+  apiKey?: string;
   /** Default "jev-latest". An `openai/...` id routes to OpenRouter (see below). */
   model?: string;
   /** Default: the TypeSafe API URL. */
   baseUrl?: string;
-  /** Used instead of `apiKey` when `model` is an OpenAI Decisions model. */
+  /** Required (and used instead of `apiKey`) when `model` is an OpenAI Decisions model. */
   openRouterApiKey?: string;
   fetch?: typeof fetch;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 export const DEFAULT_SYSTEMONE_BASE_URL = "https://api.typesafe.ai/v1";
-export const DEFAULT_SYSTEMONE_MODEL = "jev-latest";
+export const DEFAULT_SYSTEMONE_MODEL = DEFAULT_DECISION_MODEL;
 
 export function createSystemOneClient(opts: SystemOneClientOptions): DecisionClient {
-  if (!opts.apiKey) throw new Error("createSystemOneClient: apiKey is required");
   const fetchFn: typeof fetch = opts.fetch ?? fetch;
   const sleepFn: (ms: number, signal: AbortSignal) => Promise<void> = opts.sleep ?? defaultSleep;
   const decisionModel = opts.model ?? DEFAULT_SYSTEMONE_MODEL;
@@ -256,9 +257,18 @@ export function createSystemOneClient(opts: SystemOneClientOptions): DecisionCli
   // the TypeSafe key and base URL stay in place for the way back.
   const viaOpenRouter = isOpenAIDecisions(decisionModel);
   const apiKey = viaOpenRouter ? opts.openRouterApiKey : opts.apiKey;
+  // Only the key of the selected route is needed; the other is unused.
+  if (!apiKey) {
+    throw new Error(
+      viaOpenRouter
+        ? `createSystemOneClient: openRouterApiKey is required for the OpenAI Decisions model "${decisionModel}"`
+        : "createSystemOneClient: apiKey is required",
+    );
+  }
   const url = `${viaOpenRouter ? OPENROUTER_DECISIONS_BASE_URL : (opts.baseUrl ?? DEFAULT_SYSTEMONE_BASE_URL)}/systemone`;
 
   return {
+    model: decisionModel,
     async evaluate<Q extends Record<string, SystemOneQuestion>>({
       state,
       questions,

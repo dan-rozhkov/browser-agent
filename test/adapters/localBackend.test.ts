@@ -10,6 +10,7 @@ import {
 } from "../../src/policy/decisions.js";
 import { choice, fakeClient, makeOptions } from "../policy/browseFakes.js";
 import { jsonModel, textModelCalls } from "../policy/structuredModelFakes.js";
+import type { TextModel } from "../../src/policy/textModel.js";
 import { stubBrowser } from "../loop/helpers.js";
 
 // The policy fails open on its own (a throwing DecisionClient becomes a
@@ -123,39 +124,104 @@ describe("createLocalBackend: success", () => {
 });
 
 describe("createLocalBackend: policy failures never throw", () => {
-  it("maps SystemOneRateLimitError to 429", async () => {
-    const backend = createLocalBackend(
-      makeOptions({ decisions: throwing(new SystemOneRateLimitError("slow down")) }),
-    );
-    const res = await backend.request("/api/browse/locate", LOCATE_BODY, REQ);
-    expect(res).toMatchObject({ status: 429, ok: false, body: { error: "slow down" } });
-    expect(res.retryAfterSec).toBeUndefined();
-  });
-
-  it("forwards a retry-after carried by the rate-limit error", async () => {
-    const err = Object.assign(new SystemOneRateLimitError("slow down"), { retryAfterSec: 7 });
+  it.each([
+    ["SystemOneRateLimitError", new SystemOneRateLimitError("slow down")],
+    ["SystemOneUpstreamError", new SystemOneUpstreamError("boom")],
+    ["SystemOneAuthError", new SystemOneAuthError("nope")],
+    ["an unknown error", new TypeError("bug")],
+  ])("maps %s to 502 with the route's fixed message (no raw message, no 429/500)", async (_n, err) => {
     const backend = createLocalBackend(makeOptions({ decisions: throwing(err) }));
     const res = await backend.request("/api/browse/locate", LOCATE_BODY, REQ);
-    expect(res.status).toBe(429);
-    expect(res.retryAfterSec).toBe(7);
+    expect(res).toEqual({
+      status: 502,
+      ok: false,
+      body: { error: "failed to locate the requested element" },
+    });
   });
+});
 
-  it("maps other SystemOneError to 502 with the route's message", async () => {
-    for (const err of [new SystemOneUpstreamError("boom"), new SystemOneAuthError("nope")]) {
-      const backend = createLocalBackend(makeOptions({ decisions: throwing(err) }));
-      const res = await backend.request("/api/browse/locate", LOCATE_BODY, REQ);
-      expect(res).toMatchObject({
-        status: 502,
-        ok: false,
-        body: { error: "failed to locate the requested element" },
-      });
+describe("createLocalBackend: plan budget", () => {
+  it("keeps the 20 s plan budget: a stalled plan model answers 200 with the fallback, not AbortError", async () => {
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    // Shrink only the plan budget so the test does not wait 20 s.
+    const spy = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation((ms: number) => realTimeout(ms === 20_000 ? 10 : ms));
+    try {
+      const stalled: TextModel = {
+        id: "stalled",
+        generateObject: ({ abortSignal }) =>
+          new Promise((_, reject) => {
+            abortSignal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          }),
+      };
+      const backend = createLocalBackend(
+        makeOptions({ models: { structured: stalled, cascade: stalled } }),
+      );
+      const res = await backend.request(
+        "/api/browse/plan",
+        { goal: "Find a laptop" },
+        { timeoutMs: 5_000 },
+      );
+      expect(res).toMatchObject({ status: 200, ok: true, body: { subgoals: ["Find a laptop"] } });
+    } finally {
+      spy.mockRestore();
     }
   });
+});
 
-  it("maps unknown errors to 500", async () => {
-    const backend = createLocalBackend(makeOptions({ decisions: throwing(new TypeError("bug")) }));
-    const res = await backend.request("/api/browse/locate", LOCATE_BODY, REQ);
-    expect(res).toMatchObject({ status: 500, ok: false, body: { error: "bug" } });
+describe("createLocalBackend: request signal reaches the policy's clients", () => {
+  it("aborting the request aborts the signal the decision client sees", async () => {
+    let seen: AbortSignal | undefined;
+    const decisions: SystemOneClient = {
+      evaluate: (params) => {
+        seen = params.signal;
+        return new Promise(() => undefined);
+      },
+    };
+    const backend = createLocalBackend(makeOptions({ decisions }));
+    const ac = new AbortController();
+    const p = backend.request("/api/browse/locate", LOCATE_BODY, { ...REQ, signal: ac.signal });
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    expect(seen!.aborted).toBe(false);
+    ac.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it("merges the request signal into a signal the policy already passes", async () => {
+    let seen: AbortSignal | undefined;
+    const decisions: SystemOneClient = {
+      evaluate: (params) => {
+        seen = params.signal;
+        return new Promise(() => undefined);
+      },
+    };
+    const backend = createLocalBackend(makeOptions({ decisions }));
+    const ac = new AbortController();
+    const p = backend.request("/api/browse/step", STEP_BODY, { ...REQ, signal: ac.signal });
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    ac.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it("aborting the request aborts the signal the plan text model sees", async () => {
+    let seen: AbortSignal | undefined;
+    const model: TextModel = {
+      id: "m",
+      generateObject: ({ abortSignal }) => {
+        seen = abortSignal;
+        return new Promise(() => undefined);
+      },
+    };
+    const backend = createLocalBackend(makeOptions({ models: { structured: model, cascade: model } }));
+    const ac = new AbortController();
+    const p = backend.request("/api/browse/plan", { goal: "Find a laptop" }, { ...REQ, signal: ac.signal });
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    ac.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    expect(seen!.aborted).toBe(true);
   });
 });
 

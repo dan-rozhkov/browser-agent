@@ -200,7 +200,7 @@ connectOverCdp(cdpUrl: string): Promise<{ controller: BrowserController; close()
 redactedError(e: unknown, secret: string): Error;
 
 // adapters/systemone-http
-createSystemOneClient(opts: { apiKey: string; model?: string; baseUrl?: string;
+createSystemOneClient(opts: { apiKey?: string; model?: string; baseUrl?: string;
   openRouterApiKey?: string; fetch?: typeof fetch; sleep?: (ms: number, signal: AbortSignal) => Promise<void> }): DecisionClient;
 
 // adapters/ai-sdk   (peer: ai)
@@ -208,7 +208,8 @@ aiSdkTextModel(model: LanguageModel, opts?: { id?: string; providerOptions?: Rec
 
 // adapters/http-backend
 createHttpBackend(opts: { baseUrl: string; fetch?: typeof fetch;
-  headers?: Record<string, string> | (() => Record<string, string>) }): BrowseBackend;
+  headers?: Record<string, string> | (() => Record<string, string>);
+  credentials?: RequestCredentials | (() => RequestCredentials | undefined) }): BrowseBackend;
 
 // adapters/local-backend
 createLocalBackend(opts: BrowsePolicyOptions): BrowseBackend;
@@ -218,9 +219,11 @@ controllerBridge(c: BrowserController): BrowserBridge;
 ```
 
 `createLocalBackend` mirrors the backend routes: invalid body -> `400
-{ error }`; `SystemOneRateLimitError` -> `429` (with `retryAfterSec` if the
-error carries one); other `SystemOneError` -> `502`; anything else -> `500`;
-unknown path -> `404`. It strips `diag` (step) and `fallbackReason` (plan). It
+{ error }`; any error thrown by the policy -> `502` with the route's fixed
+message (the HTTP routes did the same; their `429` came from a rate-limit
+plugin that has no in-process equivalent); unknown path -> `404`. The request
+signal (and `timeoutMs`) also reaches the decision client and text models, so a
+Stop stops paid calls. It strips `diag` (step) and `fallbackReason` (plan). It
 never throws for a policy failure. An aborted signal, or `timeoutMs` passing,
 rejects with an `AbortError`, as `fetch` does.
 

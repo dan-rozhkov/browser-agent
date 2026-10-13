@@ -1,8 +1,9 @@
 # Examples
 
 `run-task.ts` runs one browse task end to end: local Chromium (or an existing
-browser via CDP), System One decisions, and two OpenRouter text models written
-as a small `TextModel` over `fetch` (no extra dependency).
+browser via CDP), System One decisions, and two OpenRouter text models built with
+`aiSdkTextModel(createOpenAICompatible(...)(id))` (structured outputs on, so the
+schema reaches the model; `@ai-sdk/openai-compatible` is a dev dependency).
 
 ```bash
 TYPESAFE_API_KEY=... OPENROUTER_API_KEY=... \
@@ -15,7 +16,7 @@ TYPESAFE_API_KEY=... OPENROUTER_API_KEY=... \
 | `OPENROUTER_API_KEY` | required, text models (and Luna decisions) |
 | `TYPESAFE_MODEL` | decision model, default `jev-latest` |
 | `STRUCTURED_MODEL`, `CASCADE_MODEL` | OpenRouter ids, default `google/gemini-2.5-flash` |
-| `CDP_URL` | attach to a running browser instead of launching one |
+| `CDP_URL` | attach to a running browser instead of launching one (counts as a remote browser: `cloud: true`, longer deadlines) |
 | `HEADLESS=0` | show the launched browser |
 
 The example prints the `Transcript` as JSON and closes the browser. It needs

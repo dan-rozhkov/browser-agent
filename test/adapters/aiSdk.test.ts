@@ -99,6 +99,18 @@ describe("TextModelInvalidObjectError.isInstance", () => {
   it("is false for other errors and non-errors", () => {
     expect(TextModelInvalidObjectError.isInstance(new Error("x"))).toBe(false);
     expect(TextModelInvalidObjectError.isInstance(undefined)).toBe(false);
+    expect(TextModelInvalidObjectError.isInstance(null)).toBe(false);
+  });
+
+  it("recognises a marker-carrying object from another copy of the package", () => {
+    const foreign = Object.assign(new Error("x"), {
+      [Symbol.for("@pen/browser-agent.TextModelInvalidObjectError")]: true,
+    });
+    expect(foreign).not.toBeInstanceOf(TextModelInvalidObjectError);
+    expect(TextModelInvalidObjectError.isInstance(foreign)).toBe(true);
+    expect(
+      TextModelInvalidObjectError.isInstance({ [Symbol.for("@pen/browser-agent.TextModelInvalidObjectError")]: true }),
+    ).toBe(true);
     expect(TextModelInvalidObjectError.isInstance(new TextModelInvalidObjectError("x"))).toBe(true);
   });
 });

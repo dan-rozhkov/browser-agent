@@ -140,9 +140,24 @@ export interface SystemOneResult<Q extends Record<string, SystemOneQuestion>> {
 }
 
 export interface SystemOneClient {
+  /** The decision model this client talks to, when it knows it. The policy
+   * uses it when `BrowsePolicyOptions.decisionModel` is not set. */
+  readonly model?: string;
   evaluate<Q extends Record<string, SystemOneQuestion>>(
     params: SystemOneEvaluateParams<Q>,
   ): Promise<SystemOneResult<Q>>;
+}
+
+/** The decision model assumed when neither the policy options nor the client
+ * name one. */
+export const DEFAULT_DECISION_MODEL = "jev-latest";
+
+/** The one effective decision model: option, else the client's own, else the default. */
+export function resolveDecisionModel(opts: {
+  decisionModel?: string;
+  decisions: { readonly model?: string };
+}): string {
+  return opts.decisionModel ?? opts.decisions.model ?? DEFAULT_DECISION_MODEL;
 }
 
 /** OpenAI Decisions models ("Luna", `openai/...`). Case-insensitive. */

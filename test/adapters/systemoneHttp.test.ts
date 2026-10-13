@@ -57,6 +57,16 @@ describe("createSystemOneClient", () => {
     expect(() => createSystemOneClient({ apiKey: "" })).toThrow(/apiKey/);
   });
 
+  it("requires openRouterApiKey, not apiKey, for an OpenAI Decisions model", () => {
+    expect(() => createSystemOneClient({ apiKey: "ts-key", model: "openai/x" })).toThrow(/openRouterApiKey/);
+    expect(() => createSystemOneClient({ model: "openai/x", openRouterApiKey: "or" })).not.toThrow();
+    expect(createSystemOneClient({ model: "openai/x", openRouterApiKey: "or" }).model).toBe("openai/x");
+  });
+
+  it("exposes its configured model (default jev-latest)", () => {
+    expect(createSystemOneClient({ apiKey: "k" }).model).toBe("jev-latest");
+  });
+
   it("returns a client when the key is set", () => {
     const client = createSystemOneClient({ apiKey: "k" });
     expect(client).not.toBeNull();
@@ -345,7 +355,7 @@ describe("createSystemOneClient", () => {
       confidence: p,
     });
     const mk = (fetchFn: unknown, model = "openai/gpt-6-luna-decisions") =>
-      createSystemOneClient({ apiKey: "k", model: model, fetch: fetchFn as typeof fetch, sleep: noSleep })!;
+      createSystemOneClient({ apiKey: "k", openRouterApiKey: "or", model: model, fetch: fetchFn as typeof fetch, sleep: noSleep })!;
     const one: Record<string, SystemOneQuestion> = {
       solo: { type: "choice", instructions: "x", criteria: { only: "the only one" } },
     };

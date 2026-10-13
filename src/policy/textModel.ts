@@ -21,13 +21,23 @@ export interface TextModel {
 
 /** The model answered, but not with an object matching the schema (was the
  * AI SDK's `NoObjectGeneratedError`). The cascade retries once on it. */
+const INVALID_OBJECT_MARKER = Symbol.for("@pen/browser-agent.TextModelInvalidObjectError");
+
 export class TextModelInvalidObjectError extends Error {
+  /** Marker for `isInstance`: survives duplicate copies of this package, where
+   * `instanceof` would not (the AI SDK's errors work the same way). */
+  readonly [INVALID_OBJECT_MARKER] = true;
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = "TextModelInvalidObjectError";
   }
 
   static isInstance(error: unknown): boolean {
-    return error instanceof TextModelInvalidObjectError;
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      (error as Record<symbol, unknown>)[INVALID_OBJECT_MARKER] === true
+    );
   }
 }

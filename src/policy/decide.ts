@@ -10,7 +10,7 @@ import {
 import { decideBrowseStepUltrafast } from "./browseStepUltrafast.js";
 import { decideBrowseLocate, type BrowseLocateInput, type BrowseLocateResult } from "./browseLocate.js";
 import { planBrowseGoal, type BrowsePlanResult } from "./browsePlan.js";
-import { isJevModel, type DecisionClient } from "./decisions.js";
+import { isJevModel, resolveDecisionModel, type DecisionClient } from "./decisions.js";
 import {
   normalizeScreenshot,
   type BrowseLocateBody,
@@ -45,9 +45,15 @@ export async function decideStep(
   body: BrowseStepBody,
 ): Promise<BrowseStepResult> {
   // System One "jev*" models are text-only: never send them an image.
-  const visionBlocked = opts.vision === true && isJevModel(opts.decisionModel);
+  const decisionModel = resolveDecisionModel(opts);
+  const visionBlocked = opts.vision === true && isJevModel(decisionModel);
   const visionOn = opts.vision === true && !visionBlocked;
-  const stepConfig: BrowsePolicyOptions = visionBlocked ? { ...opts, vision: false } : opts;
+  // Every reader below sees the one resolved decision model.
+  const stepConfig: BrowsePolicyOptions = {
+    ...opts,
+    decisionModel,
+    ...(visionBlocked ? { vision: false } : {}),
+  };
   const startedAt = Date.now();
   const input: BrowseStepInput = {
     goal: body.goal,
@@ -71,7 +77,7 @@ export async function decideStep(
         input,
         (opts.policy ?? "ultrafast") === "ultrafast"
           ? await decideBrowseStepUltrafast(opts.decisions, stepConfig, input)
-          : await decideBrowseStep(opts.decisions, opts, input),
+          : await decideBrowseStep(opts.decisions, stepConfig, input),
         // The guard gets only what is left of the step budget.
         { timeoutMs: BROWSE_STEP_OVERALL_DEADLINE_MS + 1_000 - (Date.now() - startedAt) },
       );

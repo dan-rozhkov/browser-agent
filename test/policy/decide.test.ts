@@ -51,6 +51,21 @@ describe("decideStep vision gate", () => {
     }
   });
 
+  it("with no decisionModel, a default (jev) client still blocks the screenshot", async () => {
+    const { decisionModel: _d, ...rest } = makeOptions({ vision: true });
+    const { captured } = await run(rest, { screenshot: SHOT });
+    expect(Array.isArray(captured!.state)).toBe(false);
+  });
+
+  it("takes the Luna branch when the client's model is openai/* and decisionModel is unset", async () => {
+    const { decisionModel: _d, ...rest } = makeOptions();
+    let captured: Captured | undefined;
+    const client = { ...fakeClient(answers, { capture: (p) => (captured = p) }), model: "openai/x" };
+    await decideStep({ ...rest, decisions: client }, stepBody());
+    const q = Object.values(captured!.questions)[0]!;
+    expect(typeof q.instructions).toBe("string");
+  });
+
   it("matches the jev prefix case-insensitively", async () => {
     const { captured } = await run(makeOptions({ vision: true, decisionModel: "Jev-Ultrafast" }), {
       screenshot: SHOT,

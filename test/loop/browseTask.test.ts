@@ -10,6 +10,7 @@ import {
 import {
   browseTaskDeadlineMs,
   browseTaskInnerBoundMs,
+  browseTaskOverallDeadlineMs,
   CLOUD_BROWSE_TASK_DEADLINE_MS,
   buildSubgoalGoal,
   capObservations,
@@ -2695,6 +2696,28 @@ describe("browse_task sub-goal planning", () => {
       stubPlanAndSteps("fail", [DONE]);
       const pending = runBrowseTaskPublic("hang forever", publicOpts(stubBrowser({ snapshot: () => new Promise(() => {}) })));
       await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false) + 1);
+      expect(await pending).toMatchObject({ status: "budget", reason: "deadline exceeded" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runBrowseTask derives its race bound from a larger overallDeadlineMs", async () => {
+    vi.useFakeTimers();
+    try {
+      stubPlanAndSteps("fail", [DONE]);
+      const overall = browseTaskOverallDeadlineMs(false) + 5 * 60_000;
+      let settled = false;
+      const pending = runBrowseTaskPublic(
+        "hang forever",
+        publicOpts(stubBrowser({ snapshot: () => new Promise(() => {}) }), { overallDeadlineMs: overall })
+      ).then((t) => {
+        settled = true;
+        return t;
+      });
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false) + 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(browseTaskInnerBoundMs(false, overall) - browseTaskInnerBoundMs(false));
       expect(await pending).toMatchObject({ status: "budget", reason: "deadline exceeded" });
     } finally {
       vi.useRealTimers();

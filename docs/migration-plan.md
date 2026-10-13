@@ -155,19 +155,38 @@ C2. Replace `src/lib/tools/browser/browseTask.ts`, `actionCache.ts`,
     ```ts
     import { runBrowseTask } from "@pen/browser-agent/loop";
     import { createHttpBackend } from "@pen/browser-agent/adapters/http-backend";
-    const backend = createHttpBackend({ baseUrl: resolveApiUrl("/") });
-    // in the handler:
-    const transcript = await runBrowseTask(goal, {
-      browser: getBrowserBridge(context.chatId)!,
-      backend,
-      permissions: getBrowserAgentPermissions(),
-      storage: globalThis.localStorage,
-      cloud: !isDesktopBrowserAvailable(),
-      stepScreenshots: browseStepScreenshotEnabled(),
-      signal: context.abortSignal,
-      maxSteps, url,
+    const backend = createHttpBackend({
+      baseUrl: resolveApiUrl("/"),
+      credentials: credentialsMode, // "include" when accounts are on
     });
+
+    export const browseTask: ToolHandler = async (args, context) => {
+      const browser = getBrowserBridge(context?.sessionId);
+      if (!browser) return JSON.stringify({ error: BROWSER_NOT_AVAILABLE_ERROR });
+      const goal = typeof args.goal === "string" ? args.goal : "";
+      const maxSteps =
+        typeof args.maxSteps === "number" && Number.isFinite(args.maxSteps) ? args.maxSteps : undefined;
+      const url = typeof args.url === "string" && args.url.length > 0 ? args.url : undefined;
+      try {
+        const transcript = await runBrowseTask(goal, {
+          browser,
+          backend,
+          permissions: getBrowserAgentPermissions(),
+          storage: globalThis.localStorage,
+          cloud: !isDesktopBrowserAvailable(),
+          stepScreenshots: browseStepScreenshotEnabled(),
+          signal: context?.signal,
+          maxSteps, url,
+        });
+        return JSON.stringify(transcript ?? {});
+      } catch (err) {
+        return JSON.stringify({ error: err instanceof Error ? err.message : "browse_task failed." });
+      }
+    };
     ```
+
+    (`runBrowseTask` owns the hard inner time bound; the handler's own
+    race/abort plumbing is deleted.)
 
     `bridge.ts`, `browseAct.ts`, `browseOpen.ts`, `browseRead.ts`,
     `browseScreenshot.ts`, `browseSnapshot.ts`, `browseTabs.ts`,

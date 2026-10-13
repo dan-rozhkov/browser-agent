@@ -9,15 +9,16 @@
 //   CASCADE_MODEL       optional; OpenRouter model id for the cascade, plan and field text
 //   CDP_URL             optional; attach to a running browser instead of launching one
 //   HEADLESS=0          show the launched browser window
-import { z } from "zod";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { chromium } from "playwright-core";
 import { connectOverCdp, PlaywrightTarget } from "../src/adapters/playwright.js";
+import { aiSdkTextModel } from "../src/adapters/aiSdk.js";
 import { createSystemOneClient } from "../src/adapters/systemoneHttp.js";
 import { controllerBridge } from "../src/adapters/controllerBridge.js";
 import { createLocalBackend } from "../src/adapters/localBackend.js";
 import { BrowserController } from "../src/controller/index.js";
 import { memoryStorage, runBrowseTask } from "../src/loop/index.js";
-import { TextModelInvalidObjectError, type TextModel, type TextModelMessage } from "../src/policy/index.js";
+import type { TextModel } from "../src/policy/index.js";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -28,53 +29,28 @@ function requireEnv(name: string): string {
   return v;
 }
 
-/**
- * A minimal `TextModel` over OpenRouter's chat completions endpoint (JSON
- * mode + zod validation). With the AI SDK installed you would rather use
- * `aiSdkTextModel(openrouter("..."))` from `adapters/ai-sdk`.
- */
+/** OpenRouter through the AI SDK: `generateObject` sends the schema (as a
+ * structured-output `json_schema` response format), so replies validate. */
 function openRouterTextModel(apiKey: string, id: string): TextModel {
-  return {
-    id,
-    async generateObject<T>(req: { schema: z.ZodType<T>; prompt: string | TextModelMessage[]; abortSignal?: AbortSignal }) {
-      const messages =
-        typeof req.prompt === "string" ? [{ role: "user", content: req.prompt }] : req.prompt;
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: id, messages, response_format: { type: "json_object" } }),
-        signal: req.abortSignal,
-      });
-      if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const json = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-        usage?: { prompt_tokens?: number; completion_tokens?: number };
-      };
-      const text = json.choices?.[0]?.message?.content ?? "";
-      let raw: unknown;
-      try {
-        raw = JSON.parse(text);
-      } catch (cause) {
-        throw new TextModelInvalidObjectError("model did not return JSON", { cause });
-      }
-      const parsed = req.schema.safeParse(raw);
-      if (!parsed.success) throw new TextModelInvalidObjectError(parsed.error.message);
-      return {
-        object: parsed.data,
-        usage: { inputTokens: json.usage?.prompt_tokens, outputTokens: json.usage?.completion_tokens },
-      };
-    },
-  };
+  const openrouter = createOpenAICompatible({
+    name: "openrouter",
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey,
+    supportsStructuredOutputs: true,
+  });
+  return aiSdkTextModel(openrouter(id));
 }
 
-async function openBrowser(): Promise<{ controller: BrowserController; close(): Promise<void> }> {
+async function openBrowser(): Promise<{ controller: BrowserController; close(): Promise<void>; cloud: boolean }> {
   const cdpUrl = process.env.CDP_URL;
-  if (cdpUrl) return connectOverCdp(cdpUrl);
+  // A remote browser: cloud deadlines.
+  if (cdpUrl) return { ...(await connectOverCdp(cdpUrl)), cloud: true };
   const browser = await chromium.launch({ headless: process.env.HEADLESS !== "0" });
   const context = await browser.newContext();
   return {
     controller: new BrowserController(new PlaywrightTarget(context)),
     close: () => browser.close(),
+    cloud: false,
   };
 }
 
@@ -100,12 +76,13 @@ async function main(): Promise<void> {
     ...(decisionModel ? { decisionModel } : {}),
   };
 
-  const { controller, close } = await openBrowser();
+  const { controller, close, cloud } = await openBrowser();
   try {
     const transcript = await runBrowseTask(goal, {
       browser: controllerBridge(controller),
       backend: createLocalBackend(policy),
       storage: memoryStorage(),
+      cloud,
     });
     console.log(JSON.stringify(transcript, null, 2));
   } finally {

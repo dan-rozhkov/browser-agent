@@ -1943,14 +1943,17 @@ export function browseTaskOverallDeadlineMs(cloud: boolean): number {
 }
 
 /** Hard bound on one browse_task call, enforced inside the handler: the
- * longest overall deadline for this browser (single flow ends sooner on its
+ * overall deadline in force (`overallDeadlineMs`, else the browser's default) (single flow ends sooner on its
  * own) + one step-start reserve + settleEmptySnapshot's worst case. The
  * chat-side timeout is a margin above this. The end-of-loop observation reads
  * (<= OBSERVATIONS_KEPT x OBSERVATION_READ_TIMEOUT_MS) add nothing: each one
  * starts only with OBSERVATION_READ_TIMEOUT_MS left of the overall deadline,
  * so it ends inside it. */
-export function browseTaskInnerBoundMs(cloud: boolean): number {
-  return browseTaskOverallDeadlineMs(cloud) + STEP_DEADLINE_RESERVE_MS + BROWSE_SETTLE_WORST_CASE_MS;
+export function browseTaskInnerBoundMs(
+  cloud: boolean,
+  overallDeadlineMs: number = browseTaskOverallDeadlineMs(cloud),
+): number {
+  return overallDeadlineMs + STEP_DEADLINE_RESERVE_MS + BROWSE_SETTLE_WORST_CASE_MS;
 }
 
 // Above the backend model budget (BROWSE_PLAN_TIMEOUT_MS = 20 s): the plan runs
@@ -2584,6 +2587,7 @@ export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): P
     typeof opts.maxSteps === "number" && Number.isFinite(opts.maxSteps) ? opts.maxSteps : DEFAULT_MAX_STEPS;
   const url = typeof opts.url === "string" && opts.url.length > 0 ? opts.url : undefined;
 
+  const overallDeadlineMs = opts.overallDeadlineMs ?? browseTaskOverallDeadlineMs(cloud);
   // The race below is the REAL bound on this call.
   const inner = new AbortController();
   const outer = opts.signal;
@@ -2596,7 +2600,7 @@ export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): P
       timer = setTimeout(() => {
         inner.abort();
         resolve({ status: "budget", steps: [], url: "", title: "", reason: "deadline exceeded" });
-      }, browseTaskInnerBoundMs(cloud));
+      }, browseTaskInnerBoundMs(cloud, overallDeadlineMs));
     });
     return await Promise.race([
       runBrowseTaskCore(
@@ -2607,7 +2611,7 @@ export async function runBrowseTask(goal: string, opts: RunBrowseTaskOptions): P
         opts.sleep,
         url,
         opts.deadlineMs ?? browseTaskDeadlineMs(cloud),
-        opts.overallDeadlineMs ?? browseTaskOverallDeadlineMs(cloud),
+        overallDeadlineMs,
         inner.signal
       ),
       bound,
