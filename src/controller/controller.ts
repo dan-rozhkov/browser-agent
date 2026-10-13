@@ -132,6 +132,8 @@ interface ScopedSignature {
   textHash: number;
   src: string;
   valueLength: number;
+  /** Numeric hash of the value (0 for a password field); optional so older shapes still validate. */
+  valueHash?: number;
   ariaExpanded: string;
   ariaSelected: string;
   /** Optional: a slider's only moving property (see SCOPED_SIGNATURE_JS). */
@@ -146,6 +148,7 @@ function isScopedSignature(value: unknown): value is ScopedSignature {
     typeof value.textHash === "number" &&
     typeof value.src === "string" &&
     typeof value.valueLength === "number" &&
+    (value.valueHash === undefined || typeof value.valueHash === "number") &&
     typeof value.ariaExpanded === "string" &&
     typeof value.ariaSelected === "string" &&
     (value.ariaValueNow === undefined || typeof value.ariaValueNow === "string") &&
@@ -167,6 +170,10 @@ interface PageSignature {
    * SCOPED_SIGNATURE_JS's doc comment for the same reasoning applied to the
    * scoped-target signature. */
   focusedValueLength: number;
+  /** Numeric hash of the focused field's value (never the value). Optional: older shapes lack it. */
+  focusedValueHash?: number;
+  /** Numeric hash of the visible form controls' live state. Optional: older shapes lack it. */
+  controlsHash?: number;
   /** Only present on a `phase: "after"` capture, and only when the acting
    * script stamped a target element — review finding 4. */
   scopedAfter?: ScopedSignature | null;
@@ -215,6 +222,8 @@ function isPageSignature(value: unknown): value is PageSignature {
     typeof value.mainImageSrc === "string" &&
     typeof value.scrollY === "number" &&
     typeof value.focusedValueLength === "number" &&
+    (value.focusedValueHash === undefined || typeof value.focusedValueHash === "number") &&
+    (value.controlsHash === undefined || typeof value.controlsHash === "number") &&
     (value.scopedAfter === undefined || value.scopedAfter === null || isScopedSignature(value.scopedAfter)) &&
     (value.captureId === undefined || typeof value.captureId === "string") &&
     (value.pageChanged === undefined || typeof value.pageChanged === "boolean") &&
@@ -3987,7 +3996,9 @@ export class BrowserController {
     const titleChanged = before.title !== after.title;
     const mainImageChanged = before.mainImageSrc !== after.mainImageSrc;
     const scrollChanged = before.scrollY !== after.scrollY;
-    const valueChanged = before.focusedValueLength !== after.focusedValueLength;
+    const valueChanged =
+      before.focusedValueLength !== after.focusedValueLength || before.focusedValueHash !== after.focusedValueHash;
+    const controlsChanged = before.controlsHash !== after.controlsHash;
 
     if (urlChanged) changes.push("url");
     if (titleChanged) changes.push("title");
@@ -3996,6 +4007,7 @@ export class BrowserController {
     if (before.textLength !== after.textLength || before.textHash !== after.textHash) changes.push("text");
     if (scrollChanged) changes.push("scroll");
     if (valueChanged) changes.push("value");
+    if (controlsChanged) changes.push("controls");
     if (mainImageChanged) changes.push("main-image");
 
     let scopedChanged = false;
@@ -4010,6 +4022,7 @@ export class BrowserController {
           scopedBefore.textHash !== scopedAfter.textHash ||
           scopedBefore.src !== scopedAfter.src ||
           scopedBefore.valueLength !== scopedAfter.valueLength ||
+          scopedBefore.valueHash !== scopedAfter.valueHash ||
           scopedBefore.ariaExpanded !== scopedAfter.ariaExpanded ||
           scopedBefore.ariaSelected !== scopedAfter.ariaSelected ||
           (scopedBefore.ariaValueNow ?? "") !== (scopedAfter.ariaValueNow ?? "") ||
@@ -4018,7 +4031,7 @@ export class BrowserController {
       if (scopedChanged) changes.push("target");
     }
 
-    const changed = urlChanged || titleChanged || mainImageChanged || scrollChanged || valueChanged || scopedChanged;
+    const changed = urlChanged || titleChanged || mainImageChanged || scrollChanged || valueChanged || controlsChanged || scopedChanged;
     return { changed, changes, pageChanged: after.pageChanged ?? false, appeared: after.appeared ?? [] };
   }
 

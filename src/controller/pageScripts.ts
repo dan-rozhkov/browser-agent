@@ -907,11 +907,42 @@ const INTERACTIVE_SELECTOR_JS = `
 
   // INTERACTIVE_SELECTOR's matches plus the option-like items of open popups
   // (POPUP_OPTION_JS): role-less to the selector, options to the step model.
+  // Table column headers. A sortable header (aria-sort, a pointer cursor or an
+  // onclick handler on the cell itself) is a control; a plain header cell is
+  // not, so it never floods the table. A header that CONTAINS a native or ARIA
+  // control is not listed as itself: the inner control is the target.
+  var PEN_HEADER_SELECTOR = "th, [role='columnheader']";
+  var PEN_HEADER_INNER = "a[href], button, input, select, textarea, [role='button'], [role='link']";
+  var PEN_HEADER_SCAN_CAP = 300;
+  var PEN_HEADER_ITEM_CAP = 40;
+  function penIsHeaderCell(el) {
+    return !!(el.matches && el.matches(PEN_HEADER_SELECTOR));
+  }
+  function penHeaderHasInner(el) {
+    return !!el.querySelector(PEN_HEADER_INNER);
+  }
+  function penHeaderItems(seen) {
+    var cells = deepQueryAll(document, PEN_HEADER_SELECTOR);
+    var out = [];
+    var limit = Math.min(cells.length, PEN_HEADER_SCAN_CAP);
+    for (var hi = 0; hi < limit && out.length < PEN_HEADER_ITEM_CAP; hi++) {
+      var cell = cells[hi];
+      if (seen.has(cell) || penHeaderHasInner(cell)) continue;
+      if (cell.hasAttribute("aria-sort") || cell.hasAttribute("onclick") || getComputedStyle(cell).cursor === "pointer") {
+        out.push(cell);
+      }
+    }
+    return out;
+  }
+
   function penCandidates() {
     var walked = deepQueryAll(document, INTERACTIVE_SELECTOR + ', [aria-expanded="true"]');
     var base = [];
     penExpandedFound = [];
     for (var wi = 0; wi < walked.length; wi++) {
+      // A header cell wrapping its own control (onclick on the cell AND a
+      // button inside): only the inner control is listed.
+      if (penIsHeaderCell(walked[wi]) && penHeaderHasInner(walked[wi])) continue;
       // One deep walk for both sets. An element that does not carry
       // aria-expanded="true" matched through INTERACTIVE_SELECTOR; only an
       // expanded one needs the (second) membership test.
@@ -920,6 +951,11 @@ const INTERACTIVE_SELECTOR_JS = `
       if (!expanded || walked[wi].matches(INTERACTIVE_SELECTOR)) base.push(walked[wi]);
     }
     var seen = new Set(base);
+    var headers = penHeaderItems(seen);
+    for (var hj = 0; hj < headers.length; hj++) {
+      base.push(headers[hj]);
+      seen.add(headers[hj]);
+    }
     var items = penPopupItems();
     for (var pi = 0; pi < items.length; pi++) {
       if (!seen.has(items[pi])) base.push(items[pi]);
@@ -1856,6 +1892,14 @@ const FOCUS_FOLLOW_HELPER_JS = `
 const SCOPED_SIGNATURE_JS = `
   ${SIG_TARGET_HELPER_JS}
 
+  function penHashString(str) {
+    var h = 0;
+    for (var hi = 0; hi < str.length; hi++) {
+      h = (h * 31 + str.charCodeAt(hi)) | 0;
+    }
+    return h;
+  }
+
   function scopedSignatureOf(el) {
     var nodeCount = el.querySelectorAll("*").length + 1;
     var text = (el.textContent || "").replace(/\\s+/g, " ").trim();
@@ -1867,11 +1911,17 @@ const SCOPED_SIGNATURE_JS = `
       nodeCount: nodeCount,
       textHash: hash,
       src: el.getAttribute("src") || "",
-      // A length, not the content — the raw value never needs to leave the
-      // page for a diff, and this element can be a form field (see the
-      // credentials rule elsewhere in this file for why raw field content
-      // is treated as sensitive by default).
+      // A length and a small numeric hash, never the content — the raw value
+      // never leaves the page, only numbers do, and this element can be a
+      // form field (see the credentials rule elsewhere in this file for why
+      // raw field content is treated as sensitive by default). The hash makes
+      // a same-length change ("06" -> "08") visible. A password field keeps
+      // the length only: its hash stays 0.
       valueLength: "value" in el ? String(el.value || "").length : 0,
+      valueHash:
+        "value" in el && (el.getAttribute("type") || "").toLowerCase() !== "password"
+          ? penHashString(String(el.value || ""))
+          : 0,
       ariaExpanded: el.getAttribute("aria-expanded") || "",
       ariaSelected: el.getAttribute("aria-selected") || "",
       // A slider thumb has no text/value of its own: aria-valuenow is the
@@ -3067,7 +3117,10 @@ export const READ_TARGET_VALUE_JS = `(() => {
   if (moved && penReadText(moved) === expected) {
     penStampSigTarget(moved);
     var before = scopedSignatureOf(moved);
-    if (expected.length > 0) before.valueLength = 0;
+    if (expected.length > 0) {
+      before.valueLength = 0;
+      before.valueHash = 0;
+    }
     return { matches: true, present: true, retargeted: true, __scopedBefore: before };
   }
   return { matches: false, present: true };
@@ -4691,6 +4744,51 @@ export const SIGNATURE_JS = `(() => {
     }
   }
 
+  // A numeric hash of the focused field's value (never the value; skipped for
+  // a password field), so a same-length edit still moves the signature.
+  var focusedValueHash = 0;
+  if (activeEl && String(activeEl.type || "").toLowerCase() !== "password") {
+    var activeTag2 = (activeEl.tagName || "").toLowerCase();
+    if (activeTag2 === "input" || activeTag2 === "textarea") {
+      focusedValueHash = penHashString(String(activeEl.value || ""));
+    } else if (activeEl.isContentEditable) {
+      focusedValueHash = penHashString(activeEl.textContent || "");
+    }
+  }
+
+  // controlsHash: one numeric hash over the live state of the visible form
+  // controls (value, checked, aria-valuenow / aria-checked / aria-selected).
+  // The MutationObserver cannot see a .value or .checked property change, so
+  // a stepper that rewrites a sibling input would otherwise look like "no
+  // effect". Scoped to the open dialog when there is one, capped, and only a
+  // number leaves the page; password fields are skipped.
+  var controlsHash = 0;
+  try {
+    var ctlRoot = document;
+    var dlgs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]');
+    for (var di = dlgs.length - 1; di >= 0; di--) {
+      if (isVisible(dlgs[di])) {
+        ctlRoot = dlgs[di];
+        break;
+      }
+    }
+    var ctls = ctlRoot.querySelectorAll(
+      "input, select, textarea, [role='checkbox'], [role='radio'], [role='switch'], [role='slider'], [role='spinbutton'], [role='option'], [role='tab'], [aria-checked], [aria-selected], [aria-valuenow]"
+    );
+    var ctlCap = Math.min(ctls.length, 150);
+    var ctlKey = "";
+    for (var ci = 0; ci < ctlCap; ci++) {
+      var ctl = ctls[ci];
+      if (String(ctl.type || "").toLowerCase() === "password") continue;
+      if (!isVisible(ctl)) continue;
+      ctlKey +=
+        ci + "|" + ("value" in ctl ? String(ctl.value || "") : "") + "|" + (ctl.checked ? 1 : 0) + "|" +
+        (ctl.getAttribute("aria-valuenow") || "") + "|" + (ctl.getAttribute("aria-checked") || "") + "|" +
+        (ctl.getAttribute("aria-selected") || "") + ";";
+    }
+    controlsHash = penHashString(ctlKey);
+  } catch (e) {}
+
   var result = {
     url: location.href,
     title: document.title,
@@ -4700,6 +4798,8 @@ export const SIGNATURE_JS = `(() => {
     mainImageSrc: mainImageSrc,
     scrollY: window.scrollY,
     focusedValueLength: focusedValueLength,
+    focusedValueHash: focusedValueHash,
+    controlsHash: controlsHash,
     pageChanged: phase === "after" && penSigState.pageChanged,
     appeared: phase === "after" ? penSigState.appeared : [],
   };
