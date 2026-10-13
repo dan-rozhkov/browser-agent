@@ -24,6 +24,7 @@ import {
   type LoopEnv,
   type RunBrowseTaskOptions,
 } from "../../src/loop/browseTask.js";
+import { createQuantityGate } from "../../src/loop/quantityGate.js";
 import { fetchBrowseBackend, type SnapshotResult } from "../../src/loop/shared.js";
 import { memoryStorage, type KeyValueStorage } from "../../src/loop/storage.js";
 import { createHttpBackend } from "../../src/adapters/httpBackend.js";
@@ -3809,5 +3810,56 @@ describe("quantity-reached gate", () => {
     expect(open).toHaveBeenCalledTimes(2);
     expect(perform).toHaveBeenCalledTimes(2);
     expect(t.subgoals?.[0].status).toBe("done");
+  });
+
+  it("single-goal run: a policy that insists after two vetoes ends the run as done, never stalled", async () => {
+    const { t, perform } = await run(SUBGOAL("2 units"), [click(0), click(0), click(0), click(0), click(0), click(0)], IKEA_BAGS, "Shopping bag, 1 items", true);
+    expect(perform).toHaveBeenCalledTimes(2);
+    expect(t.status).toBe("done");
+    expect(t.reason).toMatch(/^quantity 2 reached/);
+    expect(t.steps.filter((st) => st.label === "quantity 2 reached — not clicking again" && !st.ok)).toHaveLength(2);
+  });
+
+  it("Set quantity to 3 with a stepper 1→2→3: blocked at the third click (absolute target)", async () => {
+    const page = (k: number) => ({
+      url: "https://shop.test/cart",
+      title: "Cart",
+      elements: [
+        { index: 0, tag: "button", label: "Increase", ops: ["CLICK"] },
+        { index: 1, tag: "input", label: `Quantity ${k + 1}`, ops: ["TYPE_TEXT"] },
+      ],
+      snapshotId: "s",
+      scroll: { y: 0 },
+    });
+    stubFetchSequence([click(0), click(0), click(0), click(0), DONE]);
+    let performs = 0;
+    const perform = vi.fn(async () => {
+      performs++;
+      return { changed: true };
+    });
+    const browser = stubBrowser({ perform, snapshot: async () => page(performs) });
+    const goal = "Set quantity to 3. Done when: the quantity field shows 3.";
+    const t = await runBrowseTaskLoop(goal, 12, browser, undefined, undefined, undefined, undefined, { initialSnapshot: page(0) }, undefined, { isSubGoal: true });
+    expect(perform).toHaveBeenCalledTimes(2);
+    expect(t.reason).toBe("quantity 3 reached (counter 2→3)");
+  });
+
+  it("a vetoed cache replay deletes the cached entry", async () => {
+    const goal = SUBGOAL("2 units");
+    const gate = createQuantityGate(2);
+    const at = { url: "https://shop.test/p", label: ADD };
+    gate.observe(at, `${ADD} → effect: appeared: "Shopping bag, 1 items"`);
+    gate.observe(at, `${ADD} → effect: counter 1→2`);
+    const snap = pageWith("Shopping bag, 2 items");
+    const key = buildStepCacheKey(goal, snap.url, snap.title, snap.elements, [], snap.scroll, undefined);
+    writeStepCacheEntry(store, key, goal, snap.elements, { operation: "CLICK", target: { labelHash: hashCachedLabel(ADD), tag: "button" } });
+    expect(store.getItem(ACTION_CACHE_STORAGE_KEY)).toContain(key);
+    stubFetchSequence([DONE]);
+    const perform = vi.fn(async () => ({ changed: true }));
+    const t = await runBrowseTaskLoop(goal, 5, stubBrowser({ perform, snapshot: async () => snap }), undefined, undefined, undefined, undefined, { initialSnapshot: snap }, undefined, { quantityGate: gate });
+    expect(perform).not.toHaveBeenCalled();
+    expect(t.status).toBe("done");
+    expect(t.steps[0]).toMatchObject({ operation: "CLICK", ok: false });
+    expect(store.getItem(ACTION_CACHE_STORAGE_KEY) ?? "").not.toContain(key);
   });
 });

@@ -1768,14 +1768,22 @@ for N units ("Add 2 units ...") used to end with more, because the step policy
 sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
 
 - N comes from the action part, else the "Done when" clause (never "Does not
-  count"); exactly one quantity, 1..20, and not a measure or price.
-- Units per target = sum of `counter a→b` deltas with 0 < delta ≤ N, plus 1 if
-  an earlier `appeared:` text on that target holds the first counter's `a` as
-  a token (or "1" when N is 1). An error toast or modal counts nothing.
-- A target is origin+pathname + normalised label; state follows a relabel
-  ("Add to bag" → "Add to bag (1)"). The clicked element is found by its own
-  `.index`, the same lookup the effect code uses.
+  count"); exactly one quantity, 1..20, and not a measure or price. A phrase
+  like "quantity to 3" or "set ... to 3" is an absolute target.
+- Units per target = sum of `counter a→b` deltas with 0 < delta <= N, plus 1 if
+  the effect of the click on that target right before the first counter had an
+  `appeared:` text holding `a` as a whole token. An older click's text does not
+  count, and a text without that number (an error toast) infers nothing. For
+  N = 1 the first effect must show a count: "1 item(s)/unit(s)/product(s)/
+  article(s)", "(1)", "1 x" or "x 1"; a bare "1" ("Only 1 left") does not arm.
+  For an absolute target, a counter that ends at N also counts.
+- A target is origin + pathname + query (not the hash) + normalised label. A
+  relabel aliases the state under the new label too, so a label that reverts
+  still finds it. The clicked element is found by its own `.index`, the same
+  lookup the effect code uses.
 - In a sub-goal, a repeat CLICK on a saturated target ends the sub-goal as
-  done. In a single-goal run it is vetoed instead (a failed step in history),
-  so the rest of the task still runs.
-- The gate lives on `HistoryShare` and survives the stall-recovery retry.
+  done. In a single-goal run it is vetoed twice instead (a failed history step
+  that does not feed the stall or cycle counters; a vetoed cache replay deletes
+  its entry); a third attempt ends the run as done.
+- The gate lives on `HistoryShare` and survives the stall-recovery retry. The
+  retry does not carry a pending (not yet observed) effect of the last click.

@@ -1,7 +1,7 @@
 import type { BrowserBridge } from "./bridge.js";
 import type { BrowseBackend } from "./backend.js";
 import type { KeyValueStorage } from "./storage.js";
-import { createQuantityGate, parseTargetQuantity, type QuantityGate } from "./quantityGate.js";
+import { createQuantityGate, parseTarget, type QuantityGate, type TargetQuantity } from "./quantityGate.js";
 import {
   appendKeepingSuffix,
   describeEffectDetailed,
@@ -1127,6 +1127,8 @@ export interface HistoryShare {
  * an action, so multi-sub-goal step accounting skips it (see actionSteps). */
 const AUTO_CONFIRM_LABEL = "auto-confirmed by effect";
 /** Label of the synthetic DONE step the quantity gate records (see quantityGate.ts). */
+/** Single-goal runs: vetoes of a saturated target before the run ends as done. */
+const MAX_QUANTITY_VETOES = 2;
 const QUANTITY_REACHED_LABEL = "quantity reached — not clicking again";
 const actionSteps = (steps: TranscriptStep[]): number =>
   steps.filter(
@@ -1259,14 +1261,15 @@ export async function runBrowseTaskLoop(
   const history: StepHistoryEntry[] = share?.seed ? [...share.seed] : [];
   if (share) share.final = history;
   let pendingEffect: PendingEffect | null = null;
-  if (share && share.quantityGate === undefined) {
+  // The gate lives on the share so a stall-recovery retry of this sub-goal reuses it.
+  const holder: HistoryShare = share ?? {};
+  if (holder.quantityGate === undefined) {
     const target = quantityTargetOf(goal);
-    share.quantityGate = target === null ? null : createQuantityGate(target);
+    holder.quantityGate = target === null ? null : createQuantityGate(target.quantity, target.absolute);
   }
-  const quantityGate = share ? share.quantityGate ?? null : (() => {
-    const target = quantityTargetOf(goal);
-    return target === null ? null : createQuantityGate(target);
-  })();
+  const quantityGate = holder.quantityGate;
+  /** Single-goal runs: repeat clicks vetoed so far (see quantityStop). */
+  let quantityVetoes = 0;
 
   let lastUrl = "";
   let lastTitle = "";
@@ -1425,14 +1428,19 @@ export async function runBrowseTaskLoop(
     if (!quantityGate || !acted) return null;
     const reason = quantityGate.blockedReason(url, acted.label);
     if (!reason) return null;
-    if (!share?.isSubGoal) {
-      const stalled = note({
+    // A single-goal run vetoes the click, off the stall counters: it is the
+    // gate's choice, not a failed attempt. A policy that insists is ended.
+    if (!share?.isSubGoal && quantityVetoes < MAX_QUANTITY_VETOES) {
+      quantityVetoes++;
+      recordStep(steps, history, {
         operation: "CLICK",
         label: `quantity ${quantityGate.target} reached — not clicking again`,
         ok: false,
         index: acted.index,
+        ...(pendingShot ?? {}),
       });
-      return stalled ?? "veto";
+      pendingShot = undefined;
+      return "veto";
     }
     recordStep(steps, history, {
       operation: "DONE",
@@ -1550,7 +1558,10 @@ export async function runBrowseTaskLoop(
           if (signal?.aborted) return cancelledResult();
           if (cached.operation === "CLICK") {
             const stopped = quantityStop(actedElementOf(snapshot, cachedIndex), snapshot.url);
-            if (stopped === "veto") continue;
+            if (stopped === "veto") {
+              deleteCacheEntry(storage, stepCacheKey);
+              continue;
+            }
             if (stopped) return stopped;
           }
           const replay = await replayCachedStep(
@@ -2122,6 +2133,9 @@ async function planSubgoals(
   }
 }
 
+/** Lead-in of the done list `buildSubgoalGoal` appends to a sub-goal. */
+const ALREADY_DONE_MARKER = "\n\nAlready done earlier (do not redo):";
+
 /**
  * The goal string for a sub-goal: the sub-goal text ONLY, then (if any) what
  * is already done. The overall task and the step position are deliberately
@@ -2129,8 +2143,6 @@ async function planSubgoals(
  * never answer DONE. Capped at SUBGOAL_GOAL_MAX_CHARS; the done list is
  * truncated first and the sub-goal is never cut (unless it alone exceeds the cap).
  */
-/** Lead-in of the done list `buildSubgoalGoal` appends to a sub-goal. */
-export const ALREADY_DONE_MARKER = "\n\nAlready done earlier (do not redo):";
 export function buildSubgoalGoal(subgoal: string, doneGoals: string[]): string {
   let doneStr = "";
   if (doneGoals.length > 0) {
@@ -2251,12 +2263,12 @@ function subGoalAction(subGoal: string): string {
  * part is the text before the first marker; the condition is the "Done when"
  * clause only ("Does not count" says what to ignore, not what to reach). */
 const DONE_WHEN_CLAUSE = /\bdone\s+when\s*:([\s\S]*?)(?=\bdoes\s+not\s+count\s*:|$)/i;
-function quantityTargetOf(goal: string): number | null {
+function quantityTargetOf(goal: string): TargetQuantity | null {
   const cut = goal.indexOf(ALREADY_DONE_MARKER);
   const subGoal = cut >= 0 ? goal.slice(0, cut) : goal;
   const m = SUBGOAL_CONDITION_MARKER.exec(subGoal);
-  if (!m) return parseTargetQuantity(subGoal, "");
-  return parseTargetQuantity(subGoal.slice(0, m.index), DONE_WHEN_CLAUSE.exec(subGoal)?.[1] ?? "");
+  if (!m) return parseTarget(subGoal, "");
+  return parseTarget(subGoal.slice(0, m.index), DONE_WHEN_CLAUSE.exec(subGoal)?.[1] ?? "");
 }
 
 /** "search" as a noun is not a verb: a noun head before it ("the search",
