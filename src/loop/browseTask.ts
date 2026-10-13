@@ -1,7 +1,7 @@
 import type { BrowserBridge } from "./bridge.js";
 import type { BrowseBackend } from "./backend.js";
 import type { KeyValueStorage } from "./storage.js";
-import { createQuantityGate, parseTargetQuantity } from "./quantityGate.js";
+import { createQuantityGate, parseTargetQuantity, type QuantityGate } from "./quantityGate.js";
 import {
   appendKeepingSuffix,
   describeEffectDetailed,
@@ -1087,6 +1087,16 @@ function actedElementOf(snapshot: SnapshotResult, index: number | undefined): Ac
   };
 }
 
+/** The acted element's label in the next snapshot when only digits and
+ * punctuation changed ("Add to bag" → "Add to bag (1)"); same index, tag and
+ * role. The quantity gate follows the target through such relabels. */
+function relabelOf(acted: ActedElement, next: SnapshotResult): { old: string; new: string } | undefined {
+  const now = actedElementOf(next, acted.index);
+  if (!now || now.tag !== acted.tag || now.role !== acted.role || now.label === acted.label) return undefined;
+  const letters = (t: string): string => t.replace(/[^\p{L}]+/gu, "").toLowerCase();
+  return letters(now.label) === letters(acted.label) ? { old: acted.label, new: now.label } : undefined;
+}
+
 /** Appends the effect note to the recorded CLICK (transcript + history). */
 function applyPendingEffect(pending: PendingEffect, next: SnapshotResult): BecameLabel | undefined {
   const { note, became } = describeEffectDetailed(pending.prev, next, pending.acted, pending.result);
@@ -1105,6 +1115,12 @@ export interface HistoryShare {
   /** Multi-sub-goal runs only: a CLICK whose effect shows a commit (see
    * isCommitEffect) ends the sub-goal as done without another step request. */
   autoConfirmCommit?: boolean;
+  /** Multi-sub-goal runs: the goal is one sub-goal, so a reached quantity ends
+   * it as done. Without this (a single-goal run) the repeat click is only vetoed. */
+  isSubGoal?: boolean;
+  /** Quantity gate state. Created by the loop on first use; the caller passes
+   * the same object to a stall-recovery retry of the same sub-goal. */
+  quantityGate?: QuantityGate | null;
 }
 
 /** Label prefix of the synthetic DONE step the auto-confirm records. It is not
@@ -1243,8 +1259,14 @@ export async function runBrowseTaskLoop(
   const history: StepHistoryEntry[] = share?.seed ? [...share.seed] : [];
   if (share) share.final = history;
   let pendingEffect: PendingEffect | null = null;
-  const quantityTarget = quantityTargetOf(goal);
-  const quantityGate = quantityTarget === null ? null : createQuantityGate(quantityTarget);
+  if (share && share.quantityGate === undefined) {
+    const target = quantityTargetOf(goal);
+    share.quantityGate = target === null ? null : createQuantityGate(target);
+  }
+  const quantityGate = share ? share.quantityGate ?? null : (() => {
+    const target = quantityTargetOf(goal);
+    return target === null ? null : createQuantityGate(target);
+  })();
 
   let lastUrl = "";
   let lastTitle = "";
@@ -1396,11 +1418,22 @@ export async function runBrowseTaskLoop(
     cacheHits,
   });
 
-  /** Quantity gate: the finished transcript when `targetLabel` is a repeat
-   * click on a target that already produced the requested quantity, else null. */
-  const quantityStop = (targetLabel: string): Transcript | null => {
-    const reason = quantityGate?.blockedReason(targetLabel);
+  /** Quantity gate, for a CLICK on `acted` (looked up by element index, as the
+   * effect is). A sub-goal run finishes as done; a single-goal run only vetoes
+   * the click ("veto": a failed step, the policy picks something else). */
+  const quantityStop = (acted: ActedElement | undefined, url: string): Transcript | "veto" | null => {
+    if (!quantityGate || !acted) return null;
+    const reason = quantityGate.blockedReason(url, acted.label);
     if (!reason) return null;
+    if (!share?.isSubGoal) {
+      const stalled = note({
+        operation: "CLICK",
+        label: `quantity ${quantityGate.target} reached — not clicking again`,
+        ok: false,
+        index: acted.index,
+      });
+      return stalled ?? "veto";
+    }
     recordStep(steps, history, {
       operation: "DONE",
       label: `${QUANTITY_REACHED_LABEL} — ${reason}`,
@@ -1443,7 +1476,9 @@ export async function runBrowseTaskLoop(
     let effectApplied = false;
     if (pendingEffect) {
       const became = applyPendingEffect(pendingEffect, snapshot);
-      if (quantityGate && pendingEffect.acted) quantityGate.observe(pendingEffect.acted.label, pendingEffect.step.label);
+      if (quantityGate && pendingEffect.acted) {
+        quantityGate.observe({ url: pendingEffect.prev.url, label: pendingEffect.acted.label }, pendingEffect.step.label, became ?? relabelOf(pendingEffect.acted, snapshot));
+      }
       pendingEffect = null;
       effectApplied = true;
       const commit = share?.autoConfirmCommit ? isCommitEffect(became) : null;
@@ -1513,8 +1548,9 @@ export async function runBrowseTaskLoop(
         // attempt.
         if (!unsafeAtReplay && (!cached.target || cachedIndex !== undefined)) {
           if (signal?.aborted) return cancelledResult();
-          if (cached.operation === "CLICK" && typeof resolvedElement?.label === "string") {
-            const stopped = quantityStop(resolvedElement.label);
+          if (cached.operation === "CLICK") {
+            const stopped = quantityStop(actedElementOf(snapshot, cachedIndex), snapshot.url);
+            if (stopped === "veto") continue;
             if (stopped) return stopped;
           }
           const replay = await replayCachedStep(
@@ -1888,7 +1924,8 @@ export async function runBrowseTaskLoop(
     }
 
     if (operation === "CLICK" && decision.index != null) {
-      const stopped = quantityStop(label);
+      const stopped = quantityStop(actedElementOf(snapshot, decision.index), snapshot.url);
+      if (stopped === "veto") continue;
       if (stopped) return stopped;
     }
 
@@ -2092,6 +2129,8 @@ async function planSubgoals(
  * never answer DONE. Capped at SUBGOAL_GOAL_MAX_CHARS; the done list is
  * truncated first and the sub-goal is never cut (unless it alone exceeds the cap).
  */
+/** Lead-in of the done list `buildSubgoalGoal` appends to a sub-goal. */
+export const ALREADY_DONE_MARKER = "\n\nAlready done earlier (do not redo):";
 export function buildSubgoalGoal(subgoal: string, doneGoals: string[]): string {
   let doneStr = "";
   if (doneGoals.length > 0) {
@@ -2099,7 +2138,7 @@ export function buildSubgoalGoal(subgoal: string, doneGoals: string[]): string {
       doneGoals.map((g) => truncateToChars(g, DONE_ITEM_MAX_CHARS)).join("; "),
       DONE_LIST_MAX_CHARS
     );
-    doneStr = `\n\nAlready done earlier (do not redo): ${list}.`;
+    doneStr = `${ALREADY_DONE_MARKER} ${list}.`;
   }
   return `${subgoal}${doneStr}`.slice(0, SUBGOAL_GOAL_MAX_CHARS);
 }
@@ -2207,21 +2246,17 @@ function subGoalAction(subGoal: string): string {
   return action.trim() === "" ? subGoal : action;
 }
 
-/** The "Done when" / "Does not count" part of a sub-goal ("" without a marker). */
-function subGoalCondition(subGoal: string): string {
-  const m = SUBGOAL_CONDITION_MARKER.exec(subGoal);
-  return m ? subGoal.slice(m.index) : "";
-}
-
-/** The loop's goal is the sub-goal plus a "Already done earlier" list (see
- * buildSubgoalGoal); that list must not feed the quantity reader. */
-const DONE_LIST_MARKER = "\n\nAlready done earlier (do not redo):";
+/** The loop's goal is the sub-goal plus an "Already done earlier" list (see
+ * buildSubgoalGoal); that list must not feed the quantity reader. The action
+ * part is the text before the first marker; the condition is the "Done when"
+ * clause only ("Does not count" says what to ignore, not what to reach). */
+const DONE_WHEN_CLAUSE = /\bdone\s+when\s*:([\s\S]*?)(?=\bdoes\s+not\s+count\s*:|$)/i;
 function quantityTargetOf(goal: string): number | null {
-  const cut = goal.indexOf(DONE_LIST_MARKER);
+  const cut = goal.indexOf(ALREADY_DONE_MARKER);
   const subGoal = cut >= 0 ? goal.slice(0, cut) : goal;
-  const action = SUBGOAL_CONDITION_MARKER.test(subGoal) ? subGoalAction(subGoal) : subGoal;
-  const condition = subGoalCondition(subGoal);
-  return parseTargetQuantity(condition ? (action === subGoal ? "" : action) : action, condition);
+  const m = SUBGOAL_CONDITION_MARKER.exec(subGoal);
+  if (!m) return parseTargetQuantity(subGoal, "");
+  return parseTargetQuantity(subGoal.slice(0, m.index), DONE_WHEN_CLAUSE.exec(subGoal)?.[1] ?? "");
 }
 
 /** "search" as a noun is not a verb: a noun head before it ("the search",
@@ -2553,7 +2588,7 @@ export async function runBrowseTaskCore(
     const subGoalText = buildSubgoalGoal(plan[i], doneGoals);
     const subMaxSteps = Math.min(maxSteps, Math.max(1, MULTI_SUBGOAL_MAX_STEPS - stepsTotal));
     const subStart = now();
-    const share: HistoryShare = { seed: i > 0 ? carryOverHistory(previousHistory) : undefined, autoConfirmCommit: true };
+    const share: HistoryShare = { seed: i > 0 ? carryOverHistory(previousHistory) : undefined, autoConfirmCommit: true, isSubGoal: true };
     let t = await runBrowseTaskLoop(
       subGoalText,
       subMaxSteps,
@@ -2584,7 +2619,7 @@ export async function runBrowseTaskCore(
           subgoal: k,
         };
         if (!failure) {
-          const retryShare: HistoryShare = { seed: sameGoalSeed(share.final ?? []), autoConfirmCommit: true };
+          const retryShare: HistoryShare = { seed: sameGoalSeed(share.final ?? []), autoConfirmCommit: true, isSubGoal: true, quantityGate: share.quantityGate };
           const t2 = await runBrowseTaskLoop(
             subGoalText,
             leftSteps,

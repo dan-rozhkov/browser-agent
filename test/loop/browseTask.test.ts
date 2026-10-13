@@ -3646,7 +3646,7 @@ describe("quantity-reached gate", () => {
   const SUBGOAL = (n: string) => `Add ${n} of the PAX wardrobe frame (100 cm wide, white) to the shopping bag. Done when: the shopping bag shows ${n} of the frame.`;
 
   /** `bags[k]` is the bag label on the page after k clicks (null = none). */
-  async function run(goal: string, decisions: Array<Record<string, unknown>>, bags: Array<string | null>, firstAppeared?: string) {
+  async function run(goal: string, decisions: Array<Record<string, unknown>>, bags: Array<string | null>, firstAppeared?: string, single = false) {
     stubFetchSequence([...decisions, DONE]);
     let performs = 0;
     const perform = vi.fn(async () => {
@@ -3657,7 +3657,7 @@ describe("quantity-reached gate", () => {
       perform,
       snapshot: async () => pageWith(bags[Math.min(performs, bags.length - 1)]),
     });
-    const t = await runBrowseTaskLoop(goal, 12, browser, undefined, undefined, undefined, undefined, { initialSnapshot: pageWith(bags[0]) });
+    const t = await runBrowseTaskLoop(goal, 12, browser, undefined, undefined, undefined, undefined, { initialSnapshot: pageWith(bags[0]) }, undefined, single ? undefined : { isSubGoal: true });
     return { t, perform };
   }
   const IKEA_BAGS = [null, "Shopping bag, 1 items", "Shopping bag, 2 items", "Shopping bag, 3 items", "Shopping bag, 4 items"];
@@ -3716,9 +3716,98 @@ describe("quantity-reached gate", () => {
   });
 
   it("N=1 with a first click that showed a new element blocks the repeat", async () => {
-    const { t, perform } = await run(SUBGOAL("1 unit"), [click(0), click(0)], [null, null], "Added to bag");
+    const { t, perform } = await run(SUBGOAL("1 unit"), [click(0), click(0)], [null, null], "Shopping bag, 1 items");
     expect(perform).toHaveBeenCalledTimes(1);
     expect(t.status).toBe("done");
     expect(t.reason).toContain("quantity 1 reached");
+  });
+
+  it("N=1: an appeared text without the number 1 does not arm the gate", async () => {
+    const { perform } = await run(SUBGOAL("1 unit"), [click(0), click(0)], [null, null], "Please select a size");
+    expect(perform).toHaveBeenCalledTimes(2);
+  });
+
+  it("an error click does not count as the first unit (error, then a real add)", async () => {
+    // Bag already holds 3. Click 1 only shows a validation message; click 2 is the real add (3→4).
+    const bags = ["Shopping bag, 3 items", "Shopping bag, 3 items", "Shopping bag, 4 items", "Shopping bag, 5 items", "Shopping bag, 6 items"];
+    const { t, perform } = await run(SUBGOAL("2 units"), [click(0), click(0), click(0), click(0), click(0)], bags, "Please select a size");
+    expect(perform).toHaveBeenCalledTimes(3);
+    expect(t.reason).toBe("quantity 2 reached (counter 4→5)");
+  });
+
+  it("ignores a counter jump larger than N (a price, not units)", async () => {
+    const bags = [null, "Shopping bag, 1 items", "Shopping bag, 41 items", "Shopping bag, 42 items", "Shopping bag, 43 items"];
+    const { t, perform } = await run(SUBGOAL("2 units"), [click(0), click(0), click(0), click(0), click(0)], bags, "Shopping bag, 1 items");
+    expect(perform).toHaveBeenCalledTimes(4);
+    expect(t.reason).toBe("quantity 2 reached (counter 42→43)");
+  });
+
+  it("follows the target through a relabel (Add to bag → Add to bag (1) → Add to bag (2))", async () => {
+    const bags = [null, "Shopping bag, 1 items", "Shopping bag, 2 items"];
+    const page = (k: number) => ({
+      url: "https://shop.test/p?variant=1#top",
+      title: "Product",
+      elements: [
+        { index: 0, tag: "button", label: k === 0 ? "Add to bag" : `Add to bag (${k})`, ops: ["CLICK"] },
+        ...(bags[Math.min(k, 2)] ? [{ index: 1, tag: "a", label: bags[Math.min(k, 2)], ops: ["CLICK"] }] : []),
+      ],
+      snapshotId: "s",
+      scroll: { y: 0 },
+    });
+    stubFetchSequence([click(0), click(0), click(0), click(0), DONE]);
+    let performs = 0;
+    const perform = vi.fn(async () => {
+      performs++;
+      return performs === 1 ? { changed: true, appeared: ["Shopping bag, 1 items"] } : { changed: true };
+    });
+    const browser = stubBrowser({ perform, snapshot: async () => page(performs) });
+    const t = await runBrowseTaskLoop(SUBGOAL("2 units"), 12, browser, undefined, undefined, undefined, undefined, { initialSnapshot: page(0) }, undefined, { isSubGoal: true });
+    expect(perform).toHaveBeenCalledTimes(2);
+    expect(t.reason).toBe("quantity 2 reached (counter 1→2)");
+  });
+
+  it("single-goal run: vetoes the click with a failed step and lets the policy continue", async () => {
+    const { t, perform } = await run(SUBGOAL("2 units"), [click(0), click(0), click(0)], IKEA_BAGS, "Shopping bag, 1 items", true);
+    expect(perform).toHaveBeenCalledTimes(2);
+    expect(t.status).toBe("done");
+    expect(t.reason).toBeUndefined();
+    expect(t.steps.at(-1)).toMatchObject({ operation: "CLICK", ok: false, label: "quantity 2 reached — not clicking again" });
+  });
+
+  it("identifies the clicked element by its own index, not its array position", async () => {
+    const sparse = (bag: string | null) => ({
+      ...pageWith(bag),
+      elements: [
+        { index: 5, tag: "button", label: ADD, ops: ["CLICK"] },
+        { index: 9, tag: "button", label: OTHER, ops: ["CLICK"] },
+        ...(bag ? [{ index: 12, tag: "a", label: bag, ops: ["CLICK"] }] : []),
+      ],
+    });
+    stubFetchSequence([click(5), click(5), click(5), DONE]);
+    let performs = 0;
+    const perform = vi.fn(async () => (++performs === 1 ? { changed: true, appeared: ["Shopping bag, 1 items"] } : { changed: true }));
+    const browser = stubBrowser({ perform, snapshot: async () => sparse(IKEA_BAGS[performs]) });
+    const t = await runBrowseTaskLoop(SUBGOAL("2 units"), 12, browser, undefined, undefined, undefined, undefined, { initialSnapshot: sparse(null) }, undefined, { isSubGoal: true });
+    expect(perform).toHaveBeenCalledTimes(2);
+    expect(t.reason).toBe("quantity 2 reached (counter 1→2)");
+  });
+
+  it('does not read a quantity from the "Does not count" clause', async () => {
+    const goal = "Put the PAX wardrobe frame in the shopping bag. Done when: the bag shows the frame. Does not count: 2 units of the shelf.";
+    const { perform } = await run(goal, [click(0), click(0), click(0), click(0)], IKEA_BAGS, "Shopping bag, 1 items");
+    expect(perform).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps the gate across a stall-recovery retry of the same sub-goal", async () => {
+    const refuse = { outcome: "retry", operation: "CLICK", confidence: 0.1, model: "jev", reason: "BLOCKED: no candidate fits CLICK" };
+    stubPlanAndSteps([SUBGOAL("2 units"), "two"], [click(0), click(0), refuse, refuse, refuse, click(0), DONE]);
+    let performs = 0;
+    const perform = vi.fn(async () => (++performs === 1 ? { changed: true, appeared: ["Shopping bag, 1 items"] } : { changed: true }));
+    const page = () => ({ ...pageWith(IKEA_BAGS[Math.min(performs, 4)]), url: "https://shop.test/p" });
+    const open = vi.fn(async () => ({}));
+    const t = await runBrowseTask("g", 12, stubBrowser({ perform, open, snapshot: async () => page() }), undefined, undefined, "https://shop.test/p");
+    expect(open).toHaveBeenCalledTimes(2);
+    expect(perform).toHaveBeenCalledTimes(2);
+    expect(t.subgoals?.[0].status).toBe("done");
   });
 });

@@ -1766,8 +1766,16 @@ above, without touching the human cursor overlay:
 `src/loop/quantityGate.ts`, wired in `runBrowseTaskLoop`. A sub-goal that asks
 for N units ("Add 2 units ...") used to end with more, because the step policy
 sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
-The loop reads N from the action part (then the Done-when part), counts the
-units each click target produced from the `counter a→b` / `appeared:` effect
-notes (deltas, not absolute values), and finishes the sub-goal as done instead
-of repeating a CLICK on a target that already reached N. It fires only if a
-counter effect was seen, or N is 1 and the first click showed a new element.
+
+- N comes from the action part, else the "Done when" clause (never "Does not
+  count"); exactly one quantity, 1..20, and not a measure or price.
+- Units per target = sum of `counter a→b` deltas with 0 < delta ≤ N, plus 1 if
+  an earlier `appeared:` text on that target holds the first counter's `a` as
+  a token (or "1" when N is 1). An error toast or modal counts nothing.
+- A target is origin+pathname + normalised label; state follows a relabel
+  ("Add to bag" → "Add to bag (1)"). The clicked element is found by its own
+  `.index`, the same lookup the effect code uses.
+- In a sub-goal, a repeat CLICK on a saturated target ends the sub-goal as
+  done. In a single-goal run it is vetoed instead (a failed step in history),
+  so the rest of the task still runs.
+- The gate lives on `HistoryShare` and survives the stall-recovery retry.

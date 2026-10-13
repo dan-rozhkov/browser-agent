@@ -67,53 +67,81 @@ export function parseTargetQuantity(action: string, condition: string): number |
 }
 
 interface TargetUnits {
-  units: number;
-  effects: number;
+  /** Sum of the valid counter deltas seen on this target. */
+  deltas: number;
+  /** Appeared texts of earlier effects, kept until the first counter shows. */
+  appeared: string[];
+  /** The first valid counter's start value was named by an earlier appeared text: that click was the first add. */
+  inferredFirst: boolean;
   counterSeen: boolean;
-  firstAppeared: boolean;
   lastCounter?: string;
+  /** N=1 only: a first appeared text names the number 1. */
+  firstShowedOne: boolean;
+  effects: number;
 }
 
 const COUNTER = /counter (-?\d+)→(-?\d+)(?![\d,])/;
+const APPEARED = /appeared: "([^"]*)"/g;
 
-const keyOf = (label: string): string => label.replace(/\s+/g, " ").trim().toLowerCase();
+/** Origin + pathname: the same page across hash, query and SPA state. */
+function pageKey(url: string | undefined): string {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return url.split(/[?#]/)[0];
+  }
+}
+
+const keyOf = (url: string | undefined, label: string): string =>
+  `${pageKey(url)}\u0000${label.replace(/\s+/g, " ").trim().toLowerCase()}`;
+
+const hasToken = (text: string, n: number): boolean => new RegExp(`(?<!\\d)${n}(?!\\d)`).test(text);
 
 export interface QuantityGate {
-  /** Feed the final label of a landed CLICK once its effect note is known. */
-  observe(targetLabel: string, stepLabel: string): void;
-  /** A reason string when clicking `targetLabel` again must not happen. */
-  blockedReason(targetLabel: string): string | null;
+  readonly target: number;
+  /** Feed the final label of a landed CLICK once its effect note is known.
+   * `became` is the target's relabel, if the effect showed one: state follows it. */
+  observe(at: { url?: string; label: string }, stepLabel: string, became?: { old: string; new: string }): void;
+  /** A reason string when clicking `label` on `url` again must not happen. */
+  blockedReason(url: string | undefined, label: string): string | null;
 }
 
 export function createQuantityGate(target: number): QuantityGate {
   const byTarget = new Map<string, TargetUnits>();
   return {
-    observe(targetLabel, stepLabel) {
-      const at = stepLabel.indexOf(EFFECT_PREFIX);
-      const key = keyOf(targetLabel);
-      if (at < 0 || !key) return;
-      const effect = stepLabel.slice(at + EFFECT_PREFIX.length);
-      const state = byTarget.get(key) ?? { units: 0, effects: 0, counterSeen: false, firstAppeared: false };
+    target,
+    observe(at, stepLabel, became) {
+      const key = keyOf(at.url, at.label);
+      const idx = stepLabel.indexOf(EFFECT_PREFIX);
+      if (idx < 0 || !at.label.trim()) return;
+      const effect = stepLabel.slice(idx + EFFECT_PREFIX.length);
+      const state = byTarget.get(key) ?? { deltas: 0, appeared: [], inferredFirst: false, counterSeen: false, firstShowedOne: false, effects: 0 };
       const counter = COUNTER.exec(effect);
-      const first = state.effects === 0;
-      if (counter) {
-        const delta = Number(counter[2]) - Number(counter[1]);
+      const a = counter ? Number(counter[1]) : NaN;
+      const delta = counter ? Number(counter[2]) - a : 0;
+      // A jump past N is a price or subtotal, not units.
+      if (counter && delta > 0 && delta <= target) {
+        if (!state.counterSeen) state.inferredFirst = state.appeared.some((t) => hasToken(t, a));
         state.counterSeen = true;
+        state.deltas += delta;
         state.lastCounter = `${counter[1]}→${counter[2]}`;
-        // Deltas, not absolute values: the counter may hold older items.
-        state.units += delta > 0 ? delta : first ? 1 : 0;
-      } else if (first) {
-        state.units = 1;
-        state.firstAppeared = /appeared: /.test(effect);
       }
+      const texts = [...effect.matchAll(APPEARED)].map((m) => m[1]);
+      if (!state.counterSeen) state.appeared.push(...texts);
+      if (state.effects === 0 && target === 1 && texts.some((t) => hasToken(t, 1))) state.firstShowedOne = true;
       state.effects++;
-      byTarget.set(key, state);
+      byTarget.delete(key);
+      byTarget.set(became?.new.trim() ? keyOf(at.url, became.new) : key, state);
     },
-    blockedReason(targetLabel) {
-      const state = byTarget.get(keyOf(targetLabel));
-      if (!state || state.units < target) return null;
-      if (state.counterSeen) return `quantity ${target} reached (counter ${state.lastCounter})`;
-      if (target === 1 && state.firstAppeared) return "quantity 1 reached (first click showed a new element)";
+    blockedReason(url, label) {
+      const state = byTarget.get(keyOf(url, label));
+      if (!state) return null;
+      if (state.counterSeen && state.deltas + (state.inferredFirst ? 1 : 0) >= target) {
+        return `quantity ${target} reached (counter ${state.lastCounter})`;
+      }
+      if (target === 1 && state.firstShowedOne) return "quantity 1 reached (first click showed the number 1)";
       return null;
     },
   };
