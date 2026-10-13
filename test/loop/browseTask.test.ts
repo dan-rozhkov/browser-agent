@@ -713,6 +713,87 @@ describe("browse_task", () => {
     expect(transcript.steps).toEqual([{ operation: "PRESS_ESCAPE", label: "press Escape", ok: true }]);
   });
 
+  describe("closes an open popup before accepting DONE", () => {
+    const pageWith = (elements: unknown[], extra: Record<string, unknown> = {}): SnapshotResult =>
+      ({
+        url: "https://example.com/list",
+        title: "List",
+        elements,
+        snapshotId: "snap-popup",
+        ...extra,
+      }) as SnapshotResult;
+    const OPTION = { index: 0, tag: "div", role: "option", label: "Red", ops: ["CLICK"] };
+    const BUTTON = { index: 0, tag: "button", label: "Apply", ops: ["CLICK"] };
+    const OPEN_MENU = { index: 1, tag: "button", role: "combobox", label: "Colors", expanded: true, ops: ["CLICK"] };
+    const CLOSED_MENU = { ...OPEN_MENU, expanded: false };
+    const escapeCalls = (act: ReturnType<typeof vi.fn>) =>
+      act.mock.calls.filter((c) => (c[0] as { key?: string }).key === "Escape");
+
+    it("presses Escape between a choice CLICK and DONE when a popup is still open, then accepts DONE", async () => {
+      const fetchMock = stubFetchSequence([CLICK_STEP, DONE, DONE]);
+      const act = vi.fn(async () => ({}));
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([OPTION, OPEN_MENU]) });
+      const t = await runBrowseTaskLoop("filter by red", 12, browser);
+
+      expect(t.status).toBe("done");
+      expect(act).toHaveBeenCalledTimes(1);
+      expect(act).toHaveBeenCalledWith({ action: "press", key: "Escape" });
+      expect(t.steps.map((s) => s.operation)).toEqual(["CLICK", "PRESS_ESCAPE"]);
+      expect(t.steps[1]).toMatchObject({ label: expect.stringContaining("close the open popup"), ok: true });
+      // CLICK, first DONE (intercepted), second DONE (accepted).
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it("also treats a listed option as an open popup", async () => {
+      stubFetchSequence([CLICK_STEP, DONE, DONE]);
+      const act = vi.fn(async () => ({}));
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([OPTION]) });
+      const t = await runBrowseTaskLoop("filter by red", 12, browser);
+      expect(t.status).toBe("done");
+      expect(escapeCalls(act)).toHaveLength(1);
+    });
+
+    it("does not press Escape when nothing is open", async () => {
+      stubFetchSequence([CLICK_STEP, DONE]);
+      const act = vi.fn(async () => ({}));
+      const checkbox = { index: 0, tag: "input", role: "checkbox", label: "Red", ops: ["CLICK"] };
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([checkbox, CLOSED_MENU]) });
+      const t = await runBrowseTaskLoop("tick red", 12, browser);
+      expect(t.status).toBe("done");
+      expect(act).not.toHaveBeenCalled();
+    });
+
+    it("presses Escape at most once per run: a second DONE is accepted", async () => {
+      stubFetchSequence([CLICK_STEP, DONE]);
+      const act = vi.fn(async () => ({}));
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([OPTION, OPEN_MENU]) });
+      const t = await runBrowseTaskLoop("filter by red", 12, browser);
+      expect(t.status).toBe("done");
+      expect(escapeCalls(act)).toHaveLength(1);
+    });
+
+    it("does not press Escape when the preceding step was not a choice click", async () => {
+      stubFetchSequence([CLICK_STEP, DONE]);
+      const act = vi.fn(async () => ({}));
+      const browser = stubBrowser({ act, snapshot: async () => pageWith([BUTTON, OPEN_MENU]) });
+      const t = await runBrowseTaskLoop("press apply", 12, browser);
+      expect(t.status).toBe("done");
+      expect(act).not.toHaveBeenCalled();
+    });
+
+    it("does not press Escape when a dialog is open", async () => {
+      stubFetchSequence([CLICK_STEP, DONE]);
+      const act = vi.fn(async () => ({}));
+      const browser = stubBrowser({
+        act,
+        snapshot: async () => pageWith([OPTION, OPEN_MENU], { modal: "Confirm your choice" }),
+      });
+      const t = await runBrowseTaskLoop("filter by red", 12, browser);
+      expect(t.status).toBe("done");
+      expect(act).not.toHaveBeenCalled();
+    });
+  });
+
   it("dispatches HOVER as browser.act({action:'hover', index, snapshotId}) using the current step's snapshotId", async () => {
     stubFetchSequence([HOVER_STEP, DONE]);
 
@@ -1791,6 +1872,17 @@ describe("browse_task", () => {
       expect(extractUrlFromGoal("open https://example.com/a)., please")).toBe(
         "https://example.com/a"
       );
+    });
+
+    it.each([
+      ["open (https://example.com/start):", "https://example.com/start"],
+      ["is it https://example.com/a?", "https://example.com/a"],
+      ["see (https://example.com/a).", "https://example.com/a"],
+      ["go to https://example.com/a:", "https://example.com/a"],
+      ["(see https://en.wikipedia.org/wiki/Foo_(bar)).", "https://en.wikipedia.org/wiki/Foo_(bar)"],
+      ["open https://example.com/search?q=a", "https://example.com/search?q=a"],
+    ])("strips mixed trailing punctuation: %s", (goal, expected) => {
+      expect(extractUrlFromGoal(goal)).toBe(expected);
     });
 
     it("returns undefined when no URL is present", () => {
