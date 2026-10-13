@@ -714,6 +714,62 @@ describe("browse_task", () => {
     expect(transcript.steps).toEqual([{ operation: "PRESS_ESCAPE", label: "press Escape", ok: true }]);
   });
 
+  describe("does not toggle a picker option back off", () => {
+    const optionAt = (checked: boolean) => ({ index: 0, tag: "div", role: "option", label: "Red", checked, ops: ["CLICK"] });
+    const MENU = { index: 1, tag: "button", role: "combobox", label: "Colors", expanded: true, ops: ["CLICK"] };
+    const pageOf = (elements: unknown[]): SnapshotResult =>
+      ({ url: "https://example.com/list", title: "List", elements, snapshotId: "snap-t" }) as SnapshotResult;
+    const escapes = (act: ReturnType<typeof vi.fn>) =>
+      act.mock.calls.filter((c) => (c[0] as { key?: string }).key === "Escape");
+    /** A page whose option flips on every landed click. */
+    const togglingPage = (startChecked: boolean) => {
+      let on = startChecked;
+      const perform = vi.fn(async () => {
+        on = !on;
+        return {};
+      });
+      const snapshot = async () => pageOf([optionAt(on), MENU]);
+      return { perform, snapshot };
+    };
+
+    it("suppresses a second click on an option our own click turned on, then closes the popup once", async () => {
+      stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE, DONE]);
+      const { perform, snapshot } = togglingPage(false);
+      const act = vi.fn(async () => ({}));
+      const t = await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot, act }));
+
+      expect(t.status).toBe("done");
+      expect(perform).toHaveBeenCalledTimes(1);
+      expect(t.steps.map((s) => s.operation)).toEqual(["CLICK", "CLICK", "PRESS_ESCAPE"]);
+      expect(t.steps[1]).toMatchObject({ ok: true, via: "rule", label: expect.stringContaining("already selected") });
+      expect(escapes(act)).toHaveLength(1);
+    });
+
+    it("ends an insisting policy as stalled instead of looping", async () => {
+      stubFetchSequence([CLICK_STEP]);
+      const { perform, snapshot } = togglingPage(false);
+      const t = await runBrowseTaskLoop("filter by red", 30, stubBrowser({ perform, snapshot }));
+      expect(perform).toHaveBeenCalledTimes(1);
+      expect(t.status).toBe("stalled");
+    });
+
+    it("does not suppress when the sub-goal asks to uncheck", async () => {
+      stubFetchSequence([CLICK_STEP, CLICK_STEP, DONE, DONE]);
+      const { perform, snapshot } = togglingPage(false);
+      const t = await runBrowseTaskLoop("Uncheck Red", 12, stubBrowser({ perform, snapshot }));
+      expect(perform).toHaveBeenCalledTimes(2);
+      expect(t.steps.some((s) => /already selected/.test(s.label))).toBe(false);
+    });
+
+    it("does not suppress an option the page checked itself", async () => {
+      stubFetchSequence([CLICK_STEP, DONE, DONE]);
+      const { perform, snapshot } = togglingPage(true);
+      const t = await runBrowseTaskLoop("filter by red", 12, stubBrowser({ perform, snapshot }));
+      expect(perform).toHaveBeenCalledTimes(1);
+      expect(t.steps.some((s) => /already selected/.test(s.label))).toBe(false);
+    });
+  });
+
   describe("closes an open popup before accepting DONE", () => {
     const pageWith = (elements: unknown[], extra: Record<string, unknown> = {}): SnapshotResult =>
       ({
@@ -1165,6 +1221,52 @@ describe("browse_task", () => {
     expect(transcript.status).toBe("stalled");
     expect(transcript.steps.every((step) => step.ok === false)).toBe(true);
     expect(transcript.steps[0]!.label).toMatch(/no effect/);
+  });
+
+  // A click that opened a new tab: the controller reports changed:false for the
+  // page it left, plus openedTab. That landed.
+  describe("a click that opened a new tab", () => {
+    const refuse = { outcome: "retry", operation: "CLICK", confidence: 0.1, model: "jev", reason: "BLOCKED: no candidate fits CLICK" };
+
+    it("is a landed step (no '(no effect)') and does not stall the run behind two refusals on the new page", async () => {
+      stubFetchSequence([CLICK_STEP, refuse, refuse, DONE]);
+      const perform = vi.fn(async () => ({ changed: false, openedTab: { url: "https://example.com/item/1", title: "Item" } }));
+      const t = await runBrowseTaskLoop("open the item", 12, stubBrowser({ perform }));
+
+      expect(t.status).toBe("done");
+      expect(t.steps[0]).toMatchObject({ operation: "CLICK", ok: true, label: "Accept all → opened tab: Item" });
+      expect(t.steps[0]!.label).not.toMatch(/no effect/);
+    });
+
+    it("is a landed step on the act path too", async () => {
+      stubFetchSequence([PRESS_ESCAPE_STEP, DONE]);
+      const act = vi.fn(async () => ({ changed: false, openedTab: { url: "https://example.com/x", title: "" } }));
+      const t = await runBrowseTaskLoop("go", 12, stubBrowser({ act }));
+      expect(t.steps[0]).toMatchObject({ ok: true });
+      expect(t.steps[0]!.label).toContain("→ opened tab: https://example.com/x");
+      expect(t.steps[0]!.label).not.toMatch(/no effect/);
+    });
+
+    it("is a landed step on the cache replay path", async () => {
+      const key = buildStepCacheKey("open the item", EXAMPLE_SNAPSHOT.url, EXAMPLE_SNAPSHOT.title, EXAMPLE_SNAPSHOT.elements, []);
+      writeStepCacheEntry(store, key, "open the item", EXAMPLE_SNAPSHOT.elements, {
+        operation: "CLICK",
+        target: { labelHash: hashCachedLabel("Accept all"), tag: "button" },
+      });
+      stubFetchSequence([DONE]);
+      const perform = vi.fn(async () => ({ changed: false, openedTab: { url: "https://example.com/item/1", title: "Item" } }));
+      const t = await runBrowseTaskLoop("open the item", 12, stubBrowser({ perform }));
+
+      expect(t.cacheHits).toBe(1);
+      expect(t.steps[0]).toMatchObject({ operation: "CLICK", ok: true, via: "cache", label: "Accept all → opened tab: Item" });
+    });
+
+    it("still counts changed:false without openedTab as no effect", async () => {
+      stubFetchSequence([CLICK_STEP]);
+      const perform = vi.fn(async () => ({ changed: false, openedTab: null }));
+      const t = await runBrowseTaskLoop("click", 12, stubBrowser({ perform }));
+      expect(t.status).toBe("stalled");
+    });
   });
 
   // browse-speed-contract.md, "Frontend" item 4.

@@ -839,6 +839,15 @@ function isNoEffectResult(value: unknown): boolean {
   return (value as { changed?: unknown }).changed === false;
 }
 
+/** A click that opened a new tab reports `changed: false` for the OLD page but
+ * did land: the controller followed the new tab (`openedTab: { url, title }`).
+ * Only a present object counts. */
+function hasOpenedTab(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const tab = (value as { openedTab?: unknown }).openedTab;
+  return !!tab && typeof tab === "object";
+}
+
 /** Browse-speed contract (2026-09-24), frontend item 2: a `changed: false`
  * result (see isNoEffectResult above) is NOT actually unproductive when it
  * also reports `pageChanged: true` — the acted-on element's own signature
@@ -920,7 +929,7 @@ async function replayCachedStep(
     const performed = await browser.perform(performArgs);
     const rejected = resultError(performed);
     if (rejected) return { ok: false, label: rejected };
-    const noEffectRaw = isNoEffectResult(performed);
+    const noEffectRaw = isNoEffectResult(performed) && !hasOpenedTab(performed);
     const pageUpdate = noEffectRaw ? describePageUpdate(performed) : null;
     if (noEffectRaw && !pageUpdate) return { ok: false, label: "(no effect)" };
     const baseLabel = targetLabel ?? "";
@@ -1311,6 +1320,38 @@ export async function runBrowseTaskLoop(
    * (see pickerClickOf) — a picker may still be open and apply
    * its selection only once closed. Any other landed step clears it. */
   let lastPickerClick: PickerClick | null = null;
+  /** Toggle controls (role+label) this run's own landed click turned ON. A
+   * second click on one still checked would toggle it back off. */
+  const turnedOn = new Set<string>();
+  /** Consecutive clicks suppressed by that guard (a policy that insists). */
+  let toggleSuppressed = 0;
+  /** True when the sub-goal action asks to remove a selection. */
+  const wantsUncheck = UNCHECK_INTENT.test(subGoalAction(goal));
+  /** Records the "already selected" step instead of a toggling click. */
+  const suppressToggleClick = (snapshot: SnapshotResult, index: number | undefined): Transcript | typeof SUPPRESSED | null => {
+    const toggle = toggleTargetOf(snapshot, index);
+    if (wantsUncheck || !toggle || toggle.checked !== true || !turnedOn.has(toggle.key)) return null;
+    toggleSuppressed++;
+    const stalled = note({
+      operation: "CLICK",
+      label: `${toggle.label} — already selected, not clicking again`,
+      // The first suppression is a rule step; a policy that insists counts as unproductive.
+      ok: toggleSuppressed <= 1,
+      index,
+      via: "rule",
+    });
+    if (stalled) return stalled;
+    lastPickerClick = pickerClickOf(snapshot, index);
+    return SUPPRESSED;
+  };
+  /** After a landed CLICK on a toggle: remember whether it turned on or off. */
+  const trackToggle = (snapshot: SnapshotResult, index: number | undefined): void => {
+    toggleSuppressed = 0;
+    const toggle = toggleTargetOf(snapshot, index);
+    if (!toggle) return;
+    if (toggle.checked === false) turnedOn.add(toggle.key);
+    else if (toggle.checked === true) turnedOn.delete(toggle.key);
+  };
   /** One-shot guard: the loop closes an open popup at most once before
    * accepting DONE (a second DONE is taken as is). */
   let popupCloseTried = false;
@@ -1563,6 +1604,12 @@ export async function runBrowseTaskLoop(
               continue;
             }
             if (stopped) return stopped;
+            const suppressed = suppressToggleClick(snapshot, cachedIndex);
+            if (suppressed === SUPPRESSED) {
+              deleteCacheEntry(storage, stepCacheKey);
+              continue;
+            }
+            if (suppressed) return suppressed;
           }
           const replay = await replayCachedStep(
             browser,
@@ -1594,6 +1641,7 @@ export async function runBrowseTaskLoop(
             unproductive = 0;
             lastLandedOperation = cached.operation;
             lastPickerClick = cached.operation === "CLICK" ? pickerClickOf(snapshot, cachedIndex) : null;
+            if (cached.operation === "CLICK") trackToggle(snapshot, cachedIndex);
             if (cached.operation === "TYPE_TEXT" && cachedIndex != null) {
               lastTypeText = { index: cachedIndex, text: readTextFromRange(goal, cached.textRange) ?? "" };
             }
@@ -1907,7 +1955,7 @@ export async function runBrowseTaskLoop(
         // "no progress" case the consecutive-unproductive-steps counter
         // exists to catch, so it must count the same way a rejected act
         // does, not as a landed action.
-        const noEffectRaw = !rejected && isNoEffectResult(acted);
+        const noEffectRaw = !rejected && isNoEffectResult(acted) && !hasOpenedTab(acted);
         const pageUpdate = noEffectRaw ? describePageUpdate(acted) : null;
         const noEffect = noEffectRaw && !pageUpdate;
         const stalled = note(
@@ -1938,6 +1986,9 @@ export async function runBrowseTaskLoop(
       const stopped = quantityStop(actedElementOf(snapshot, decision.index), snapshot.url);
       if (stopped === "veto") continue;
       if (stopped) return stopped;
+      const suppressed = suppressToggleClick(snapshot, decision.index);
+      if (suppressed === SUPPRESSED) continue;
+      if (suppressed) return suppressed;
     }
 
     const performArgs: {
@@ -1970,7 +2021,9 @@ export async function runBrowseTaskLoop(
       // landed nothing — same "no progress" case the act path already
       // counts via isNoEffectResult (see that function's comment), now
       // applied to perform too.
-      const noEffectRaw = !rejected && isNoEffectResult(performed);
+      // A click that opened (and switched to) a new tab landed: `changed:
+      // false` describes the page it left.
+      const noEffectRaw = !rejected && isNoEffectResult(performed) && !hasOpenedTab(performed);
       // browse-speed-contract.md, "Frontend" item 2: `changed: false` +
       // `pageChanged: true` (see describePageUpdate's doc comment) is not
       // the "no progress" case — something the user would see did happen,
@@ -2010,6 +2063,7 @@ export async function runBrowseTaskLoop(
       if (!rejected && !noEffect && lastRecorded) {
         markPageState((lastRecorded as { step: TranscriptStep }).step, operation, snapshot, decision.index, lastUrl);
         lastPickerClick = operation === "CLICK" ? pickerClickOf(snapshot, decision.index) : null;
+        if (operation === "CLICK") trackToggle(snapshot, decision.index);
       }
       // A landed CLICK: the next snapshot tells what it did (effect note).
       if (operation === "CLICK" && !rejected && !noEffect && (lastRecorded as { step: TranscriptStep; hist: StepHistoryEntry } | null)) {
@@ -2342,6 +2396,31 @@ interface PickerClick {
   label: string;
   /** A checkbox: no "still listed" proof, only an expanded control counts. */
   checkbox: boolean;
+}
+
+const SUPPRESSED = Symbol("toggle click suppressed");
+const UNCHECK_INTENT = /(?<!\p{L})(?:remove|uncheck|un-check|deselect|de-select|unselect|clear|turn\s+off|untick|снять|убрать|сбросить|отключи)/iu;
+const TOGGLE_ROLES = new Set(["option", "menuitemcheckbox", "menuitemradio", "checkbox", "switch"]);
+
+/** The element at `index` when a click toggles it (a checkable choice role,
+ * or a native checkbox/radio), with its `checked` state in the snapshot. */
+function toggleTargetOf(
+  snapshot: SnapshotResult,
+  index: number | undefined
+): { key: string; label: string; checked: boolean | undefined } | null {
+  if (index == null) return null;
+  const el = findElementByIndex(snapshot.elements, index) as
+    | { role?: unknown; tag?: unknown; inputType?: unknown; label?: unknown; checked?: unknown }
+    | undefined;
+  if (!el || typeof el.label !== "string") return null;
+  const role = elementRole(el);
+  const native = !role && el.tag === "input" && (el.inputType === "checkbox" || el.inputType === "radio");
+  if (!TOGGLE_ROLES.has(role) && !native) return null;
+  return {
+    key: `${role || String(el.inputType)}\u0000${el.label}`,
+    label: el.label,
+    checked: typeof el.checked === "boolean" ? el.checked : undefined,
+  };
 }
 
 const PICKER_LISTED_ROLES = new Set(["option", "menuitemcheckbox"]);

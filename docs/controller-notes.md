@@ -1787,3 +1787,8 @@ sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
   its entry); a third attempt ends the run as done.
 - The gate lives on `HistoryShare` and survives the stall-recovery retry. The
   retry does not carry a pending (not yet observed) effect of the last click.
+
+## Loop: opened-tab clicks and picker toggles
+
+- A click that opens a new tab returns `{ changed: false, openedTab }`. `changed:false` describes the page left behind; the loop treats a present `openedTab` as a landed step (ok, no "(no effect)") on the perform, act and cache-replay paths. The unproductive counter resets, so the policy gets fresh decisions on the new page.
+- A role=option/menuitem*/checkbox/switch (or native checkbox/radio) already `checked` after the loop's own landed click is not clicked again (a second click toggles it off). The loop records "already selected, not clicking again"; a policy that insists is counted unproductive. Sub-goals that ask to remove/uncheck/clear are exempt.
