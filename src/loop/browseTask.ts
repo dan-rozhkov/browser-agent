@@ -445,7 +445,7 @@ export function extractUrlFromGoal(goal: string): string | undefined {
   const CLOSERS: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
   while (url.length > 0) {
     const last = url[url.length - 1]!;
-    if (",.;!".includes(last)) {
+    if (",.;!:?".includes(last)) {
       url = url.slice(0, -1);
       continue;
     }
@@ -1275,6 +1275,13 @@ export async function runBrowseTaskLoop(
    * happens to have focus on, not the field Jev meant). `null` until the
    * first step lands. */
   let lastLandedOperation: string | null = null;
+  /** True while the most recent landed step was a CLICK on a choice control
+   * (see isChoiceElement) — a menu-style picker may still be open and apply
+   * its selection only once closed. Any other landed step clears it. */
+  let lastLandedChoiceClick = false;
+  /** One-shot guard: the loop closes an open popup at most once before
+   * accepting DONE (a second DONE is taken as is). */
+  let popupCloseTried = false;
   /** Bench finding B: Jev kept re-typing the same query into the search box
    * instead of pressing Enter to submit it. Tracks the index (and text) of
    * the element a landed TYPE_TEXT just filled, so the very next decision
@@ -1358,6 +1365,7 @@ export async function runBrowseTaskLoop(
     if (entry.ok) {
       unproductive = 0;
       lastLandedOperation = entry.operation;
+      lastLandedChoiceClick = false;
       return null;
     }
     unproductive++;
@@ -1511,6 +1519,7 @@ export async function runBrowseTaskLoop(
             }
             unproductive = 0;
             lastLandedOperation = cached.operation;
+            lastLandedChoiceClick = cached.operation === "CLICK" && isChoiceElement(snapshot, cachedIndex);
             if (cached.operation === "TYPE_TEXT" && cachedIndex != null) {
               lastTypeText = { index: cachedIndex, text: readTextFromRange(goal, cached.textRange) ?? "" };
             }
@@ -1608,6 +1617,38 @@ export async function runBrowseTaskLoop(
     const terminalReason = decision.cascade
       ? `${decision.reason ?? ""}${decision.reason ? " " : ""}(via cascade)`
       : decision.reason;
+    // A choice click can leave a menu-style picker open that applies its
+    // selection only once closed; finishing now would lose it. Close the
+    // popup first (once), then let the policy decide again on a fresh
+    // snapshot. Skipped when a dialog is in play (Escape could dismiss it).
+    if (
+      decision.outcome === "done" &&
+      lastLandedChoiceClick &&
+      !popupCloseTried &&
+      modalFor(snapshot) === undefined &&
+      hasOpenPopup(snapshot)
+    ) {
+      popupCloseTried = true;
+      if (signal?.aborted) return cancelledResult();
+      let escLabel = "close the open popup before finishing";
+      let escOk = true;
+      try {
+        const acted = await browser.act({ action: "press", key: "Escape" });
+        const rejected = resultError(acted);
+        if (rejected) {
+          escLabel = rejected;
+          escOk = false;
+        } else {
+          escLabel = `${escLabel}${describeSideEffects(acted)}`;
+        }
+      } catch (err) {
+        escLabel = err instanceof Error ? err.message : "act failed";
+        escOk = false;
+      }
+      const stalled = note({ operation: "PRESS_ESCAPE", label: escLabel, ok: escOk, via: "rule" });
+      if (stalled) return stalled;
+      continue;
+    }
     // The final step's capture info would otherwise be dropped (no note()).
     if ((decision.outcome === "done" || decision.outcome === "blocked") && pendingShot) {
       steps.push({
@@ -1888,6 +1929,7 @@ export async function runBrowseTaskLoop(
       if (stalled) return stalled;
       if (!rejected && !noEffect && lastRecorded) {
         markPageState((lastRecorded as { step: TranscriptStep }).step, operation, snapshot, decision.index, lastUrl);
+        lastLandedChoiceClick = operation === "CLICK" && isChoiceElement(snapshot, decision.index);
       }
       // A landed CLICK: the next snapshot tells what it did (effect note).
       if (operation === "CLICK" && !rejected && !noEffect && (lastRecorded as { step: TranscriptStep; hist: StepHistoryEntry } | null)) {
@@ -2192,6 +2234,28 @@ const pageStateSteps = new WeakMap<TranscriptStep, string>();
 const CHOICE_ROLES = new Set([
   "option", "menuitemradio", "menuitemcheckbox", "checkbox", "radio", "switch", "treeitem", "gridcell",
 ]);
+
+function elementRole(el: { role?: unknown } | undefined): string {
+  return typeof el?.role === "string" ? el.role.toLowerCase() : "";
+}
+
+/** The element at `index` is a choice control (see CHOICE_ROLES). */
+function isChoiceElement(snapshot: SnapshotResult, index: number | undefined): boolean {
+  if (index == null) return false;
+  return CHOICE_ROLES.has(elementRole(findElementByIndex(snapshot.elements, index) as { role?: unknown } | undefined));
+}
+
+/** The snapshot shows an open popup: an element reporting `expanded: true`,
+ * or a listed option / menu item. */
+function hasOpenPopup(snapshot: SnapshotResult): boolean {
+  return snapshot.elements.some((raw) => {
+    const el = raw as { role?: unknown; expanded?: unknown } | null;
+    if (!el || typeof el !== "object") return false;
+    if (el.expanded === true) return true;
+    const role = elementRole(el);
+    return role === "option" || role.startsWith("menuitem");
+  });
+}
 
 /** Record `step` in pageStateSteps when it set a value or a choice: TYPE_TEXT,
  * SELECT, or a CLICK on a choice control — a choice role, or a role-less

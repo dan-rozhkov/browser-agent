@@ -1740,3 +1740,23 @@ above, without touching the human cursor overlay:
   after the baseline is captured (started and finished quickly) — the wait
   must settle once the *new* request goes quiet, not wait out the stale
   one for the full budget.
+
+## 2026-10-13: same-length value changes and sortable column headers
+
+- **False "no effect" on a same-length value change.** The effect signature
+  kept only value *lengths*, and the MutationObserver cannot see `.value`
+  property writes, so typing "08" over "06", or a stepper rewriting a sibling
+  input 06 -> 07, reported `changed: false`. The scoped signature now carries
+  `valueHash`, the page signature `focusedValueHash` and `controlsHash` (value,
+  checked, aria-valuenow/-checked/-selected of up to 150 visible form
+  controls, scoped to the open dialog when there is one). `diffSignatures`
+  reports a `controls` change kind and `controls`/`value` gate `changed`. Only
+  numeric hashes leave the page, never values; `type=password` fields keep
+  length only (hash 0, skipped in `controlsHash`). Hash fields are optional
+  in `isScopedSignature`/`isPageSignature`, so older shapes compare as
+  "no change" (undefined === undefined). Tests: `test/controller/pageScripts.dom.test.ts`.
+- **Sortable column headers were not actionable.** `penCandidates` now lists a
+  `th` / `[role=columnheader]` that has `aria-sort`, an `onclick`, or a
+  computed `cursor: pointer` (cap 40, scan cap 300). A header that contains a
+  button/link/input is not listed itself: the inner control is the target
+  (no duplicate). Plain header cells are still not listed.
