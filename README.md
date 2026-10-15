@@ -100,7 +100,7 @@ await close();
 
 | Import | Contents |
 |---|---|
-| `@sideform/browser-agent` | controller + policy + loop barrels (no adapters) |
+| `@sideform/browser-agent` | controller + policy + loop + fixture barrels (no adapters) |
 | `@sideform/browser-agent/controller` | controller layer |
 | `@sideform/browser-agent/policy` | policy layer |
 | `@sideform/browser-agent/loop` | loop layer |
@@ -110,6 +110,7 @@ await close();
 | `@sideform/browser-agent/adapters/http-backend` | `createHttpBackend` |
 | `@sideform/browser-agent/adapters/local-backend` | `createLocalBackend` |
 | `@sideform/browser-agent/adapters/controller-bridge` | `controllerBridge` |
+| `@sideform/browser-agent/fixture` | `PageFixture` types, `parsePageFixture`, `applyFixture`, `captureFixture` (isomorphic, no zod) |
 | `@sideform/browser-agent/agent` | the browse agent mode: prompt, tool definitions, limits, session core (zod only, no `ai`) |
 | `@sideform/browser-agent/agent/session` | the light part of `/agent`: limits, result helpers, session core, `singleUseTool`. No zod, no schemas, no descriptions: use it in a browser bundle |
 | `@sideform/browser-agent/agent/ai-sdk` | `runBrowseAgent` (peer: `ai`) |
@@ -420,6 +421,31 @@ The tool executor now serves Pen Editor and `runBrowseAgent` alike. For
 - **Unchanged**: `element` alone is still refused (before any bridge call).
   A batch with no locator has no stale-order check; an `element` entry stops
   the batch at its own error.
+
+## Page fixtures
+
+A `PageFixture` is the state of a browser before a task: cookies, localStorage,
+sessionStorage, the start URL, extra tabs and deterministic setup steps (`goto`,
+`click`, `type`, `press`, `waitFor`, `wait`; no LLM). Design:
+`docs/specs/2026-10-15-page-fixture-design.md`.
+
+```ts
+import { applyFixture, captureFixture, parsePageFixture } from "@sideform/browser-agent/fixture";
+
+const parsed = parsePageFixture(JSON.parse(text));          // { ok, value } | { ok, error }
+await controller.applyFixture(fixture);                     // under the controller lock; { ok, url, title, summary }
+const saved = await controller.captureFixture();            // { ok, fixture } - for the host only, it holds secrets
+
+await runBrowseAgent(goal, { model, browser: controllerBridge(controller), fixture });
+```
+
+Apply order: cookies, storage per origin, start URL, extra tabs, steps. Cookies
+need a target with `setCookies` (`PlaywrightTarget` has it, so Steel too).
+`network` is reserved: a non-empty list fails with "not supported yet". The model
+never sees the fixture: `runBrowseAgent({ fixture })` gives it a summary with
+counts only, plus a snapshot. `url` and `fixture` together are an error. A host
+that prepares the browser its own way uses `BrowseAgentRunOptions.setup`.
+Capture takes storage, URL and tabs, not the DOM state of a page.
 
 ## Isomorphism
 

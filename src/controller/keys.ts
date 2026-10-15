@@ -313,3 +313,50 @@ export function resolveEditCommand(key: string, modifiers: ModifierState): strin
   if (lower === "v") return ["paste"];
   return undefined;
 }
+
+/**
+ * The `Input.dispatchKeyEvent` options for a parsed key spec. A Meta/Ctrl
+ * combo (Cmd+A, Ctrl+C, ...) is textless and names its editing command in
+ * `commands` (see the note in `BrowserController.runPress`); any other key
+ * carries the key's own `text`. Shared by `press` and PageFixture `press` steps.
+ */
+export function keyDispatchOptions(parsed: ParsedKeySpec): { modifiers: number; text?: string; commands?: string[] } {
+  const { descriptor, modifiers } = parsed;
+  const isEditCombo = modifiers.meta || modifiers.ctrl;
+  return {
+    modifiers: modifiersBitmask(modifiers),
+    text: isEditCombo ? undefined : descriptor.text,
+    commands: isEditCombo ? resolveEditCommand(descriptor.key, modifiers) : undefined,
+  };
+}
+
+/**
+ * One trusted key press: `Input.dispatchKeyEvent` down (a `keyDown` when it
+ * carries text, else `rawKeyDown`) and up, over the page's CDP session. The one
+ * implementation behind `BrowserController`'s typing/press/slider code and
+ * PageFixture `press` steps. Throws if the page has no CDP session or a
+ * dispatch rejects.
+ */
+export async function dispatchKeyPair(
+  page: { sendCdp?(method: string, params?: Record<string, unknown>): Promise<unknown> },
+  key: { key: string; code: string; windowsVirtualKeyCode: number },
+  opts?: { modifiers?: number; text?: string; commands?: string[] },
+): Promise<void> {
+  if (!page.sendCdp) throw new Error("Keyboard input requires a CDP session, which is unavailable for this browser tab.");
+  const base: Record<string, unknown> = {
+    key: key.key,
+    code: key.code,
+    windowsVirtualKeyCode: key.windowsVirtualKeyCode,
+    nativeVirtualKeyCode: key.windowsVirtualKeyCode,
+  };
+  if (opts?.modifiers !== undefined) base.modifiers = opts.modifiers;
+  const down: Record<string, unknown> = { type: opts?.text ? "keyDown" : "rawKeyDown", ...base };
+  if (opts) {
+    // Present even when undefined: `press`'s callers (and tests) read them.
+    down.text = opts.text;
+    down.unmodifiedText = opts.text;
+    down.commands = opts.commands;
+  }
+  await page.sendCdp("Input.dispatchKeyEvent", down);
+  await page.sendCdp("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+}

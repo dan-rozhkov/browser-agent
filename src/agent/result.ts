@@ -78,3 +78,12 @@ export function goalRequiredResult(): BrowseAgentResult {
 export function preOpenText(goal: string, url: string, openedResult: string): string {
   return `${goal}\n\nThe browser already opened ${url} for you (browse_open). Its result, with a snapshot of the page:\n${openedResult}`;
 }
+
+/**
+ * The part of the first user message that follows the goal when the browser
+ * state was prepared from a PageFixture: the safe summary (counts only) and a
+ * snapshot of the page. The fixture itself never reaches the model.
+ */
+export function fixtureSetupBody(summary: string, snapshotResult: string): string {
+  return `The browser state was prepared for you (${summary}). Snapshot of the page:\n${snapshotResult}`;
+}

@@ -10,13 +10,14 @@
 // or the `reasoningEffort` of an OpenAI-compatible provider).
 import { generateText, tool, type LanguageModel, type ToolSet } from "ai";
 import type { ZodTypeAny } from "zod";
+import type { PageFixture } from "../fixture/types.js";
 import type { BrowserBridge } from "../loop/bridge.js";
 import { executeBrowseTool } from "./execute.js";
 import {
   buildBrowseAgentPrompt,
   type BuildBrowseAgentPromptOptions,
 } from "./prompt.js";
-import type { BrowseAgentMessage, BrowseAgentMessagePart, BrowseAgentResult } from "./result.js";
+import { fixtureSetupBody, type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
 import {
   createBrowseAgentSession,
   parseJsonObject,
@@ -44,6 +45,15 @@ export interface RunBrowseAgentOptions {
   browser: BrowserBridge;
   /** Start URL: the browser opens it before the first request. */
   url?: string;
+  /**
+   * Page state to prepare before the first request (cookies, storage, start
+   * URL, extra tabs, setup steps; see `@sideform/browser-agent/fixture`). The
+   * browser applies it through `browser.applyFixture`, then the run takes a
+   * snapshot. The model gets a summary with counts only: never a cookie or a
+   * storage key or value. Counts as one step. A bridge without `applyFixture`
+   * gives status `error`. `url` and `fixture` together are an error.
+   */
+  fixture?: PageFixture;
   /** Aborts the run (status `aborted`). */
   signal?: AbortSignal;
   /** Provider options for every request (the reasoning switch goes here). */
@@ -139,6 +149,17 @@ function buildTools(
   return tools;
 }
 
+/** Applies the fixture, then snapshots the page. Returns the model-safe text after the goal. */
+async function prepareFixture(browser: BrowserBridge, fixture: PageFixture, signal: AbortSignal): Promise<string> {
+  if (!browser.applyFixture) throw new Error("This browser does not support page fixtures (BrowserBridge.applyFixture is missing).");
+  const raw = await browser.applyFixture(fixture, { signal });
+  const applied: Record<string, unknown> = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  // Only `summary` (counts) and `error` (no cookie or storage data) are read from the result.
+  if (applied.ok !== true) throw new Error(typeof applied.error === "string" ? applied.error : "The page fixture could not be applied.");
+  const summary = typeof applied.summary === "string" ? applied.summary : "page fixture applied";
+  return fixtureSetupBody(summary, await executeBrowseTool(browser, "browse_snapshot", {}));
+}
+
 /**
  * Run a browse task with a non-reasoning chat model driving the browse tools.
  * Resolves to the run result (never rejects for a model or browser failure:
@@ -198,6 +219,10 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       },
       messages: () => messages,
     },
-    { url: opts.url, toolCallId: opts.runId },
+    {
+      url: opts.url,
+      toolCallId: opts.runId,
+      ...(opts.fixture ? { setup: ({ signal }: { signal: AbortSignal }) => prepareFixture(opts.browser, opts.fixture!, signal) } : {}),
+    },
   );
 }

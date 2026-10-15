@@ -240,3 +240,47 @@ describe("connectOverCdp", () => {
     expect((err as Error).cause).toBeUndefined();
   });
 });
+
+describe("PlaywrightTarget cookies", () => {
+  function cookieContext() {
+    const ctx = fakeContext(async () => new FakeCdp()) as EventEmitter & Record<string, unknown>;
+    const added: unknown[][] = [];
+    const asked: unknown[] = [];
+    Object.assign(ctx, {
+      addCookies: async (c: unknown[]) => { added.push(c); },
+      cookies: async (urls?: string[]) => {
+        asked.push(urls);
+        return [
+          { name: "sid", value: "v", domain: ".a.test", path: "/", expires: 1900000000, httpOnly: true, secure: true, sameSite: "Lax" },
+          { name: "s", value: "w", domain: "a.test", path: "/p", expires: -1, httpOnly: false, secure: false, sameSite: "None" },
+        ];
+      },
+    });
+    return { target: new PlaywrightTarget(ctx as never), added, asked };
+  }
+
+  it("setCookies maps a fixture cookie to addCookies input", async () => {
+    const { target, added } = cookieContext();
+    await target.setCookies!([
+      { name: "a", value: "1", domain: "a.test" },
+      { name: "b", value: "2", domain: "a.test", path: "/x", expires: 5, httpOnly: true, secure: true, sameSite: "Strict" },
+      { name: "c", value: "3", url: "https://a.test/" },
+      { name: "d", value: "4", url: "https://a.test/", domain: "ignored.test", path: "/ignored" },
+    ]);
+    expect(added).toEqual([[
+      { name: "a", value: "1", domain: "a.test", path: "/" },
+      { name: "b", value: "2", domain: "a.test", path: "/x", expires: 5, httpOnly: true, secure: true, sameSite: "Strict" },
+      { name: "c", value: "3", url: "https://a.test/" },
+      { name: "d", value: "4", url: "https://a.test/" },
+    ]]);
+  });
+
+  it("getCookies maps back and drops the session-cookie expiry", async () => {
+    const { target, asked } = cookieContext();
+    expect(await target.getCookies!(["https://a.test/"])).toEqual([
+      { name: "sid", value: "v", domain: ".a.test", path: "/", expires: 1900000000, httpOnly: true, secure: true, sameSite: "Lax" },
+      { name: "s", value: "w", domain: "a.test", path: "/p", httpOnly: false, secure: false, sameSite: "None" },
+    ]);
+    expect(asked).toEqual([["https://a.test/"]]);
+  });
+});

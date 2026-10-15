@@ -81,6 +81,14 @@ export interface BrowseAgentDriver {
 export interface BrowseAgentRunOptions {
   /** Start URL: the session runs `browse_open` before the first request. */
   url?: string;
+  /**
+   * Host hook that prepares the browser (for example a PageFixture) before the
+   * first model request. It runs inside the deadline and the abort signal and
+   * counts as one step. Its string is the text the model gets after the goal:
+   * it must be safe for a model (no secrets). A throw gives status `error`.
+   * `url` and `setup` together are an error.
+   */
+  setup?(ctx: { signal: AbortSignal }): Promise<string>;
   /** Id of the parent tool call. The pre-open call gets `${toolCallId}:open`. Default "browse_agent". */
   toolCallId?: string;
 }
@@ -188,6 +196,24 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
     return run;
   }
 
+  /** Runs the host setup hook. The race with the abort signal covers a hook that ignores it. */
+  async function runSetup(setup: NonNullable<BrowseAgentRunOptions["setup"]>): Promise<{ ok: true; text: string } | { ok: false; error: unknown }> {
+    let onAbort!: () => void;
+    const aborted = new Promise<"aborted">((resolve) => {
+      onAbort = () => resolve("aborted");
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      const outcome = await Promise.race([Promise.resolve().then(() => setup({ signal })), aborted]);
+      return outcome === "aborted" ? { ok: false, error: new Error("aborted") } : { ok: true, text: outcome };
+    } catch (error) {
+      return { ok: false, error };
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
   async function runAll(goal: string, driver: BrowseAgentDriver, runOpts: BrowseAgentRunOptions): Promise<BrowseAgentResult> {
     const result = (status: BrowseAgentStatus, error?: string): BrowseAgentResult => ({
       status,
@@ -224,7 +250,14 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
       // Open the start page before the first model request: the model starts
       // on its snapshot instead of spending a whole request on browse_open.
       let text = goal;
-      if (runOpts.url) {
+      if (runOpts.url && runOpts.setup) return result("error", "url and setup cannot be used together");
+      if (runOpts.setup) {
+        steps += 1;
+        const outcome = await runSetup(runOpts.setup);
+        if (stopped || timedOut) return result(timedOut ? "timeout" : "aborted");
+        if (!outcome.ok) return result("error", browseAgentErrorMessage(outcome.error));
+        text = `${goal}\n\n${outcome.text}`;
+      } else if (runOpts.url) {
         steps += 1;
         const opened = await execute({
           toolName: "browse_open",

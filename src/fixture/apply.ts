@@ -1,0 +1,544 @@
+// applyFixture: put a browser into the state a PageFixture describes.
+// Isomorphic: it drives a BrowserTarget (types only) and runs every page step
+// through `executeJavaScript`. Order: cookies, storage per origin, start URL,
+// extra tabs, steps. Error text never repeats cookie or storage data: page
+// errors are reported with fixed words, not with the message the page gave.
+import type { BrowserPageHandle, BrowserTarget } from "../controller/controller.js";
+import { dispatchKeyPair, keyDispatchOptions, parseKeySpec } from "../controller/keys.js";
+import { parsePageFixture } from "./parse.js";
+import {
+  FIXTURE_MAX_WAIT_MS,
+  FIXTURE_WAIT_FOR_DEFAULT_MS,
+  type FixtureApplyOptions,
+  type FixtureApplyResult,
+  type FixtureDialog,
+  type FixtureHookResult,
+  type FixtureHooks,
+  type FixtureStep,
+  type PageFixture,
+} from "./types.js";
+import { redactUrl, redactUrls, runScript, SCRIPT_TIMEOUT_MS, toMessage } from "./util.js";
+
+/** What one apply run shares between its helpers. */
+interface Ctx {
+  target: BrowserTarget;
+  signal: AbortSignal | undefined;
+  hooks: FixtureHooks | undefined;
+  /** Id of the tab the fixture works on; undefined when the target lists no tabs (then there is one). */
+  mainId: number | undefined;
+  /** Dialogs the host hooks drained. */
+  dialogs: FixtureDialog[];
+}
+
+/** Longest wait for one navigation of a fixture. */
+const LOAD_TIMEOUT_MS = 30_000;
+/** Longest wait for a page to finish a navigation a click or key press started (standalone). */
+const SETTLE_TIMEOUT_MS = 10_000;
+/** How long a click or key press may take to start a navigation (standalone). */
+const SETTLE_START_MS = 150;
+const WAIT_FOR_POLL_MS = 100;
+/** Overall cap of `fixtureBudgetMs`. */
+const MAX_BUDGET_MS = 5 * 60_000;
+
+class FixtureError extends Error {}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new FixtureError("aborted");
+}
+
+/** Sleeps `ms`; rejects at once when `signal` aborts. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(new FixtureError("aborted"));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new FixtureError("aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Loads `url` and waits for the DOM (like `BrowserController.open`): the
+ * subresources of a heavy page do not have to finish. */
+async function load(page: BrowserPageHandle, url: string, signal: AbortSignal | undefined): Promise<void> {
+  throwIfAborted(signal);
+  const domReady = page.onceDomReady();
+  const loaded = page.loadURL(url);
+  // A load failure after DOM-ready is not a failure of this call.
+  const loadOutcome = loaded.then(
+    () => undefined,
+    (err: unknown) => new FixtureError(`loading failed: ${toMessage(err)}`),
+  );
+  const stop = new AbortController();
+  const timeout = new Promise<never>((_, reject) => {
+    const timer = setTimeout(() => reject(new FixtureError(`loading timed out after ${LOAD_TIMEOUT_MS}ms`)), LOAD_TIMEOUT_MS);
+    stop.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+  });
+  const aborted = new Promise<never>((_, reject) => {
+    const onAbort = () => reject(new FixtureError("aborted"));
+    if (signal?.aborted) onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    stop.signal.addEventListener("abort", () => signal?.removeEventListener("abort", onAbort), { once: true });
+  });
+  try {
+    const first = await Promise.race([domReady.then(() => undefined), loadOutcome, timeout, aborted]);
+    if (first) throw first;
+  } finally {
+    stop.abort();
+    // The timeout and abort promises settle unobserved when they lose.
+    timeout.catch(() => {});
+    aborted.catch(() => {});
+  }
+}
+
+/** Makes the main tab current and returns its page. Re-resolved before every
+ * navigation and step, because a popup can become current at any time. */
+async function mainPage(ctx: Ctx): Promise<BrowserPageHandle> {
+  throwIfAborted(ctx.signal);
+  const { target } = ctx;
+  if (ctx.mainId !== undefined) {
+    const tabs = await target.listPages!();
+    const current = tabs.find((t) => t.current);
+    if (!current) throw new FixtureError("the browser reports no current tab");
+    if (current.tabId !== ctx.mainId) {
+      throwIfAborted(ctx.signal);
+      if (!target.selectPage || !(await target.selectPage(ctx.mainId))) throw new FixtureError("the main tab is gone");
+    }
+    const page = target.currentPage();
+    if (!page) throw new FixtureError("the main tab has no page");
+    return page;
+  }
+  return target.ensurePage();
+}
+
+function takeHookResult(ctx: Ctx, done: FixtureHookResult): void {
+  if (done.dialogs) ctx.dialogs.push(...done.dialogs);
+  if (!done.ok) throw new FixtureError(done.error);
+}
+
+/** Loads `url` in the main tab: through the host hook when it has one, else standalone. Returns the main page. */
+async function navigate(ctx: Ctx, url: string): Promise<BrowserPageHandle> {
+  const page = await mainPage(ctx);
+  if (ctx.hooks?.navigate) {
+    takeHookResult(ctx, await ctx.hooks.navigate(url, ctx.signal));
+  } else {
+    await load(page, url, ctx.signal);
+  }
+  return mainPage(ctx);
+}
+
+/** After a click or key press: wait for a navigation it started (standalone version of `settled`). */
+async function settleStandalone(page: BrowserPageHandle, signal: AbortSignal | undefined): Promise<void> {
+  const begin = Date.now();
+  while (!page.isLoading() && Date.now() - begin < SETTLE_START_MS) await sleep(25, signal);
+  if (!page.isLoading()) return;
+  const stop = new AbortController();
+  const timeout = new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, SETTLE_TIMEOUT_MS);
+    stop.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+  });
+  const aborted = new Promise<void>((resolve) => {
+    signal?.addEventListener("abort", () => resolve(), { once: true });
+    if (signal?.aborted) resolve();
+  });
+  try {
+    await Promise.race([page.onceDomReady().catch(() => {}), timeout, aborted]);
+  } finally {
+    stop.abort();
+  }
+  throwIfAborted(signal);
+}
+
+/** Runs a click or key `action` and lets the page settle: the host's way when it has one. */
+async function settled(ctx: Ctx, page: BrowserPageHandle, action: () => Promise<StepOutcome>): Promise<StepOutcome> {
+  if (ctx.hooks?.settled) return ctx.hooks.settled(page, action);
+  const outcome = await action();
+  // A failed action started nothing worth waiting for.
+  if (outcome.ok) await settleStandalone(page, ctx.signal);
+  return outcome;
+}
+
+/** A value as a JS literal. `JSON.stringify` output is valid JS except for the
+ * line separators U+2028 and U+2029 in older engines, so those are escaped. */
+function lit(value: unknown): string {
+  return JSON.stringify(value).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
+}
+
+const FIND = (selector: string) => `(() => { try { return document.querySelector(${lit(selector)}); } catch { return undefined; } })()`;
+
+function storageScript(local: Record<string, string>, session: Record<string, string>): string {
+  // The page error is not reported: its message may quote a key.
+  return `(() => {
+  try {
+    const set = (store, entries) => { for (const [k, v] of Object.entries(entries)) store.setItem(k, v); };
+    set(localStorage, ${lit(local)});
+    set(sessionStorage, ${lit(session)});
+    return JSON.stringify({ ok: true });
+  } catch (e) {
+    return JSON.stringify({ ok: false, name: String((e && e.name) || "Error") });
+  }
+})()`;
+}
+
+function clickScript(selector: string): string {
+  return `(() => {
+  const el = ${FIND(selector)};
+  if (el === undefined) return JSON.stringify({ ok: false, error: "invalid selector" });
+  if (!el) return JSON.stringify({ ok: false, error: "element not found" });
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", inline: "center" });
+  el.click();
+  return JSON.stringify({ ok: true });
+})()`;
+}
+
+function typeScript(selector: string, text: string): string {
+  return `(() => {
+  const el = ${FIND(selector)};
+  if (el === undefined) return JSON.stringify({ ok: false, error: "invalid selector" });
+  if (!el) return JSON.stringify({ ok: false, error: "element not found" });
+  const isArea = el instanceof HTMLTextAreaElement;
+  if (!isArea && !(el instanceof HTMLInputElement)) return JSON.stringify({ ok: false, error: "element is not a text field" });
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", inline: "center" });
+  el.focus();
+  const proto = isArea ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+  setter.call(el, ${lit(text)});
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return JSON.stringify({ ok: true });
+})()`;
+}
+
+/** Focuses the target of a `press` step (when it has a selector). */
+function focusScript(selector: string): string {
+  return `(() => {
+  const el = ${FIND(selector)};
+  if (el === undefined) return JSON.stringify({ ok: false, error: "invalid selector" });
+  if (!el) return JSON.stringify({ ok: false, error: "element not found" });
+  if (el.focus) el.focus();
+  return JSON.stringify({ ok: true });
+})()`;
+}
+
+/** Fallback of `press` for a page without a CDP session. */
+function keyEventScript(key: string, code: string, mods: { alt: boolean; ctrl: boolean; meta: boolean; shift: boolean }): string {
+  return `(() => {
+  const el = document.activeElement || document.body;
+  const init = { key: ${lit(key)}, code: ${lit(code)}, bubbles: true, cancelable: true, altKey: ${mods.alt}, ctrlKey: ${mods.ctrl}, metaKey: ${mods.meta}, shiftKey: ${mods.shift} };
+  el.dispatchEvent(new KeyboardEvent("keydown", init));
+  el.dispatchEvent(new KeyboardEvent("keyup", init));
+  return JSON.stringify({ ok: true });
+})()`;
+}
+
+function existsScript(selector: string): string {
+  return `(() => {
+  const el = ${FIND(selector)};
+  if (el === undefined) return JSON.stringify({ ok: false, error: "invalid selector" });
+  return JSON.stringify({ ok: true, found: !!el });
+})()`;
+}
+
+type StepOutcome = { ok: true } | { ok: false; error: string };
+
+async function pageStep(page: BrowserPageHandle, code: string): Promise<StepOutcome> {
+  let result: Record<string, unknown>;
+  try {
+    result = await runScript(page, code);
+  } catch {
+    return { ok: false, error: "the page script failed" };
+  }
+  return result.ok === true ? { ok: true } : { ok: false, error: typeof result.error === "string" ? result.error : "the page script failed" };
+}
+
+async function press(ctx: Ctx, page: BrowserPageHandle, step: Extract<FixtureStep, { action: "press" }>): Promise<StepOutcome> {
+  const parsed = parseKeySpec(step.key);
+  if (!parsed) return { ok: false, error: "unsupported key" };
+  if (step.selector !== undefined) {
+    const focused = await pageStep(page, focusScript(step.selector));
+    if (!focused.ok) return focused;
+  }
+  const { descriptor, modifiers } = parsed;
+  return settled(ctx, page, async () => {
+    if (ctx.hooks?.press) {
+      try {
+        if (await ctx.hooks.press(page, parsed)) return { ok: true };
+      } catch {
+        return { ok: false, error: "the key press failed" };
+      }
+    }
+    if (page.sendCdp) {
+      // Trusted input, like `act press`: reaches the real key handlers.
+      try {
+        await dispatchKeyPair(page, descriptor, keyDispatchOptions(parsed));
+        return { ok: true };
+      } catch {
+        return { ok: false, error: "the key press failed" };
+      }
+    }
+    // The selector was focused above, so the event goes to the active element.
+    return pageStep(page, keyEventScript(descriptor.key, descriptor.code, modifiers));
+  });
+}
+
+/** Polls for `selector` until `timeoutMs` passes. `timeoutMs` 0 checks once. */
+async function waitFor(page: BrowserPageHandle, selector: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<StepOutcome> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    throwIfAborted(signal);
+    let result: Record<string, unknown> | undefined;
+    try {
+      result = await runScript(page, existsScript(selector));
+    } catch {
+      // The context can be destroyed by a navigation under the poll: retry until the deadline.
+    }
+    if (result) {
+      if (result.ok !== true) return { ok: false, error: typeof result.error === "string" ? result.error : "the page script failed" };
+      if (result.found === true) return { ok: true };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ok: false, error: `timed out after ${timeoutMs}ms` };
+    await sleep(Math.min(WAIT_FOR_POLL_MS, remaining), signal);
+  }
+}
+
+async function runStep(ctx: Ctx, step: FixtureStep): Promise<StepOutcome> {
+  const { signal } = ctx;
+  if (step.action === "goto") {
+    try {
+      await navigate(ctx, step.url);
+      return { ok: true };
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      return { ok: false, error: toMessage(err) };
+    }
+  }
+  if (step.action === "wait") {
+    await sleep(step.ms, signal);
+    return { ok: true };
+  }
+  const page = await mainPage(ctx);
+  switch (step.action) {
+    case "click":
+      return settled(ctx, page, () => pageStep(page, clickScript(step.selector)));
+    case "type":
+      return pageStep(page, typeScript(step.selector, step.text));
+    case "press":
+      return press(ctx, page, step);
+    case "waitFor":
+      return waitFor(page, step.selector, step.timeoutMs ?? FIXTURE_WAIT_FOR_DEFAULT_MS, signal);
+  }
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/** Counts only: no cookie name, no storage key, no value. */
+function summarize(fixture: PageFixture): string {
+  const parts: string[] = [];
+  if (fixture.url) parts.push(`start page ${redactUrl(fixture.url)}`);
+  const cookies = fixture.storage?.cookies?.length ?? 0;
+  if (cookies) parts.push(plural(cookies, "cookie"));
+  const origins = fixture.storage?.origins?.length ?? 0;
+  if (origins) parts.push(`storage for ${plural(origins, "origin")}`);
+  const tabs = fixture.tabs?.length ?? 0;
+  if (tabs) parts.push(`${plural(tabs, "extra tab")}`);
+  const steps = fixture.steps?.length ?? 0;
+  if (steps) parts.push(plural(steps, "setup step"));
+  return parts.length ? parts.join("; ") : "no state to prepare";
+}
+
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+/** Closes a tab opened after an abort and gives the current-tab role back, so a
+ * late tab never changes what the next command acts on. Best effort. */
+async function abandonTab(ctx: Ctx, tabId: number): Promise<void> {
+  try {
+    await ctx.target.closePage?.(tabId);
+    if (ctx.mainId !== undefined) await ctx.target.selectPage?.(ctx.mainId);
+  } catch {
+    // Nothing more can be done for a tab the target no longer lets us touch.
+  }
+}
+
+/** Opens `url` in a new tab that becomes current. Standalone version: `newPage()` takes
+ * no url (the desktop target ignores it), so the page is created first and then loaded. */
+async function openTab(ctx: Ctx, url: string): Promise<void> {
+  throwIfAborted(ctx.signal);
+  if (ctx.hooks?.openTab) {
+    takeHookResult(ctx, await ctx.hooks.openTab(url, ctx.signal));
+    return;
+  }
+  const info = await ctx.target.newPage!();
+  if (ctx.signal?.aborted) {
+    await abandonTab(ctx, info.tabId);
+    throw new FixtureError("aborted");
+  }
+  const tab = ctx.target.currentPage();
+  if (!tab) throw new FixtureError("the new tab has no page");
+  await load(tab, url, ctx.signal);
+}
+
+async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> {
+  const { target, signal } = ctx;
+  if (fixture.network && fixture.network.length > 0) throw new FixtureError("PageFixture.network is not supported yet");
+  const cookies = fixture.storage?.cookies ?? [];
+  const origins = fixture.storage?.origins ?? [];
+  const tabs = fixture.tabs ?? [];
+  if (cookies.length > 0 && !target.setCookies) throw new FixtureError("this browser target cannot set cookies (setCookies is missing)");
+  if (tabs.length > 0 && !(target.newPage && target.listPages && target.selectPage)) {
+    throw new FixtureError("this browser target cannot open extra tabs (newPage, listPages or selectPage is missing)");
+  }
+  throwIfAborted(signal);
+
+  if (cookies.length > 0) {
+    try {
+      await target.setCookies!(cookies);
+    } catch {
+      // The target's message may quote a cookie.
+      throw new FixtureError("setting cookies failed");
+    }
+  }
+
+  // The main tab: the one that is current now. A target that lists no tabs has one.
+  await target.ensurePage();
+  if (target.listPages) {
+    const current = (await target.listPages()).find((t) => t.current);
+    if (!current) throw new FixtureError("the browser reports no current tab");
+    ctx.mainId = current.tabId;
+  }
+
+  for (const [i, entry] of origins.entries()) {
+    const label = `storage origin ${i + 1}`;
+    if (!entry.localStorage && !entry.sessionStorage) continue;
+    let page: BrowserPageHandle;
+    try {
+      page = await navigate(ctx, `${entry.origin}/`);
+    } catch (err) {
+      throw new FixtureError(`${label}: ${toMessage(err)}`);
+    }
+    if (!sameOrigin(page.getURL(), entry.origin)) throw new FixtureError(`${label}: the page redirected to another origin`);
+    let result: Record<string, unknown>;
+    try {
+      result = await runScript(page, storageScript(entry.localStorage ?? {}, entry.sessionStorage ?? {}));
+    } catch {
+      throw new FixtureError(`${label}: the storage script failed`);
+    }
+    if (result.ok !== true) {
+      const name = typeof result.name === "string" ? result.name.slice(0, 40) : "Error";
+      throw new FixtureError(`${label}: writing storage failed (${name})`);
+    }
+  }
+
+  if (fixture.url) {
+    try {
+      await navigate(ctx, fixture.url);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      throw new FixtureError(`start page: ${toMessage(err)}`);
+    }
+  }
+
+  for (const [i, url] of tabs.entries()) {
+    try {
+      await openTab(ctx, url);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      throw new FixtureError(`extra tab ${i + 1}: ${toMessage(err)}`);
+    }
+  }
+
+  const steps = fixture.steps ?? [];
+  for (const [i, step] of steps.entries()) {
+    throwIfAborted(signal);
+    const outcome = await runStep(ctx, step);
+    if (!outcome.ok) {
+      const subject = "selector" in step ? step.selector : "url" in step ? redactUrl(step.url) : "key" in step ? step.key : "";
+      throw new FixtureError(`step ${i + 1} (${step.action}${subject ? ` ${subject}` : ""}) failed: ${outcome.error}`);
+    }
+  }
+
+  // A new tab became current: the agent works on the main tab.
+  const page = await mainPage(ctx);
+  return { ok: true, url: page.getURL(), title: page.getTitle(), summary: summarize(fixture) };
+}
+
+/** Per-navigation and per-settle budgets a host may know better than the standalone defaults. */
+export interface FixtureBudgetOptions {
+  /** Longest one navigation may take. Default 30 s. */
+  navigationMs?: number;
+  /** Longest a click or key press may take to settle. Default 10 s. */
+  settleMs?: number;
+}
+
+/**
+ * Upper bound of the time `applyFixture` may take, for a host that wants one
+ * overall deadline (the controller does): every navigation, script and settle
+ * at its own cap, every wait at its length. Capped at five minutes, but the
+ * cap never cuts below one navigation plus two scripts.
+ */
+export function fixtureBudgetMs(fixture: PageFixture, opts: FixtureBudgetOptions = {}): number {
+  const nav = opts.navigationMs ?? LOAD_TIMEOUT_MS;
+  const settle = opts.settleMs ?? SETTLE_TIMEOUT_MS;
+  const loads = (fixture.storage?.origins?.length ?? 0) + (fixture.url ? 1 : 0) + (fixture.tabs?.length ?? 0);
+  let total = loads * nav + SCRIPT_TIMEOUT_MS;
+  for (const step of fixture.steps ?? []) {
+    if (step.action === "goto") total += nav;
+    else if (step.action === "wait") total += step.ms;
+    else if (step.action === "waitFor") total += Math.min(step.timeoutMs ?? FIXTURE_WAIT_FOR_DEFAULT_MS, FIXTURE_MAX_WAIT_MS) + SCRIPT_TIMEOUT_MS;
+    else if (step.action === "click" || step.action === "press") total += SCRIPT_TIMEOUT_MS + settle;
+    else total += SCRIPT_TIMEOUT_MS;
+  }
+  return Math.min(total, Math.max(MAX_BUDGET_MS, nav + 2 * SCRIPT_TIMEOUT_MS));
+}
+
+/**
+ * `applyFixture` for a fixture that `parsePageFixture` already validated (the
+ * controller parses once, to size its deadline). Same result, same redaction.
+ */
+export async function applyParsedFixture(
+  target: BrowserTarget,
+  fixture: PageFixture,
+  opts: FixtureApplyOptions = {},
+  hooks?: FixtureHooks,
+): Promise<FixtureApplyResult> {
+  const ctx: Ctx = { target, signal: opts.signal, hooks, mainId: undefined, dialogs: [] };
+  const withDialogs = <T extends FixtureApplyResult>(result: T): T => (ctx.dialogs.length > 0 ? { ...result, dialogs: ctx.dialogs } : result);
+  try {
+    const result = await run(ctx, fixture);
+    return withDialogs(result.ok ? result : { ok: false, error: redactUrls(result.error) });
+  } catch (err) {
+    const message = err instanceof FixtureError ? err.message : `applying the fixture failed: ${toMessage(err)}`;
+    return withDialogs({ ok: false, error: redactUrls(message) });
+  }
+}
+
+/**
+ * Put `target` into the state `fixture` describes. Never rejects: a failure is
+ * `{ ok: false, error }`. The error holds no cookie or storage data and no URL
+ * query or hash. A failed step stops the apply with
+ * `step N (<action> <selector>) failed: <reason>`. The caller serializes it
+ * against other browser commands (the controller does). `hooks` is for a host
+ * that has its own navigation, tab and key code (see `FixtureHooks`).
+ */
+export async function applyFixture(
+  target: BrowserTarget,
+  fixture: PageFixture,
+  opts: FixtureApplyOptions = {},
+  hooks?: FixtureHooks,
+): Promise<FixtureApplyResult> {
+  const parsed = parsePageFixture(fixture);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  return applyParsedFixture(target, parsed.value, opts, hooks);
+}

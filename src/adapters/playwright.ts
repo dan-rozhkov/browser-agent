@@ -1,7 +1,7 @@
 // Playwright-backed BrowserTarget / BrowserPageHandle for the BrowserController.
 // Wraps an EXISTING BrowserContext (from chromium.connectOverCDP to a Steel session) —
 // there is no launch path: no Chromium runs on this host.
-// Implemented optional methods: isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
+// Implemented optional methods: getCookies/setCookies (PageFixture), isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
 // onNavigationEvent, networkStats, listFrames, executeJavaScriptInFrame, listPages/selectPage/closePage/newPage/pageHandles.
 import type { BrowserContext, Page, CDPSession, Frame } from "playwright-core";
 import { promises as dns } from "node:dns";
@@ -13,6 +13,7 @@ import type { Readable } from "node:stream";
 import { BrowserController } from "../controller/index.js";
 import { isBlockedIp, isFetchableStylesheetUrl } from "../controller/captureCss.js";
 import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../controller/index.js";
+import type { FixtureCookie } from "../fixture/types.js";
 
 const MAX_FETCH_REDIRECTS = 3;
 
@@ -366,6 +367,37 @@ class PwPage implements BrowserPageHandle {
   }
 }
 
+type PwCookie = Awaited<ReturnType<BrowserContext["cookies"]>>[number];
+type PwCookieInput = Parameters<BrowserContext["addCookies"]>[0][number];
+
+/** Playwright's cookie as a fixture cookie. `expires` -1 is a session cookie. */
+function toFixtureCookie(c: PwCookie): FixtureCookie {
+  return {
+    name: c.name,
+    value: c.value,
+    domain: c.domain,
+    path: c.path,
+    ...(c.expires > 0 ? { expires: c.expires } : {}),
+    httpOnly: c.httpOnly,
+    secure: c.secure,
+    sameSite: c.sameSite,
+  };
+}
+
+/** A fixture cookie as `addCookies` input: it takes `url`, or `domain` + `path`, never both. */
+function toPlaywrightCookie(c: FixtureCookie): PwCookieInput {
+  const common = {
+    name: c.name,
+    value: c.value,
+    ...(c.expires !== undefined ? { expires: c.expires } : {}),
+    ...(c.httpOnly !== undefined ? { httpOnly: c.httpOnly } : {}),
+    ...(c.secure !== undefined ? { secure: c.secure } : {}),
+    ...(c.sameSite !== undefined ? { sameSite: c.sameSite } : {}),
+  };
+  if (c.url) return { ...common, url: c.url };
+  return { ...common, domain: c.domain!, path: c.path ?? "/" };
+}
+
 export class PlaywrightTarget implements BrowserTarget {
   private readonly ctx: BrowserContext;
   private pages = new Map<number, PwPage>();
@@ -435,6 +467,13 @@ export class PlaywrightTarget implements BrowserTarget {
   }
   async pageHandles() {
     return [...this.pages].map(([tabId, page]) => ({ tabId, page }));
+  }
+  // Cookies live on the context, so Steel (which connects through this target) gets them too.
+  async getCookies(urls?: string[]): Promise<FixtureCookie[]> {
+    return (await this.ctx.cookies(urls)).map(toFixtureCookie);
+  }
+  async setCookies(cookies: FixtureCookie[]): Promise<void> {
+    await this.ctx.addCookies(cookies.map(toPlaywrightCookie));
   }
 }
 

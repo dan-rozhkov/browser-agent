@@ -1,9 +1,10 @@
-// Root barrel: controller + policy + loop. Adapters are NOT re-exported (they
+// Root barrel: controller + policy + loop + fixture (all isomorphic). Adapters are NOT re-exported (they
 // carry optional peer dependencies) — import them from
 // `@sideform/browser-agent/adapters/*`.
 export * from "./controller/index.js";
 export * from "./policy/index.js";
 export * from "./loop/index.js";
+export * from "./fixture/index.js";
 
 // Two names exist in more than one layer. The root picks one explicitly; the
 // other stays available from its layer entry point (`@sideform/browser-agent/policy`).

@@ -13,6 +13,20 @@
 // (and how dispatcher.ts's ToolCallResult never rejects either).
 
 import { decideBrowserNavigation } from "./navigation.js";
+import { applyParsedFixture, fixtureBudgetMs } from "../fixture/apply.js";
+import { redactUrl } from "../fixture/util.js";
+import { parsePageFixture } from "../fixture/parse.js";
+import { captureFixture } from "../fixture/capture.js";
+import type {
+  FixtureApplyOptions,
+  FixtureApplyResult,
+  FixtureCaptureOptions,
+  FixtureCaptureResult,
+  FixtureCookie,
+  FixtureHookResult,
+  FixtureHooks,
+  PageFixture,
+} from "../fixture/types.js";
 import {
   applyQueryResults,
   collectQueries,
@@ -24,7 +38,7 @@ import {
   type ResolvedSheet,
   v1Shape,
 } from "./captureCss.js";
-import { parseKeySpec, modifiersBitmask, resolveEditCommand, resolveNamedKey } from "./keys.js";
+import { parseKeySpec, resolveNamedKey, keyDispatchOptions, dispatchKeyPair as dispatchKeyPairShared } from "./keys.js";
 import {
   ARGS_MARKER,
   FIND_IMAGES_JS,
@@ -762,12 +776,27 @@ export interface BrowserTarget {
    * only `currentPage()`, the previous behavior.
    */
   pageHandles?(): Promise<{ tabId: number; page: BrowserPageHandle }[]>;
+  /**
+   * Optional: PageFixture cookies (docs/specs/2026-10-15-page-fixture-design.md).
+   * Cookies live on the browser context, not on a page, so they are target
+   * methods. `urls` limits the result to cookies that apply to those URLs.
+   * `applyFixture` with cookies fails clearly on a target without `setCookies`.
+   */
+  getCookies?(urls?: string[]): Promise<FixtureCookie[]>;
+  setCookies?(cookies: FixtureCookie[]): Promise<void>;
 }
 
 export type BrowserCommandResult = Record<string, unknown>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A fixture command's result as the fixture shape: a timeout comes back from
+ * `withCommandTimeout` as a bare `{ error }`. */
+function fixtureResult<T>(result: BrowserCommandResult): T {
+  if (typeof result.ok === "boolean") return result as unknown as T;
+  return { ok: false, error: String(result.error ?? "The fixture command failed.") } as unknown as T;
 }
 
 function errorResult(message: string): BrowserCommandResult {
@@ -1465,6 +1494,100 @@ export class BrowserController {
       const loaded = graceOutcome !== "timeout" && graceOutcome.via === "load" && graceOutcome.error === null;
       return { url: page.getURL(), title: page.getTitle(), loaded, ...(await this.checkBotWall(page)) };
     }, this.openTimeoutMs);
+  }
+
+  /**
+   * PageFixture (docs/specs/2026-10-15-page-fixture-design.md): puts the
+   * browser into the state `fixture` describes, under the same exclusive lock
+   * as every other command. Navigation, extra tabs and key presses reuse this
+   * controller's own code (`openUnlocked`, the `tabs` "new" path,
+   * `dispatchKeyPair`), so a fixture behaves like `browse_open`, `browse_tabs`
+   * and `act press`. The whole run has one deadline sized for the fixture
+   * (`fixtureBudgetMs`) and drains dialogs like any command. It navigates and
+   * may switch tabs, so the last snapshot is dropped (a `perform` against it
+   * is refused as stale). Never rejects: a failure is `{ ok: false, error }`.
+   */
+  async applyFixture(fixture: PageFixture, opts?: FixtureApplyOptions): Promise<FixtureApplyResult> {
+    const parsed = parsePageFixture(fixture);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+    return this.runExclusive(async () => {
+      // The deadline abandons the work, not stops it: this signal stops it.
+      const stop = new AbortController();
+      const signal = opts?.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal;
+      const aborted = { ok: false as const, error: "aborted" };
+      // What a nested `open` reports, as a hook result: its drained dialogs travel up
+      // (the outer drain would not see them again), and a bot-check wall fails the fixture.
+      const opened = (url: string, result: BrowserCommandResult): FixtureHookResult => {
+        const dialogs = Array.isArray(result.dialogs) ? (result.dialogs as Record<string, unknown>[]) : undefined;
+        const extra = dialogs ? { dialogs } : {};
+        if ("error" in result) return { ok: false, error: String(result.error), ...extra };
+        if (result.botCheck === true) return { ok: false, error: `${redactUrl(url)} shows a bot check`, ...extra };
+        return { ok: true, ...extra };
+      };
+      const hooks: FixtureHooks = {
+        navigate: async (url, abortSignal) => {
+          if (abortSignal?.aborted) return aborted;
+          return opened(url, await this.openUnlocked({ url }));
+        },
+        // Same path as `tabs({ action: "new", url })`: the tab is created empty, then `open` loads it.
+        openTab: async (url, abortSignal) => {
+          if (abortSignal?.aborted) return aborted;
+          const before = (await this.listPagesSafe()).find((t) => t.current)?.tabId;
+          const tab = await this.target.newPage!();
+          if (abortSignal?.aborted) {
+            // The lock is released (or about to be): the late tab must not stay current.
+            try {
+              await this.target.closePage?.(tab.tabId);
+              if (before !== undefined) await this.target.selectPage?.(before);
+            } catch {
+              // Best effort.
+            }
+            return aborted;
+          }
+          return opened(url, await this.openUnlocked({ url }));
+        },
+        press: async (page, key) => {
+          if (!page.sendCdp) return false;
+          await this.dispatchKeyPair(page, key.descriptor, keyDispatchOptions(key));
+          return true;
+        },
+        // A click or key press settles like `act` does: navigation watcher, load stop, network quiet.
+        settled: async (page, action) => {
+          const navWatcher = this.armNavigationWatcher(page, page.getURL());
+          const networkBaseline = this.captureNetworkBaseline(page);
+          try {
+            const outcome = await action();
+            // A failed action started nothing worth waiting for.
+            if ((outcome as { ok?: unknown } | null)?.ok === false) navWatcher.dispose();
+            else await this.settleAfterClick(page, navWatcher, networkBaseline);
+            return outcome;
+          } catch (err) {
+            navWatcher.dispose();
+            throw err;
+          }
+        },
+      };
+      try {
+        const result = await this.withCommandTimeout(
+          async () => (await applyParsedFixture(this.target, parsed.value, { signal }, hooks)) as BrowserCommandResult,
+          fixtureBudgetMs(parsed.value, {
+            navigationMs: this.openTimeoutMs + OPEN_COMMAND_MARGIN_MS,
+            settleMs: CLICK_LOAD_SETTLE_TIMEOUT_MS + NETWORK_QUIET_HARD_CAP_MS,
+          }),
+        );
+        return fixtureResult<FixtureApplyResult>(result);
+      } finally {
+        stop.abort();
+        this.lastSnapshot = null;
+      }
+    });
+  }
+
+  /** Reads the browser state as a `PageFixture` (host use: it holds secrets). Bounded like any command. */
+  async captureFixture(opts?: FixtureCaptureOptions): Promise<FixtureCaptureResult> {
+    return this.runExclusive(async () =>
+      fixtureResult<FixtureCaptureResult>(await this.withCommandTimeout(async () => (await captureFixture(this.target, opts)) as BrowserCommandResult)),
+    );
   }
 
   /** Second-pass review finding 8: public entry point — serializes onto the
@@ -2177,23 +2300,7 @@ export class BrowserController {
     key: { key: string; code: string; windowsVirtualKeyCode: number },
     opts?: { modifiers?: number; text?: string; commands?: string[] },
   ): Promise<void> {
-    if (!page.sendCdp) throw new Error("Keyboard input requires a CDP session, which is unavailable for this browser tab.");
-    const base: Record<string, unknown> = {
-      key: key.key,
-      code: key.code,
-      windowsVirtualKeyCode: key.windowsVirtualKeyCode,
-      nativeVirtualKeyCode: key.windowsVirtualKeyCode,
-    };
-    if (opts?.modifiers !== undefined) base.modifiers = opts.modifiers;
-    const down: Record<string, unknown> = { type: opts?.text ? "keyDown" : "rawKeyDown", ...base };
-    if (opts) {
-      // Present even when undefined: `press`'s callers (and tests) read them.
-      down.text = opts.text;
-      down.unmodifiedText = opts.text;
-      down.commands = opts.commands;
-    }
-    await page.sendCdp("Input.dispatchKeyEvent", down);
-    await page.sendCdp("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    await dispatchKeyPairShared(page, key, opts);
   }
 
   /** Moves a focused ARIA slider to `target` with trusted CDP key presses
@@ -2647,21 +2754,16 @@ export class BrowserController {
     const navWatcher = this.armNavigationWatcher(page, previousUrl);
     const networkBaseline = this.captureNetworkBaseline(page);
 
-    const { descriptor, modifiers } = parsed;
-    const modBits = modifiersBitmask(modifiers);
+    const { descriptor } = parsed;
     // Review finding 2: a Meta/Ctrl-modified combo (Cmd+A, Ctrl+C, …) is
     // sent as a *textless* event with CDP's `commands` field naming the
-    // editing command — Chromium doesn't run its native accelerator table
-    // off a CDP-synthesized modified keydown the way it would a genuine
-    // OS-level shortcut, so a synthetic Cmd+A on macOS Chromium silently did
-    // nothing before this. Sending `text` alongside a modified combo would
-    // also be actively wrong — Cmd+A must select all, never additionally
-    // insert the literal character "a".
-    const isEditCombo = modifiers.meta || modifiers.ctrl;
-    const commands = isEditCombo ? resolveEditCommand(descriptor.key, modifiers) : undefined;
-    const text = isEditCombo ? undefined : descriptor.text;
+    // editing command (see `keyDispatchOptions`) — Chromium doesn't run its
+    // native accelerator table off a CDP-synthesized modified keydown the
+    // way it would a genuine OS-level shortcut, and `text` alongside a
+    // modified combo would insert the literal character "a" on Cmd+A.
+    const dispatchOpts = keyDispatchOptions(parsed);
     try {
-      await this.dispatchKeyPair(page, descriptor, { modifiers: modBits, text, commands });
+      await this.dispatchKeyPair(page, descriptor, dispatchOpts);
     } catch (err) {
       navWatcher.dispose();
       return errorResult(`Failed to dispatch key "${keySpec}": ${toMessage(err)}`);
@@ -4535,10 +4637,13 @@ export class BrowserController {
         () => undefined,
         () => undefined,
       );
-      this.overrun = Promise.race([
+      const next = Promise.race([
         settled,
         new Promise<void>((resolve) => setTimeout(resolve, OVERRUN_GRACE_MS)),
       ]);
+      // Merged, not replaced: a command nested in another one (a fixture's
+      // navigation) must not drop the outer command's pending overrun.
+      this.overrun = this.overrun ? Promise.all([this.overrun, next]).then(() => undefined) : next;
     }
     return this.mergeDialogs(result, pageHandles, actedPage);
   }

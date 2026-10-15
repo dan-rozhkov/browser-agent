@@ -1,3 +1,9 @@
+import type {
+  FixtureApplyOptions,
+  FixtureCaptureOptions,
+  PageFixture,
+} from "../fixture/types.js";
+
 /**
  * The browser the loop drives. The shape is pen-editor's preload surface
  * (`window.penDesktop.browser`, docs/superpowers/specs/
@@ -62,5 +68,14 @@ export interface BrowserBridge {
    * older than this feature.
    */
   capture?(args?: { index?: number; snapshotId?: string }): Promise<unknown>;
+  /**
+   * PageFixture (docs/specs/2026-10-15-page-fixture-design.md) — prepare the
+   * browser state before a task, or read it back. `applyFixture` resolves to a
+   * `FixtureApplyResult` (`{ ok, summary }` or `{ ok: false, error }`),
+   * `captureFixture` to a `FixtureCaptureResult`. Optional — absent on bridges
+   * older than this feature; `runBrowseAgent({ fixture })` then fails clearly.
+   */
+  applyFixture?(fixture: PageFixture, opts?: FixtureApplyOptions): Promise<unknown>;
+  captureFixture?(opts?: FixtureCaptureOptions): Promise<unknown>;
 }
 

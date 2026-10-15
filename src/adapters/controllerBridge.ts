@@ -14,5 +14,7 @@ export function controllerBridge(c: BrowserController): BrowserBridge {
     screenshot: (args) => c.screenshot(args),
     tabs: (args) => c.tabs(args),
     capture: (args) => c.capture(args),
+    applyFixture: (fixture, opts) => c.applyFixture(fixture, opts),
+    captureFixture: (opts) => c.captureFixture(opts),
   };
 }

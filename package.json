@@ -55,6 +55,10 @@
       "types": "./dist/adapters/controllerBridge.d.ts",
       "default": "./dist/adapters/controllerBridge.js"
     },
+    "./fixture": {
+      "types": "./dist/fixture/index.d.ts",
+      "default": "./dist/fixture/index.js"
+    },
     "./agent": {
       "types": "./dist/agent/index.d.ts",
       "default": "./dist/agent/index.js"
@@ -137,6 +141,9 @@
       ],
       "adapters/controller-bridge": [
         "dist/adapters/controllerBridge.d.ts"
+      ],
+      "fixture": [
+        "dist/fixture/index.d.ts"
       ],
       "agent": [
         "dist/agent/index.d.ts"
