@@ -19,7 +19,7 @@ jobs:
     steps:
       # The release PR is made with GITHUB_TOKEN, so other workflows (ci.yml)
       # do not run on it. It changes only the version and CHANGELOG.md.
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         id: release
         with:
           config-file: release-please-config.json
