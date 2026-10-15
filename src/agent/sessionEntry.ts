@@ -3,6 +3,7 @@
 // no schemas and no tool descriptions, so a browser bundle that only drives
 // the session (Pen Editor's frontend) does not carry them. Pinned by
 // test/agent/sessionEntry.test.ts.
+export * from "./fixtureSetup.js";
 export * from "./limits.js";
 export * from "./result.js";
 export * from "./session.js";

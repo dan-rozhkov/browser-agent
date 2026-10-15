@@ -52,9 +52,11 @@ them in step when you add an entry point.
   them. Name collisions between layers are resolved explicitly in
   `src/index.ts`.
 - `BrowserTarget.resetSession` and `routeRequests` (QA start) clear or intercept a whole
-  browser context. The desktop target runs in the user's real profile: it must never
-  implement them without scoping to the agent's own tabs (`resetSession` would log the
-  user out of everything). A network mock must be removed by `release()` when the task ends.
+  browser context. A target in a profile the user also logs into (pen-editor-desktop's
+  built-in browser) must scope them: `routeRequests` to the agent's own tabs (CDP `Fetch`
+  per tab, never a profile-wide hook) and `resetSession` to the `origins` it is given
+  (never "clear everything", or the user is logged out of every site). A network mock
+  must be removed by `release()` when the task ends.
 - Relative imports use the `.js` suffix.
 - Fixes land here first. Do not patch the copies in the consumer repos
   (pen-editor, backend, desktop).

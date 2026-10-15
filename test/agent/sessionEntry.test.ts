@@ -46,6 +46,7 @@ describe("agent/session entry", () => {
       expect(names, banned).not.toContain(banned);
     }
     expect(names).toContain("session.ts");
+    expect(names).toContain("fixtureSetup.ts");
   });
 
   it("the package maps the subpath to the built entry", () => {

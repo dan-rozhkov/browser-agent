@@ -514,9 +514,32 @@ if (result.status === "setup_failed") console.error("setup broke at", result.set
 await context.close();
 ```
 
-The desktop target runs in the user's real profile. It must not implement
-`resetSession` (it would log the user out of everything) or `routeRequests`
-(the rules would hit the user's own tabs) without scoping them to the agent's tabs.
+A host that drives `createBrowseAgentSession` itself (no `runBrowseAgent`) uses the same
+setup and release logic through `createFixtureSetup` (zod-free, from `agent/session`):
+
+```ts
+import { createBrowseAgentSession, createFixtureSetup } from "@sideform/browser-agent/agent/session";
+
+const fx = createFixtureSetup(browser, fixture, {
+  allowNetworkMocks: true,
+  snapshot: () => executeBrowseTool(browser, "browse_snapshot", {}),
+  onApplied: ({ mockCount }) => log(mockCount),   // not called if release() ran first
+});
+try {
+  await session.run(goal, driver, { setup: fx.setup });
+} finally {
+  await fx.release();   // idempotent, bounded (releaseTimeoutMs, 10 s), never throws
+}
+```
+
+`release()` does not wait for an apply that is still in flight (a run aborted at the deadline;
+a remote bridge cannot cancel): when that apply later resolves with a token, the helper releases it
+at once and does not call `onApplied`.
+
+A target in a profile the user also logs into (Pen Editor's desktop built-in
+browser) must scope both: `routeRequests` to the agent's own tabs (CDP `Fetch` per
+tab, never a profile-wide hook), and `resetSession` to the `origins` it is given.
+A "clear everything" reset there would log the user out of every site.
 
 ## Isomorphism
 
