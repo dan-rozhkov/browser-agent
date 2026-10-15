@@ -56,8 +56,25 @@ them in step when you add an entry point.
   implement them without scoping to the agent's own tabs (`resetSession` would log the
   user out of everything). A network mock must be removed by `release()` when the task ends.
 - Relative imports use the `.js` suffix.
-- Fixes land here first. Consumers (pen-editor, backend, desktop) bump the
-  git tag afterwards. Do not patch the copies in those repos.
+- Fixes land here first. Do not patch the copies in the consumer repos
+  (pen-editor, backend, desktop).
+- Releases are made by release-please. Use Conventional Commits. When a
+  release PR is open, merge it: this bumps the version, writes `CHANGELOG.md`,
+  makes the tag and the GitHub release. Do not write manual `chore: release`
+  commits or tags.
+- Versioning while 0.x: `feat` and `fix` bump the patch (0.2.x). A breaking
+  change bumps the minor (0.3.0).
+- Consumers pin an exact git tag (`#v0.2.13`). Renovate in each consumer
+  (`renovate.json`) opens a PR that moves the tag. It automerges a patch bump
+  when the consumer's CI is green. A minor bump waits for a human.
+- The release PR is made with `GITHUB_TOKEN`, so CI does not run on it. It
+  changes only the version and `CHANGELOG.md`. The publish job runs lint and
+  test again before `npm publish`. If the publish job fails, the tag exists but
+  npm does not have the version: fix the cause and re-run the job.
+- Do not run `npm publish` by hand. `prepublishOnly` stops it outside GitHub
+  Actions.
+- npm publish runs in the same workflow after a release, and only when the
+  `NPM_TOKEN` secret is set. Without it, consumers install by git tag.
 
 ## Testing
 

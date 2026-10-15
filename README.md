@@ -32,13 +32,14 @@ three pen-editor repos move onto this package.
 
 ## Install
 
-The package is private. Install it from the Git repo:
+Install it from the Git repo by tag:
 
 ```bash
-npm install github:dan-rozhkov/browser-agent#v0.2.9
+npm install github:dan-rozhkov/browser-agent#v0.2.13 # x-release-please-version
 ```
 
-`prepare` builds `dist/` on install. Peer dependencies are optional:
+When the `NPM_TOKEN` secret is set, releases are also published to npm
+as `@sideform/browser-agent`. `prepare` builds `dist/` on install. Peer dependencies are optional:
 `playwright-core` (for `adapters/playwright`) and `ai` (for
 `adapters/ai-sdk`). `zod` is a normal dependency. Node >= 20.
 
@@ -545,5 +546,19 @@ npm run lint   # tsc --noEmit && eslint
 npm test       # vitest
 npm run build  # tsc -> dist/
 ```
+
+## Releases
+
+Releases are made by release-please. Use Conventional Commits. Merge the
+release PR it opens: this bumps the version, updates `CHANGELOG.md`, and makes
+the tag and the GitHub release. Do not write manual `chore: release` commits
+or tags.
+
+While the version is 0.x, `feat` and `fix` bump the patch (0.2.x). A breaking
+change bumps the minor (0.3.0). Consumers pin an exact git tag. Renovate in
+each consumer opens a PR that moves the tag, and automerges a patch bump when
+the consumer's CI is green.
+
+npm publish runs after the release when the `NPM_TOKEN` secret is set.
 
 Migration of the three pen-editor repos: [docs/migration-plan.md](docs/migration-plan.md).

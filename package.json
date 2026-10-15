@@ -1,7 +1,6 @@
 {
   "name": "@sideform/browser-agent",
   "version": "0.2.13",
-  "private": true,
   "description": "Goal-driven browser agent: page controller, step policy and browse_task loop, decoupled from pen-editor.",
   "type": "module",
   "license": "MIT",
@@ -81,7 +80,8 @@
     "lint": "tsc --noEmit && eslint .",
     "test": "vitest run",
     "example": "tsx examples/run-task.ts",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "prepublishOnly": "node -e \"if(!process.env.GITHUB_ACTIONS){console.error('Publish only from the release workflow (.github/workflows/release.yml).');process.exit(1)}\""
   },
   "peerDependencies": {
     "ai": "^6.0.0",
@@ -158,6 +158,9 @@
         "dist/agent/aiSdk.d.ts"
       ]
     }
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "repository": {
     "type": "git",

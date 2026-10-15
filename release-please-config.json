@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "1e0b28e3b3be4cd1b67e944b7fd35b6732ee9232",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "package-name": "@sideform/browser-agent",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        "README.md"
+      ]
+    }
+  }
+}
