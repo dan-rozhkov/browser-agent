@@ -89,6 +89,18 @@ describe("absolutizeCss", () => {
 });
 
 describe("resolveImports", () => {
+  it("refuses a loopback stylesheet by default, and fetches it when isAllowed widens the policy", async () => {
+    const { fn } = fakeFetch({ "http://127.0.0.1:5173/app.css": ".app{color:red}" });
+    const [strict] = await resolveImports([link("http://127.0.0.1:5173/app.css")], fn);
+    expect(strict).not.toContain(".app");
+    const [wide] = (
+      await resolveSheets([link("http://127.0.0.1:5173/app.css")], fn, {
+        isAllowed: (u) => u.startsWith("http://127.0.0.1:5173/"),
+      })
+    ).map(flat);
+    expect(wide).toContain(".app");
+  });
+
   it("fetches a link and absolutizes its urls against the file url", async () => {
     const { fn } = fakeFetch({ "https://cdn.test/css/site.css": "a{background:url(../img/x.png)}" });
     const [out] = await resolveImports([link("https://cdn.test/css/site.css")], fn);

@@ -599,8 +599,15 @@ export interface BrowserPageHandle {
    * `<link>`/`@import` CSS; a handle without it falls back to literal
    * `@import url(...)` lines. Must reject past `maxBytes` and on timeout, and
    * must never be pointed at an address the page could not reach publicly
-   * (`isFetchableStylesheetUrl` is checked before the call).
+   * (`isFetchAllowed`, else `isFetchableStylesheetUrl`, is checked before the call).
    */
+  /**
+   * Optional: the URL policy for `fetchText`. Without it only public
+   * http(s) URLs are fetched (`isFetchableStylesheetUrl`). The desktop shell
+   * also allows the page's own origin (a local dev server); a server-side
+   * adapter must NOT widen it, since its requests leave from the server.
+   */
+  isFetchAllowed?(url: string): boolean;
   fetchText?(
     url: string,
     opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal },
@@ -3079,7 +3086,10 @@ export class BrowserController {
     index: number | null,
     deadlineAt: number,
   ): Promise<ResolvedSheet[]> {
-    const sheets = await resolveImports(sources, page.fetchText ? page.fetchText.bind(page) : undefined, { deadlineAt });
+    const sheets = await resolveImports(sources, page.fetchText ? page.fetchText.bind(page) : undefined, {
+      deadlineAt,
+      isAllowed: page.isFetchAllowed ? page.isFetchAllowed.bind(page) : undefined,
+    });
     const remainingMs = () => deadlineAt - Date.now();
     if (remainingMs() < CSS_QUERY_MIN_REMAINING_MS) return sheets;
     try {

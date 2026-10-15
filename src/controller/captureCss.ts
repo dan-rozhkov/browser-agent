@@ -354,6 +354,7 @@ class Fetcher {
     private readonly lim: ImportLimits,
     private readonly deadlineAt: number,
     private readonly now: () => number,
+    private readonly isAllowed: (url: string) => boolean = isFetchableStylesheetUrl,
   ) {}
 
   get(url: string): Promise<string | null> {
@@ -381,7 +382,7 @@ class Fetcher {
   }
 
   private async load(url: string): Promise<string | null> {
-    if (!isFetchableStylesheetUrl(url) || this.files >= this.lim.maxFiles) return null;
+    if (!this.isAllowed(url) || this.files >= this.lim.maxFiles) return null;
     this.files++;
     await this.slot();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -640,6 +641,9 @@ export interface ResolveOptions {
   /** Command deadline (ms since epoch). Default: no deadline. */
   deadlineAt?: number;
   now?: () => number;
+  /** Which URLs may be fetched. Default: isFetchableStylesheetUrl (public
+   * http(s) only). A page handle on the user's own machine may widen it. */
+  isAllowed?: (url: string) => boolean;
 }
 
 /** The v1 shape: a link becomes a fallback `@import`, an inline/adopted sheet
@@ -667,7 +671,13 @@ export async function resolveImports(
   options: ResolveOptions = {},
 ): Promise<ResolvedSheet[]> {
   const lim = { ...DEFAULT_IMPORT_LIMITS, ...options.limits };
-  const fetcher = new Fetcher(fetchText, lim, options.deadlineAt ?? Infinity, options.now ?? Date.now);
+  const fetcher = new Fetcher(
+    fetchText,
+    lim,
+    options.deadlineAt ?? Infinity,
+    options.now ?? Date.now,
+    options.isAllowed ?? isFetchableStylesheetUrl,
+  );
   return Promise.all(
     sources.map(async (src): Promise<ResolvedSheet> => {
       const media = src.kind === "adopted" ? "" : src.media;
