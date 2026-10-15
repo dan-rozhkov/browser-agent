@@ -1,66 +1,335 @@
-// Runs the seven browse tools against a `BrowserBridge`. The same mapping Pen
-// Editor's frontend handlers (src/lib/tools/browser/*) apply, minus the
-// host-only parts (canvas placement, natural-language `element` targeting).
+// The one implementation of the seven browse tools, run against a
+// `BrowserBridge`. Pen Editor's frontend handlers (src/lib/tools/browser/*) are
+// thin wrappers over this: they plug in what only the host has (the
+// natural-language `element` locator, its own "not available" texts and the
+// canvas placement after a screenshot). Imports only ../loop/*, so it stays
+// zod-free (entry: `agent/execute`).
 import type { BrowserBridge } from "../loop/bridge.js";
-import { resultError, takeSnapshot } from "../loop/shared.js";
-import { parseJsonObject } from "./session.js";
+import { resultError, takeSnapshot, type SnapshotResult } from "../loop/shared.js";
 
 const MAX_BATCH_ACTIONS = 10;
-/** A batch may start no new entry after this time. */
-const BATCH_DEADLINE_MS = 60_000;
+/** A batch may start no new entry after this time (the client-side tool-call budget is 120 s). */
+export const BATCH_DEADLINE_MS = 60_000;
 
-const ELEMENT_UNAVAILABLE =
-  'browse_act: element targeting is not available here. Use target or index instead.';
+const ELEMENT_UNAVAILABLE = "browse_act: element targeting is not available here. Use target or index instead.";
 
-const missing = (tool: string) => JSON.stringify({ error: `${tool} is not supported by this browser.` });
+/** Default for `ExecuteBrowseToolOptions.elementActions`. */
+const DEFAULT_ELEMENT_ACTIONS: readonly string[] = ["click", "type", "select", "hover", "press"];
 
-async function callBridge(call: () => Promise<unknown>): Promise<string> {
+/** "a", "a and b", "a, b, and c": the list as the refusal text prints it. */
+function listActions(actions: readonly string[]): string {
+  if (actions.length <= 2) return actions.join(" and ");
+  return `${actions.slice(0, -1).join(", ")}, and ${actions[actions.length - 1]}`;
+}
+
+export interface ElementLocateRequest {
+  element: string;
+  action: string;
+  snapshot: SnapshotResult;
+}
+
+export type ElementLocateOutcome =
+  | { outcome: "found"; index: number; label?: string; confidence?: number }
+  | { outcome: "not_found"; reason?: string }
+  | { outcome: "retry"; reason?: string }
+  | { outcome: "failed"; message: string };
+
+/** Resolves a natural-language element description to a snapshot index. */
+export type ElementLocator = (req: ElementLocateRequest) => Promise<ElementLocateOutcome>;
+
+export interface AfterScreenshotContext {
+  /** The screenshot result string, as the bridge call produced it. */
+  raw: string;
+  /** `raw` parsed (a malformed result becomes an `{ error }` object). */
+  result: Record<string, unknown>;
+  /** The tool input. */
+  args: Record<string, unknown>;
+  /** The input without `placeOnCanvas`, `x` and `y`: what the bridge got. */
+  bridgeArgs: Record<string, unknown>;
+  /** Takes another capture with `extra` merged over `bridgeArgs`; resolves to the result string. */
+  capture: (extra: Record<string, unknown>) => Promise<string>;
+}
+
+export interface ExecuteBrowseToolOptions {
+  /** The clock for the batch deadline. `runActionsBatch`'s positional `now` wins over this; the default is `Date.now`. */
+  now?: () => number;
+  /** Without it, an `element`-only `browse_act` is refused. */
+  locateElement?: ElementLocator;
+  /**
+   * The actions an `element` description can be resolved for: the host's
+   * locator must know each one. Default: click, type, select, hover, press.
+   * The refusal text for any other action lists these.
+   */
+  elementActions?: readonly string[];
+  texts?: {
+    /** No bridge at all. */
+    notAvailable?: string;
+    /** The bridge threw something that is not an Error. */
+    commandFailed?: string;
+    /** The bridge lacks `screenshot` or `tabs`. (A missing `findImages` is not guarded: the call throws and its message is the error.) */
+    methodMissing?: (tool: string) => string;
+  };
+  /** Runs after `browse_screenshot` when the input has `placeOnCanvas: true`. */
+  afterScreenshot?: (ctx: AfterScreenshotContext) => Promise<string>;
+}
+
+const NOT_AVAILABLE_DEFAULT = "The browser is not available.";
+const COMMAND_FAILED_DEFAULT = "Browser command failed.";
+const methodMissingDefault = (tool: string) => `${tool} is not supported by this browser.`;
+
+const err = (error: string) => JSON.stringify({ error });
+const isNonEmptyString = (value: unknown): value is string => typeof value === "string" && value.trim() !== "";
+
+/** Parses a tool result string back to an object. A non-object is reported as an `{ error }` object. */
+export function parseResultObject(value: string): Record<string, unknown> {
   try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch {
+    // fall through
+  }
+  return { error: "browse_act: malformed result from the browser bridge." };
+}
+
+/** Runs a bridge call and stringifies it; a throw becomes `{ error }`. Never rejects. */
+export async function callBridge(call: () => Promise<unknown>, opts: ExecuteBrowseToolOptions): Promise<string> {
+  try {
+    // `undefined` would stringify to `undefined`, not a string.
     return JSON.stringify((await call()) ?? {});
-  } catch (err) {
-    return JSON.stringify({ error: err instanceof Error ? err.message : "Browser command failed." });
+  } catch (e) {
+    return err(e instanceof Error ? e.message : (opts.texts?.commandFailed ?? COMMAND_FAILED_DEFAULT));
   }
 }
 
 /** Merge a fresh snapshot into a result. Best effort: a failed snapshot leaves the result as it is. */
-async function attachSnapshot(browser: BrowserBridge, result: Record<string, unknown>): Promise<Record<string, unknown>> {
+export async function attachSnapshot(browser: BrowserBridge, result: Record<string, unknown>): Promise<Record<string, unknown>> {
   const snap = await takeSnapshot(browser);
-  return "error" in snap ? result : { ...result, snapshot: snap };
+  if ("error" in snap) return result;
+  return { ...result, snapshot: snap };
 }
 
-function hasElementOnly(entry: Record<string, unknown>): boolean {
+/** A non-empty `element` with neither an `index` nor a non-empty `target`: it must be resolved. */
+function routesToElement(entry: Record<string, unknown>): boolean {
   const hasTarget = typeof entry.target === "string" && entry.target !== "";
-  return typeof entry.element === "string" && entry.element.trim() !== "" && entry.index == null && !hasTarget;
+  return isNonEmptyString(entry.element) && entry.index == null && !hasTarget;
 }
 
-async function actOne(browser: BrowserBridge, entry: Record<string, unknown>): Promise<string> {
-  const { element: _element, ...rest } = entry;
-  if (hasElementOnly(entry)) return JSON.stringify({ error: ELEMENT_UNAVAILABLE });
-  return callBridge(() => browser.act(rest));
-}
-
-async function actBatch(
-  browser: BrowserBridge,
-  entries: unknown[],
-  topSnapshotId: string | undefined,
-  now: () => number,
-): Promise<string> {
-  if (entries.length === 0) return JSON.stringify({ error: 'browse_act: "actions" must contain at least 1 entry.' });
-  if (entries.length > MAX_BATCH_ACTIONS) {
-    return JSON.stringify({ error: `browse_act: "actions" accepts at most ${MAX_BATCH_ACTIONS} entries.` });
+/** Cheap local checks, made before a snapshot and a locate round trip are spent on a call the bridge would refuse. */
+function validateActionArgs(action: string, rest: Record<string, unknown>): string | null {
+  if ((action === "type" || action === "select") && !isNonEmptyString(rest.text)) {
+    return `browse_act: action "${action}" requires a non-empty "text" field.`;
   }
-  const deadline = now() + BATCH_DEADLINE_MS;
+  if (action === "press" && !isNonEmptyString(rest.key)) {
+    return `browse_act: action "press" requires a non-empty "key" field.`;
+  }
+  return null;
+}
+
+async function resolveByElement(
+  browser: BrowserBridge,
+  locate: ElementLocator,
+  action: string,
+  element: string,
+  rest: Record<string, unknown>,
+  opts: ExecuteBrowseToolOptions,
+): Promise<string> {
+  const snapshotResult = await takeSnapshot(browser);
+  if ("error" in snapshotResult) {
+    return err(`browse_act: could not resolve "${element}" — snapshot failed: ${snapshotResult.error}`);
+  }
+  const snapshot = snapshotResult;
+
+  let located: ElementLocateOutcome;
+  try {
+    located = await locate({ element, action, snapshot });
+  } catch (e) {
+    return err(
+      `browse_act: element lookup failed while resolving "${element}" (${e instanceof Error ? e.message : String(e)}). Use target or index instead.`,
+    );
+  }
+
+  if (located.outcome === "failed") {
+    return err(
+      isNonEmptyString(located.message)
+        ? located.message
+        : `browse_act: element lookup failed while resolving "${element}". Use target or index instead.`,
+    );
+  }
+
+  if (located.outcome === "found" && typeof located.index === "number") {
+    const actArgs: Record<string, unknown> = { ...rest, action, index: located.index, snapshotId: snapshot.snapshotId };
+    delete actArgs.target;
+
+    const result = await callBridge(() => browser.act(actArgs), opts);
+    // The lookup took a FRESH snapshot, so any snapshotId the model already had
+    // is stale. `resolved` carries the new one, whether the act succeeded or not.
+    const resolved = {
+      index: located.index,
+      label: located.label,
+      confidence: located.confidence,
+      snapshotId: snapshot.snapshotId,
+      note: "this call took a fresh snapshot to resolve `element` — earlier snapshotIds are now stale; use this snapshotId for further index-based browse_act calls",
+    };
+    try {
+      const parsed: unknown = JSON.parse(result);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return JSON.stringify({ ...parsed, resolved });
+      }
+    } catch {
+      // not JSON: hand back the raw result
+    }
+    return result;
+  }
+
+  if (located.outcome === "not_found") {
+    return err(
+      `No element matched "${element}": ${located.reason ?? "not found"}. Call browse_snapshot to see the elements and act by index.`,
+    );
+  }
+
+  // "retry", or anything else unrecognized: never a silent success.
+  const reason = "reason" in located ? located.reason : undefined;
+  return err(
+    `browse_act: could not confidently resolve "${element}" (${reason ?? "try again or be more specific"}). Use target or index instead.`,
+  );
+}
+
+/** One action entry, a top-level call or one entry of a batch. */
+async function performOne(
+  browser: BrowserBridge | undefined,
+  entryArgs: Record<string, unknown>,
+  opts: ExecuteBrowseToolOptions,
+): Promise<string> {
+  const { element, ...rest } = entryArgs;
+
+  if (routesToElement(entryArgs)) {
+    if (!opts.locateElement) return err(ELEMENT_UNAVAILABLE);
+    const action = typeof rest.action === "string" ? rest.action : "";
+    const elementActions = opts.elementActions ?? DEFAULT_ELEMENT_ACTIONS;
+    if (!elementActions.includes(action)) {
+      return err(
+        `browse_act: "element" is only supported for ${listActions(elementActions)} actions (got "${action}"). Use target or index instead.`,
+      );
+    }
+    const validationError = validateActionArgs(action, rest);
+    if (validationError) return err(validationError);
+    if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
+    return resolveByElement(browser, opts.locateElement, action, element as string, rest, opts);
+  }
+
+  // `element` beside an index/target, or absent: it is dropped, the bridge does not know the field.
+  if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
+  return callBridge(() => browser.act(rest), opts);
+}
+
+/**
+ * A single call attaches a fresh `snapshot` when the action changed the page
+ * (`changed !== false`), and always for `wait` and `scroll`. A result without
+ * `changed`, an error too, counts as "may have changed".
+ */
+async function maybeAttachSnapshot(
+  browser: BrowserBridge | undefined,
+  action: string,
+  result: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (!browser) return result;
+  const shouldAttach = action === "wait" || action === "scroll" || result.changed !== false;
+  return shouldAttach ? attachSnapshot(browser, result) : result;
+}
+
+/**
+ * Element resolution takes its own snapshot and tells the model to use that
+ * `resolved.snapshotId`; the snapshot attached after the act is newer. With
+ * both present, drop the stale id and point the note at `snapshot.snapshotId`.
+ */
+function reconcileResolvedSnapshot(result: Record<string, unknown>): Record<string, unknown> {
+  const snapshot = result.snapshot;
+  const resolved = result.resolved;
+  if (
+    !snapshot ||
+    typeof snapshot !== "object" ||
+    typeof (snapshot as { snapshotId?: unknown }).snapshotId !== "string" ||
+    !resolved ||
+    typeof resolved !== "object" ||
+    Array.isArray(resolved)
+  ) {
+    return result;
+  }
+  const freshSnapshotId = (snapshot as { snapshotId: string }).snapshotId;
+  const { snapshotId: _stale, ...restResolved } = resolved as Record<string, unknown>;
+  return {
+    ...result,
+    resolved: {
+      ...restResolved,
+      note: `a newer snapshot was taken after this action settled — use snapshot.snapshotId ("${freshSnapshotId}") for further index-based browse_act calls, not the snapshotId this "resolved" carried`,
+    },
+  };
+}
+
+/**
+ * An `element` entry re-snapshots the page, which makes the batch's
+ * `snapshotId` stale for every index-based entry after it. Returns the index
+ * of the offending `element` entry, or `undefined` when the order is fine.
+ */
+function findStaleOrderViolation(entries: unknown[]): number | undefined {
+  let elementEntryIndex: number | undefined;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const obj = entry as Record<string, unknown>;
+    if (elementEntryIndex === undefined) {
+      if (routesToElement(obj)) elementEntryIndex = i;
+      continue;
+    }
+    if (obj.index != null) return elementEntryIndex;
+  }
+  return undefined;
+}
+
+/**
+ * Runs `actions` in order, stopping at the first entry that returns `{ error }`.
+ * Index entries without their own `snapshotId` get `topSnapshotId`. Result:
+ * `{ results, completed, stoppedAt?, error?, snapshot? }`; the trailing
+ * snapshot is skipped once the 60 s deadline has passed. A batch result is not
+ * reconciled (`resolved` keeps its snapshotId).
+ */
+export async function runActionsBatch(
+  browser: BrowserBridge | undefined,
+  actions: unknown[],
+  topSnapshotId: string | undefined,
+  now?: () => number,
+  opts: ExecuteBrowseToolOptions = {},
+): Promise<string> {
+  // One clock: the positional `now`, else `opts.now`, else Date.now.
+  const clock = now ?? opts.now ?? (() => Date.now());
+  if (actions.length === 0) return err('browse_act: "actions" must contain at least 1 entry.');
+  if (actions.length > MAX_BATCH_ACTIONS) return err(`browse_act: "actions" accepts at most ${MAX_BATCH_ACTIONS} entries.`);
+  if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
+
+  if (opts.locateElement) {
+    const staleOrderIndex = findStaleOrderViolation(actions);
+    if (staleOrderIndex != null) {
+      return err(
+        `browse_act: actions[${staleOrderIndex}] uses "element", which re-snapshots the page and ` +
+          "makes the batch's snapshotId stale for every index-based entry after it — element entries " +
+          "re-snapshot the page; put them last or split the batch.",
+      );
+    }
+  }
+
+  const deadline = clock() + BATCH_DEADLINE_MS;
   const results: unknown[] = [];
   let completed = 0;
   let stoppedAt: number | undefined;
   let batchError: string | undefined;
-  for (let i = 0; i < entries.length; i++) {
-    if (now() >= deadline) {
+
+  for (let i = 0; i < actions.length; i++) {
+    if (clock() >= deadline) {
       batchError = "browse_act: batch deadline reached.";
       stoppedAt = i;
       break;
     }
-    const raw = entries[i];
+    const raw = actions[i];
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       batchError = `browse_act: actions[${i}] must be an object.`;
       results.push({ error: batchError });
@@ -70,83 +339,112 @@ async function actBatch(
     const entry: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
     // The bridge reads any snapshotId as index mode: copy it only into entries with an index.
     if (entry.snapshotId == null && topSnapshotId != null && entry.index != null) entry.snapshotId = topSnapshotId;
-    const parsed = parseJsonObject(await actOne(browser, entry));
+
+    const parsed = parseResultObject(await performOne(browser, entry, opts));
     results.push(parsed);
-    const err = resultError(parsed);
-    if (err) {
-      batchError = err;
+    const entryError = resultError(parsed);
+    if (entryError) {
+      batchError = entryError;
       stoppedAt = i;
       break;
     }
     completed++;
   }
+
   const out: Record<string, unknown> = {
     results,
     completed,
     ...(stoppedAt != null ? { stoppedAt } : {}),
     ...(batchError ? { error: batchError } : {}),
   };
-  return JSON.stringify(now() >= deadline ? out : await attachSnapshot(browser, out));
+  return JSON.stringify(clock() >= deadline ? out : await attachSnapshot(browser, out));
 }
 
-async function browseAct(browser: BrowserBridge, input: Record<string, unknown>, now: () => number): Promise<string> {
+async function browseAct(
+  browser: BrowserBridge | undefined,
+  input: Record<string, unknown>,
+  opts: ExecuteBrowseToolOptions,
+): Promise<string> {
   const { actions, ...top } = input;
   if (Array.isArray(actions)) {
-    return actBatch(browser, actions, typeof top.snapshotId === "string" ? top.snapshotId : undefined, now);
+    return runActionsBatch(browser, actions, typeof top.snapshotId === "string" ? top.snapshotId : undefined, opts.now, opts);
   }
   const action = typeof input.action === "string" ? input.action : "";
-  const parsed = parseJsonObject(await actOne(browser, input));
-  // A snapshot follows a change; wait and scroll always get one. A result
-  // without `changed` (an error too) counts as "may have changed".
-  const attach = action === "wait" || action === "scroll" || parsed.changed !== false;
-  return JSON.stringify(attach ? await attachSnapshot(browser, parsed) : parsed);
+  const resultStr = await performOne(browser, input, opts);
+  if (!browser) return resultStr;
+  const withSnapshot = await maybeAttachSnapshot(browser, action, parseResultObject(resultStr));
+  return JSON.stringify(reconcileResolvedSnapshot(withSnapshot));
+}
+
+async function browseScreenshot(
+  browser: BrowserBridge | undefined,
+  args: Record<string, unknown>,
+  opts: ExecuteBrowseToolOptions,
+): Promise<string> {
+  const { placeOnCanvas, x: _x, y: _y, ...bridgeArgs } = args;
+  const shot = browser?.screenshot?.bind(browser);
+  const take = async (extra: Record<string, unknown>): Promise<string> => {
+    if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
+    if (!shot) return err((opts.texts?.methodMissing ?? methodMissingDefault)("browse_screenshot"));
+    return callBridge(() => shot({ ...bridgeArgs, ...extra }), opts);
+  };
+  const raw = await take({});
+  if (placeOnCanvas !== true || !opts.afterScreenshot) return raw;
+  return opts.afterScreenshot({
+    raw,
+    result: parseResultObject(raw),
+    args,
+    bridgeArgs,
+    capture: take,
+  });
 }
 
 /**
- * Run one of the seven browse tools. Always resolves to a JSON string: a
- * refusal or a failure is `{ "error": "..." }`. A successful `browse_open` and
- * a page-changing `browse_act` carry a fresh `snapshot`, as in Pen Editor.
+ * Run one of the seven browse tools. Always resolves to a string: a refusal or
+ * a failure is `{ "error": "..." }`. A successful `browse_open` and a
+ * page-changing `browse_act` carry a fresh `snapshot`.
  *
- * `browse_screenshot` passes only `annotate` to the bridge: the host-only
- * fields of a widened schema (`placeOnCanvas`, `x`, `y`) are dropped. A host
- * that supports them handles the tool itself.
+ * `browse_act` accepts `element` (a description of the target) only when
+ * `opts.locateElement` is given; without it an element-only call is refused.
  */
 export async function executeBrowseTool(
-  browser: BrowserBridge,
+  browser: BrowserBridge | undefined,
   toolName: string,
   input: unknown,
-  opts: { now?: () => number } = {},
+  opts: ExecuteBrowseToolOptions = {},
 ): Promise<string> {
-  const args: Record<string, unknown> = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+  const args: Record<string, unknown> =
+    input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+  const notAvailable = () => err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
   switch (toolName) {
     case "browse_open": {
-      const raw = await callBridge(() => browser.open({ url: String(args.url ?? "") }));
-      const parsed = parseJsonObject(raw);
+      if (!browser) return notAvailable();
+      const raw = await callBridge(() => browser.open(args as { url: string }), opts);
+      const parsed = parseResultObject(raw);
       if (resultError(parsed)) return raw;
       return JSON.stringify(await attachSnapshot(browser, parsed));
     }
     case "browse_snapshot":
-      return callBridge(() => browser.snapshot());
-    case "browse_screenshot": {
-      const shot = browser.screenshot?.bind(browser);
-      if (!shot) return missing(toolName);
-      return callBridge(() => shot(args.annotate === true ? { annotate: true } : {}));
-    }
+      return browser ? callBridge(() => browser.snapshot(), opts) : notAvailable();
+    case "browse_screenshot":
+      return browseScreenshot(browser, args, opts);
     case "browse_act":
-      return browseAct(browser, args, opts.now ?? (() => Date.now()));
+      return browseAct(browser, args, opts);
     case "browse_tabs": {
+      if (!browser) return notAvailable();
       const tabs = browser.tabs?.bind(browser);
-      if (!tabs) return missing(toolName);
-      return callBridge(() => tabs(args as Parameters<NonNullable<BrowserBridge["tabs"]>>[0]));
+      if (!tabs) return err((opts.texts?.methodMissing ?? methodMissingDefault)(toolName));
+      return callBridge(() => tabs(args as Parameters<NonNullable<BrowserBridge["tabs"]>>[0]), opts);
     }
     case "browse_find_images": {
-      const find = browser.findImages?.bind(browser);
-      if (!find) return missing(toolName);
-      return callBridge(() => find(args));
+      if (!browser) return notAvailable();
+      // Not guarded, as Pen Editor's handler never was: a bridge without
+      // `findImages` throws, and the TypeError message is the error.
+      return callBridge(() => browser.findImages!(args), opts);
     }
     case "browse_read":
-      return callBridge(() => browser.read(args));
+      return browser ? callBridge(() => browser.read(args), opts) : notAvailable();
     default:
-      return JSON.stringify({ error: `Unknown browse tool: ${toolName}.` });
+      return err(`Unknown browse tool: ${toolName}.`);
   }
 }

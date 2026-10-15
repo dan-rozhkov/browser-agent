@@ -46,15 +46,21 @@ describe("executeBrowseTool", () => {
     expect(await run(b, "browse_find_images", {})).toEqual({ images: [] });
   });
 
+  it("browse_find_images on a bridge without findImages reports the TypeError message (no guard)", async () => {
+    const r = await run(fakeBrowser(), "browse_find_images", {});
+    expect(r.error).toMatch(/findImages/);
+    expect(r.error).not.toMatch(/not supported/);
+  });
+
   it("reports a missing optional bridge method", async () => {
     const r = await run(fakeBrowser(), "browse_tabs", { action: "list" });
     expect(r.error).toMatch(/browse_tabs is not supported/);
   });
 
-  it("browse_screenshot passes only annotate", async () => {
+  it("browse_screenshot forwards everything except placeOnCanvas, x and y", async () => {
     const screenshot = vi.fn(async () => ({ imageData: "data:image/jpeg;base64,AAAA" }));
-    await run(fakeBrowser({ screenshot }), "browse_screenshot", { annotate: true, placeOnCanvas: true, x: 1 });
-    expect(screenshot).toHaveBeenCalledWith({ annotate: true });
+    await run(fakeBrowser({ screenshot }), "browse_screenshot", { annotate: true, fullPage: true, placeOnCanvas: true, x: 1, y: 2 });
+    expect(screenshot).toHaveBeenCalledWith({ annotate: true, fullPage: true });
   });
 
   it("browse_act: one action gets a snapshot when the page changed", async () => {

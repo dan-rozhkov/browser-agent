@@ -63,6 +63,10 @@
       "types": "./dist/agent/sessionEntry.d.ts",
       "default": "./dist/agent/sessionEntry.js"
     },
+    "./agent/execute": {
+      "types": "./dist/agent/executeEntry.d.ts",
+      "default": "./dist/agent/executeEntry.js"
+    },
     "./agent/ai-sdk": {
       "types": "./dist/agent/aiSdk.d.ts",
       "default": "./dist/agent/aiSdk.js"
@@ -137,6 +141,9 @@
       ],
       "agent/session": [
         "dist/agent/sessionEntry.d.ts"
+      ],
+      "agent/execute": [
+        "dist/agent/executeEntry.d.ts"
       ],
       "agent/ai-sdk": [
         "dist/agent/aiSdk.d.ts"

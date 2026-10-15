@@ -349,9 +349,21 @@ What the package owns:
   `Chat` is another, on the same core.
 - **Result helpers**: `finalAnswer(messages, status)` over a minimal message
   type that `UIMessage` satisfies, and `preOpenText(goal, url, openedResult)`.
-- **Tool execution**: `executeBrowseTool(browser, name, input)` maps the seven
+- **Tool execution**: `executeBrowseTool(browser, name, input, opts?)` maps the seven
   tools onto a `BrowserBridge` (a snapshot follows `browse_open` and a changed page;
-  `browse_act` batches up to 10 entries).
+  `browse_act` batches up to 10 entries). It is the one implementation: Pen
+  Editor's handlers are thin wrappers over it. `opts` plugs in what only a host
+  has: `locateElement` (resolves `browse_act`'s `element` description to an
+  index; see the next list), `texts` (`notAvailable`, `commandFailed`,
+  `methodMissing` for `browse_screenshot` and `browse_tabs`), `elementActions` (the
+  actions the locator can resolve; default click, type, select, hover, press),
+  `afterScreenshot` (a hook that runs after `browse_screenshot`
+  when the input has `placeOnCanvas: true`) and `now`. `browser` may be
+  `undefined`: every tool then answers `texts.notAvailable`. `runActionsBatch`
+  (also exported) runs a batch with an injectable clock (the positional `now`,
+  else `opts.now`, else `Date.now`); its 60 s deadline is `BATCH_DEADLINE_MS`.
+  A locator outcome `failed` without a message answers a default
+  "element lookup failed" error, never a silent success.
 
 What stays in the host:
 
@@ -363,9 +375,12 @@ What stays in the host:
 - **Nested chat transport.** A product that streams the sub-run through its
   own chat (Pen Editor: a headless `Chat` against `/api/chat`) writes its driver
   and uses `createBrowseAgentSession` for everything else.
-- **`element` targeting** of `browse_act` (a description instead of an index)
-  is not in the package: `executeBrowseTool` answers "not available, use target
-  or index", so the neutral definitions do not offer the field.
+- **`element` targeting** of `browse_act` (a description instead of an index).
+  The package owns the routing, the checks, the snapshot rules and the result
+  (`resolved`), but the lookup itself is the host's `locateElement` (Pen Editor
+  calls its backend). Without a locator `executeBrowseTool` answers "not
+  available, use target or index", so the neutral definitions do not offer the
+  field and `runBrowseAgent` passes none.
 - **Vision.** By default the `browse_screenshot` result is text only: the JSON
   without `imageData`, plus an `imageNote` that an image was taken but is not
   attached. OpenAI-compatible providers (`@ai-sdk/openai-compatible`) print an
@@ -380,6 +395,31 @@ What stays in the host:
 `createBrowseAgentSession` and `singleUseTool` and imports no zod, no schemas
 and no descriptions (about 13 KB of text). A frontend that drives the session
 with its own chat (Pen Editor) imports this entry, not `/agent`.
+
+`@sideform/browser-agent/agent/execute` exports `executeBrowseTool`,
+`runActionsBatch`, `parseResultObject`, `callBridge`, `attachSnapshot` and their types, and imports no zod, no
+`ai` and no schemas. A frontend that runs the browse tools against its own
+bridge (Pen Editor's handlers) imports this entry, not `/agent`. Pinned by
+`test/agent/executeEntry.test.ts`.
+
+#### Notes: one executor for the seven tools
+
+The tool executor now serves Pen Editor and `runBrowseAgent` alike. For
+`runBrowseAgent` (no locator, no hooks) these edge cases changed:
+
+- **A malformed `browse_act` result** (not a JSON object): the entry result is
+  `{ "error": "browse_act: malformed result from the browser bridge." }`, no
+  longer `{}`. In a batch this now stops the batch.
+- **`browse_open`** forwards all its input to `bridge.open`, not only `{ url }`.
+- **`browse_find_images`** no longer checks that the bridge has `findImages`:
+  a bridge without it throws a `TypeError`, and its message is the `error`
+  (before: `browse_find_images is not supported by this browser.`). Pen Editor's
+  handler never checked either.
+- **`browse_screenshot`** forwards all its input except `placeOnCanvas`, `x`
+  and `y`, not only `annotate`.
+- **Unchanged**: `element` alone is still refused (before any bridge call).
+  A batch with no locator has no stale-order check; an `element` entry stops
+  the batch at its own error.
 
 ## Isomorphism
 

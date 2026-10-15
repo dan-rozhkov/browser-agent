@@ -25,7 +25,7 @@ src/controller/   BrowserController, page scripts, keys, navigation (BrowserTarg
 src/policy/       decideStep / planGoal / locateTarget, step policies, schemas, DecisionClient, TextModel
 src/loop/         runBrowseTask, action cache, loop guard, BrowserBridge, BrowseBackend, KeyValueStorage
 src/adapters/     playwright, systemoneHttp, aiSdk, httpBackend, localBackend, controllerBridge
-src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; aiSdk.ts = runBrowseAgent (peer ai)
+src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; execute.ts + executeEntry.ts = the one executor of the seven browse tools, zod-free `agent/execute`; aiSdk.ts = runBrowseAgent (peer ai)
 src/index.ts      root barrel: controller + policy + loop (NOT adapters)
 test/<layer>/     mirrors src; examples/ is type-checked by lint
 ```

@@ -292,6 +292,11 @@ model drives seven `browse_*` tools in a plain tool loop (Pen Editor's
 - `agent/sessionEntry.ts` (`agent/session`): limits, result helpers and the
   session core only, with no zod, schemas or descriptions, for browser bundles.
   `test/agent/sessionEntry.test.ts` checks its import graph and built JS.
+- `agent/executeEntry.ts` (`agent/execute`): `executeBrowseTool` and `runActionsBatch`,
+  the one implementation of the seven browse tools. Zod-free and `ai`-free. The
+  host plugs in `locateElement`, `texts` and `afterScreenshot`; Pen Editor's
+  handlers are wrappers over it. `test/agent/executeEntry.test.ts` checks the graph;
+  `test/agent/execute*.test.ts` pin the exact output.
 - Screenshots: the `runBrowseAgent` tool result is text only by default (no
   `imageData`, an `imageNote` instead); `toolResultImages: true` adds the image
   part for providers that carry tool-result images natively.
