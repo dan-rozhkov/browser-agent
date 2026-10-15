@@ -3048,6 +3048,50 @@ describe("act: press", () => {
     expect(result).toHaveProperty("changed");
     expect(result.openedTab).toEqual({ tabId: 2, url: "https://b/", title: "B" });
   });
+
+  it("waits for a just-opened popup's url instead of reporting it blank", async () => {
+    // A popup is listed the moment it is created, before its first
+    // navigation lands: the first listings after the click carry url "".
+    let listCalls = 0;
+    const target = {
+      ...makeFakeTarget(makeFakePage({ sendCdp: vi.fn((_method: string, _params?: Record<string, unknown>) => Promise.resolve({})) })),
+      listPages: vi.fn(() => {
+        listCalls += 1;
+        const popupUrl = listCalls >= 5 ? "https://b/" : "";
+        return Promise.resolve(
+          listCalls === 1
+            ? [{ tabId: 1, url: "https://a/", title: "A", current: true }]
+            : [
+                { tabId: 1, url: "https://a/", title: "A", current: true },
+                { tabId: 2, url: popupUrl, title: popupUrl ? "B" : "New Tab", current: false },
+              ],
+        );
+      }),
+    };
+    const controller = new BrowserController(target);
+    const result = (await controller.act({ action: "press", key: "Enter" })) as {
+      openedTab?: { tabId: number; url: string; title: string };
+    };
+    expect(result.openedTab).toEqual({ tabId: 2, url: "https://b/", title: "B" });
+  });
+
+  it("drops openedTab when the popup closes itself while its url is still blank", async () => {
+    let listCalls = 0;
+    const target = {
+      ...makeFakeTarget(makeFakePage({ sendCdp: vi.fn((_method: string, _params?: Record<string, unknown>) => Promise.resolve({})) })),
+      listPages: vi.fn(() => {
+        listCalls += 1;
+        const opener = { tabId: 1, url: "https://a/", title: "A", current: true };
+        // First listing: before the press. Then the blank popup shows up for
+        // a moment, and is gone on the next re-list.
+        if (listCalls === 1 || listCalls >= 5) return Promise.resolve([opener]);
+        return Promise.resolve([opener, { tabId: 2, url: "", title: "New Tab", current: false }]);
+      }),
+    };
+    const controller = new BrowserController(target);
+    const result = (await controller.act({ action: "press", key: "Enter" })) as { openedTab?: unknown };
+    expect(result.openedTab).toBeUndefined();
+  });
 });
 
 describe("act: hover", () => {

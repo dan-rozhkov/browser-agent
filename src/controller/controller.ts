@@ -116,6 +116,12 @@ const SLIDER_TIME_MARGIN_MS = 3_000;
 const READ_MAX_CHARS_DEFAULT = 6_000;
 const READ_MAX_CHARS_HARD_CAP = 20_000;
 
+/** How long a command result waits for a just-opened popup's url (see
+ * resolveOpenedTab), and how often it re-lists the tabs meanwhile. Short on
+ * purpose: a popup that stays on about:blank (window.open('') + document.write)
+ * pays this on every click that opens it. */
+const OPENED_TAB_URL_WAIT_MS = 1_000;
+const OPENED_TAB_URL_POLL_MS = 50;
 /** browse-capture design (2026-10-15): the serialized HTML document of a
  * `capture` over this many characters is refused. */
 const CAPTURE_MAX_CHARS = 3_000_000;
@@ -2547,7 +2553,7 @@ export class BrowserController {
       (await this.detectOpenedTab(tabsBefore)) !== undefined,
     );
     const currentUrl = page.getURL();
-    const openedTab = await this.detectOpenedTab(tabsBefore);
+    const openedTab = await this.resolveOpenedTab(tabsBefore, deadlineAt);
     const merged: BrowserCommandResult = {
       ...result,
       url: currentUrl,
@@ -2674,7 +2680,7 @@ export class BrowserController {
     await this.settleAfterClick(page, navWatcher, networkBaseline);
     const after = await this.captureSignature(page, "after");
     const currentUrl = page.getURL();
-    const openedTab = await this.detectOpenedTab(tabsBefore);
+    const openedTab = await this.resolveOpenedTab(tabsBefore);
     const result: BrowserCommandResult = {
       url: currentUrl,
       title: page.getTitle(),
@@ -3542,6 +3548,34 @@ export class BrowserController {
     return { tabId: opened.tabId, url: opened.url, title: opened.title };
   }
 
+  /** `detectOpenedTab` for the command RESULT. A popup is listed the moment
+   * it is created, before its first navigation lands, so one listing can
+   * report `url: ""` (title "New Tab") and the agent gets a tab it cannot
+   * tell apart. Re-list it briefly (up to OPENED_TAB_URL_WAIT_MS) until the
+   * url is known. The settle predicate keeps using the plain, instant
+   * `detectOpenedTab`: it only needs to know that a tab appeared. */
+  private async resolveOpenedTab(
+    before: BrowserTabInfo[],
+    deadlineAt?: number,
+  ): Promise<{ tabId: number; url: string; title: string } | undefined> {
+    let opened = await this.detectOpenedTab(before);
+    if (!opened) return undefined;
+    // Never eat into the command's own budget: a late result is a timeout
+    // the agent may answer by clicking (and opening a popup) again.
+    let waitUntil = Date.now() + OPENED_TAB_URL_WAIT_MS;
+    if (deadlineAt !== undefined) waitUntil = Math.min(waitUntil, deadlineAt - SETTLE_HEADROOM_MS);
+    while ((!opened.url || opened.url === "about:blank") && Date.now() < waitUntil) {
+      await new Promise((resolve) => setTimeout(resolve, OPENED_TAB_URL_POLL_MS));
+      const tabId: number = opened.tabId;
+      const again = (await this.listPagesSafe()).find((p) => p.tabId === tabId);
+      // The popup closed itself (an OAuth/payment window): there is no tab
+      // left to report.
+      if (!again) return undefined;
+      opened = { tabId: again.tabId, url: again.url, title: again.title };
+    }
+    return opened;
+  }
+
   /** Acts by index against the elements table from the caller's most recent
    * snapshot() — see validatePerformArgs and lastSnapshot's doc comment for
    * the staleness/cross-tab guard. CLICK reuses the same post-click settle
@@ -3625,7 +3659,7 @@ export class BrowserController {
       (await this.detectOpenedTab(tabsBefore)) !== undefined,
     );
         const currentUrl = page.getURL();
-        const openedTab = await this.detectOpenedTab(tabsBefore);
+        const openedTab = await this.resolveOpenedTab(tabsBefore, deadlineAt);
         const merged: BrowserCommandResult = {
           ...result,
           url: currentUrl,
