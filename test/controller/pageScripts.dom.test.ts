@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach } from "vitest";
-import { ARGS_MARKER, CAPTURE_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
+import { ARGS_MARKER, CAPTURE_JS, CSS_QUERY_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
 import { BrowserController } from "../../src/controller/controller.js";
 
 /** Runs a page script in the happy-dom document, like page.evaluate would. */
@@ -254,19 +254,47 @@ describe("SNAPSHOT_JS inputType", () => {
 
 describe("CAPTURE_JS", () => {
   const doc = { snapshotId: null, index: null, maxChars: 3_000_000 };
-  const capture = (args: unknown = doc) => run(CAPTURE_JS, args);
+  // v2: CAPTURE_JS returns the parts; `html` is the body-side document with
+  // no style sources (those are assembled in the controller, see captureCss).
+  const capture = (args: unknown = doc) => {
+    const res = run(CAPTURE_JS, args);
+    if (res.error === undefined) {
+      res.html = "<!doctype html>" + res.htmlOpen + "<head></head>" + res.bodyOpen + res.bodyHtml + "</body></html>";
+    }
+    return res;
+  };
 
-  it("turns <link rel=stylesheet> into an @import style and keeps style text with absolute urls", () => {
+  it("reports <link rel=stylesheet> and <style> as ordered sources and no longer emits them in the body", () => {
     document.head.innerHTML =
-      '<link rel="stylesheet" href="/a.css"><style>.x{background:url(img/bg.png)}</style>';
+      '<link rel="stylesheet" href="/a.css"><style>.x{background:url(img/bg.png)}</style>' +
+      '<link rel="stylesheet" href="/p.css" media="print"><link rel="alternate stylesheet" href="/alt.css">';
     document.body.innerHTML = "<p>hi</p>";
     const res = capture();
     expect(res.error).toBeUndefined();
-    expect(res.html).toContain("<!doctype html>");
-    expect(res.html).toMatch(/<style>@import url\("[^"]*\/a\.css"\);<\/style>/);
-    expect(res.html).toMatch(/background:url\("[^"]*\/img\/bg\.png"\)/);
+    expect(res.sources).toEqual([
+      { kind: "link", href: expect.stringMatching(/^http.*\/a\.css$/), media: "" },
+      { kind: "inline", text: ".x{background:url(img/bg.png)}", baseUrl: expect.stringMatching(/^http/), media: "" },
+      { kind: "link", href: expect.stringMatching(/^http.*\/p\.css$/), media: "print" },
+    ]);
     expect(res.html).not.toContain("<link");
-    expect(res.html.indexOf("a.css")).toBeLessThan(res.html.indexOf("bg.png"));
+    expect(res.html).not.toContain("<style");
+    expect(res.htmlOpen).toMatch(/^<html/);
+    expect(res.bodyOpen).toMatch(/^<body/);
+    expect(res.bodyHtml).toContain("<p>hi</p>");
+    document.head.innerHTML = "";
+  });
+
+  it("reports adopted stylesheets after the document sources", () => {
+    document.head.innerHTML = "<style>.a{color:red}</style>";
+    Object.defineProperty(document, "adoptedStyleSheets", {
+      value: [{ cssRules: [{ cssText: ".b{background:url(q.png)}" }] }],
+      configurable: true,
+    });
+    document.body.innerHTML = "<p>x</p>";
+    const res = capture();
+    expect(res.sources.map((x: { kind: string }) => x.kind)).toEqual(["inline", "adopted"]);
+    expect(res.sources[1].text).toMatch(/background:url\("http[^"]*\/q\.png"\)/);
+    delete (document as any).adoptedStyleSheets;
     document.head.innerHTML = "";
   });
 
@@ -353,7 +381,8 @@ describe("CAPTURE_JS", () => {
   it("refuses a document over maxChars", () => {
     document.body.innerHTML = "<p>" + "x".repeat(5000) + "</p>";
     const res = capture({ snapshotId: null, index: null, maxChars: 1000 });
-    expect(res.error).toMatch(/^Page is too large to capture \(\d+\.\dK characters, limit 1\.0K\)\.$/);
+    expect(res.error).toBeUndefined();
+    expect(res.tooLarge).toBeGreaterThan(5000);
   });
 
   it("clones into an inert document: the live lazy image is untouched, the output has the promoted src", () => {
@@ -380,7 +409,7 @@ describe("CAPTURE_JS", () => {
     expect(html).toMatch(/<img[^>]*srcset="http[^"]*\/i1\.jpg 1x, http[^"]*\/i2\.jpg 2x"/);
   });
 
-  it("passes an empty-text <style> through its cssRules with absolute urls", () => {
+  it("passes an empty-text <style> through its cssRules as an inline source with absolute urls", () => {
     document.head.innerHTML = "<style></style>";
     const st = document.head.querySelector("style") as HTMLStyleElement;
     Object.defineProperty(st, "sheet", {
@@ -388,8 +417,10 @@ describe("CAPTURE_JS", () => {
       configurable: true,
     });
     document.body.innerHTML = "<p>x</p>";
-    const html = capture().html as string;
-    expect(html).toMatch(/\.z\{background:url\("http[^"]*\/rel\/z\.png"\)\}/);
+    const res = capture();
+    expect(res.sources).toHaveLength(1);
+    expect(res.sources[0].kind).toBe("inline");
+    expect(res.sources[0].text).toMatch(/\.z\{background:url\("http[^"]*\/rel\/z\.png"\)\}/);
     document.head.innerHTML = "";
   });
 
@@ -405,8 +436,8 @@ describe("CAPTURE_JS", () => {
     expect(html).toContain("&{display:block}");
     expect(html).toContain("&:is(.on) b{color:red}");
     expect(html).toContain("<b>in</b>");
-    // the shadow style is not hoisted into <head>
-    expect(html.indexOf("data-capture-host")).toBeGreaterThan(html.indexOf("</head>"));
+    // the shadow style is not hoisted into the document sources
+    expect(capture().sources).toEqual([]);
   });
 
   it("element mode inside a shadow root carries the enclosing root styles under the wrapper scope", () => {
@@ -449,5 +480,44 @@ describe("CAPTURE_JS", () => {
     expect(html).toMatch(/<body[^>]*style="[^"]*--brand:#123456/);
     document.documentElement.removeAttribute("data-theme");
     document.body.removeAttribute("style");
+  });
+});
+
+describe("CSS_QUERY_JS", () => {
+  const query = (args: Record<string, unknown>) =>
+    run(CSS_QUERY_JS, { rootCompounds: [], selectors: [], snapshotId: null, index: null, ...args });
+
+  it("reports which root compounds the live <html> matches", () => {
+    document.documentElement.setAttribute("data-theme", "dark");
+    const res = query({ rootCompounds: ["html[data-theme=dark]", "html[data-theme=light]", ":root"] });
+    expect(res.rootMatches.sort()).toEqual([":root", "html[data-theme=dark]"]);
+    document.documentElement.removeAttribute("data-theme");
+  });
+
+  it("reports selectors that exist in the document, and the ones the browser rejects", () => {
+    document.body.innerHTML = '<div class="a"><b class="c"></b></div>';
+    const res = query({ selectors: [".a", ".a > .c", ".nope", "a[[", ".a:not(.zzz)"] });
+    expect(res.existing).toEqual([".a", ".a > .c", ".a:not(.zzz)"]);
+    expect(res.unparseable).toEqual(["a[["]);
+  });
+
+  it("in element mode tests the target, its ancestors and its descendants, not siblings", () => {
+    document.body.innerHTML = '<p class="out"></p><div data-pen-snap="s1:2" class="tgt"><i class="in"></i></div>';
+    const res = query({ snapshotId: "s1", index: 2, selectors: [".out", ".tgt", ".in", "div > i", "body", "html"] });
+    expect(res.existing).toEqual([".tgt", ".in", "div > i", "body", "html"]);
+  });
+
+  it("a body rule survives an element-mode capture", () => {
+    document.head.innerHTML = "<style>body{margin:0} .zzz{color:red}</style>";
+    document.body.innerHTML = '<div data-pen-snap="s1:2" class="tgt"><i></i></div>';
+    const res = run(CAPTURE_JS, { snapshotId: "s1", index: 2, maxChars: 3_000_000 });
+    const q = run(CSS_QUERY_JS, { rootCompounds: [], selectors: ["body", ".zzz"], snapshotId: "s1", index: 2 });
+    expect(res.sources[0].text).toContain("body{margin:0}");
+    expect(q.existing).toEqual(["body"]);
+    document.head.innerHTML = "";
+  });
+
+  it("errors on a missing element stamp", () => {
+    expect(query({ snapshotId: "s1", index: 9 }).error).toMatch(/not found/);
   });
 });

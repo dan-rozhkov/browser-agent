@@ -1,11 +1,156 @@
 // Playwright-backed BrowserTarget / BrowserPageHandle for the BrowserController.
 // Wraps an EXISTING BrowserContext (from chromium.connectOverCDP to a Steel session) —
 // there is no launch path: no Chromium runs on this host.
-// Implemented optional methods: isVisible, capture, sendCdp, drainDialogs, drainConsoleErrors,
+// Implemented optional methods: isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
 // onNavigationEvent, networkStats, listFrames, executeJavaScriptInFrame, listPages/selectPage/closePage/newPage/pageHandles.
 import type { BrowserContext, Page, CDPSession, Frame } from "playwright-core";
+import { promises as dns } from "node:dns";
+import http from "node:http";
+import https from "node:https";
+import type { IncomingMessage } from "node:http";
+import zlib from "node:zlib";
+import type { Readable } from "node:stream";
 import { BrowserController } from "../controller/index.js";
+import { isBlockedIp, isFetchableStylesheetUrl } from "../controller/captureCss.js";
 import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../controller/index.js";
+
+const MAX_FETCH_REDIRECTS = 3;
+
+type Resolved = { address: string; family: number }[];
+type LookupCallback = (err: Error | null, address?: string | Resolved, family?: number) => void;
+
+/** A `lookup` for `http.request` that resolves ALL addresses and REJECTS if
+ * any is private/loopback/link-local/...: the address that was checked is the
+ * address the socket connects to, so a DNS answer cannot change in between
+ * (DNS rebinding). */
+export function guardedLookup(lookupAll: (host: string) => Promise<Resolved>) {
+  return (hostname: string, options: { all?: boolean; family?: number } | number, cb: LookupCallback): void => {
+    const opts = typeof options === "object" && options ? options : {};
+    lookupAll(hostname).then(
+      (addrs) => {
+        if (addrs.length === 0 || addrs.some((a) => isBlockedIp(a.address))) {
+          cb(new Error("blocked address"));
+          return;
+        }
+        const usable = opts.family === 4 || opts.family === 6 ? addrs.filter((a) => a.family === opts.family) : addrs;
+        if (usable.length === 0) cb(new Error("no address of the requested family"));
+        else if (opts.all) cb(null, usable);
+        else cb(null, usable[0].address, usable[0].family);
+      },
+      (err: Error) => cb(err),
+    );
+  };
+}
+
+type GuardedLookup = ReturnType<typeof guardedLookup>;
+
+/** Seams for tests: how a hostname is resolved and how one request is made. */
+export interface StylesheetFetchDeps {
+  lookupAll?: (host: string) => Promise<Resolved>;
+  request?: (
+    url: URL,
+    init: { headers: Record<string, string>; signal: AbortSignal; lookup: GuardedLookup },
+  ) => Promise<IncomingMessage>;
+}
+
+const defaultLookupAll = (host: string): Promise<Resolved> => dns.lookup(host, { all: true });
+
+function realRequest(
+  url: URL,
+  init: { headers: Record<string, string>; signal: AbortSignal; lookup: GuardedLookup },
+): Promise<IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    const mod = url.protocol === "https:" ? https : http;
+    const req = mod.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname.replace(/^\[|\]$/g, ""),
+        port: url.port || undefined,
+        path: url.pathname + url.search,
+        method: "GET",
+        headers: init.headers,
+        lookup: init.lookup as never,
+        signal: init.signal,
+      },
+      resolve,
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/** Stylesheet fetch for `capture` v2, run from THIS host (the cloud runs on
+ * our backend network), so it is SSRF-hardened: Node `http`/`https` with a
+ * connection-time address check (`guardedLookup`), redirects followed by hand
+ * (at most 3, each Location re-checked with `isFetchableStylesheetUrl`), gzip /
+ * deflate / br decoded with the cap applied to the DECODED bytes, a streaming
+ * size cap and an abort signal. It is cookie-less, and sends only the page
+ * origin as referer. */
+export async function fetchStylesheet(
+  url: string,
+  opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal },
+  ctx: { referer?: string; userAgent?: string; deps?: StylesheetFetchDeps } = {},
+): Promise<{ status: number; text: string; contentType?: string }> {
+  const timeout = AbortSignal.timeout(opts.timeoutMs);
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+  const lookup = guardedLookup(ctx.deps?.lookupAll ?? defaultLookupAll);
+  const request = ctx.deps?.request ?? realRequest;
+  const headers: Record<string, string> = {
+    accept: "text/css,*/*;q=0.1",
+    "accept-encoding": "gzip, deflate, br",
+    ...(ctx.referer ? { referer: ctx.referer } : {}),
+    // Some hosts (Wikimedia) answer 403 to a request without a user agent.
+    ...(ctx.userAgent ? { "user-agent": ctx.userAgent } : {}),
+  };
+  let current = url;
+  for (let hop = 0; hop <= MAX_FETCH_REDIRECTS; hop++) {
+    if (!isFetchableStylesheetUrl(current)) throw new Error("blocked url");
+    const res = await request(new URL(current), { headers, signal, lookup });
+    const status = res.statusCode ?? 0;
+    const location = res.headers.location;
+    if (status >= 300 && status < 400 && location) {
+      res.resume();
+      current = new URL(location, current).href;
+      continue;
+    }
+    const declared = Number(res.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > opts.maxBytes) {
+      res.destroy();
+      throw new Error("response too large");
+    }
+    const encoding = String(res.headers["content-encoding"] ?? "").trim().toLowerCase();
+    let body: Readable = res;
+    if (encoding === "gzip" || encoding === "x-gzip") body = res.pipe(zlib.createGunzip());
+    else if (encoding === "deflate") body = res.pipe(zlib.createInflate());
+    else if (encoding === "br") body = res.pipe(zlib.createBrotliDecompress());
+    if (body !== res) res.on("error", (e) => body.destroy(e));
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of body) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      size += buf.length;
+      if (size > opts.maxBytes) {
+        res.destroy();
+        body.destroy();
+        throw new Error("response too large");
+      }
+      chunks.push(buf);
+    }
+    const contentType = res.headers["content-type"];
+    return { status, text: Buffer.concat(chunks).toString("utf8"), contentType: typeof contentType === "string" ? contentType : undefined };
+  }
+  throw new Error("too many redirects");
+}
+
+/** Only the origin, like a browser's strict-origin-when-cross-origin referer. */
+function refererOrigin(pageUrl: string): string | undefined {
+  try {
+    const origin = new URL(pageUrl).origin;
+    return origin === "null" ? undefined : origin;
+  } catch {
+    return undefined;
+  }
+}
 
 class PwPage implements BrowserPageHandle {
   private loading = false;
@@ -173,6 +318,19 @@ class PwPage implements BrowserPageHandle {
       const vp = this.page.viewportSize() ?? { width: 1280, height: 800 };
       return { imageData: buf.toString("base64"), width: vp.width, height: vp.height };
     } catch { return null; }
+  }
+  /** See `fetchStylesheet`: SSRF-hardened and cookie-less. */
+  private userAgent: Promise<string | undefined> | undefined;
+  async fetchText(url: string, opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal }) {
+    // The page's own user agent (read once), so the fetch looks like the browser's.
+    this.userAgent ??= (async () => {
+      try {
+        return await this.page.evaluate(() => navigator.userAgent);
+      } catch {
+        return undefined;
+      }
+    })();
+    return fetchStylesheet(url, opts, { referer: refererOrigin(this.page.url()), userAgent: await this.userAgent });
   }
   async sendCdp(method: string, params?: Record<string, unknown>) {
     await this.ready;

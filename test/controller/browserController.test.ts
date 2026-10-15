@@ -5557,13 +5557,52 @@ describe("cursor overlay around screenshots and menu toggles", () => {
 });
 
 describe("capture", () => {
-  const okResult = { html: "<!doctype html><html></html>", width: 800, height: 1200, url: "https://example.com/", title: "Example" };
-  const pageReturning = (result: unknown) =>
+  // v2: CAPTURE_JS returns the parts, the controller assembles the document.
+  const okResult = {
+    sources: [],
+    htmlOpen: "<html>",
+    bodyOpen: "<body>",
+    bodyHtml: "<p>hi</p>",
+    width: 800,
+    height: 1200,
+    url: "https://example.com/",
+    title: "Example",
+  };
+  const pageReturning = (result: unknown, extra: Partial<BrowserPageHandle> = {}) =>
     makeFakePage({
       executeJavaScript: vi.fn((code: string) =>
         isSignatureCall(code) ? Promise.resolve({ ok: true }) : Promise.resolve(result),
       ),
+      ...extra,
     });
+  const isCssQuery = (code: string) => code.includes("CSS query failed");
+  /** A page whose CAPTURE_JS reports `sources` and whose CSS_QUERY_JS answers
+   * from `answer(args)`; records every CSS query's args. */
+  const cssPage = (
+    sources: unknown[],
+    answer: (args: { rootCompounds: string[]; selectors: string[] }) => unknown,
+    extra: Partial<BrowserPageHandle> = {},
+  ) => {
+    const queries: { rootCompounds: string[]; selectors: string[] }[] = [];
+    const page = makeFakePage({
+      executeJavaScript: vi.fn((code: string) => {
+        if (isSignatureCall(code)) return Promise.resolve({ ok: true });
+        if (isCssQuery(code)) {
+          const m = /var args = (\{[\s\S]*?\});\n/.exec(code);
+          const args = JSON.parse((m as RegExpExecArray)[1]);
+          queries.push(args);
+          return Promise.resolve(answer(args));
+        }
+        return Promise.resolve({ ...okResult, sources });
+      }),
+      ...extra,
+    });
+    return { page, queries };
+  };
+  const fetching = (files: Record<string, string>) =>
+    vi.fn(async (url: string) =>
+      url in files ? { status: 200, text: files[url], contentType: "text/css" } : { status: 404, text: "" },
+    );
 
   const seedSnapshot = (
     controller: BrowserController,
@@ -5625,7 +5664,13 @@ describe("capture", () => {
     const page = pageReturning(okResult);
     const controller = new BrowserController(makeFakeTarget(page));
     const result = await controller.capture(undefined);
-    expect(result).toEqual(okResult);
+    expect(result).toEqual({
+      html: '<!doctype html><html><head><meta charset="utf-8"></head><body><p>hi</p></body></html>',
+      width: 800,
+      height: 1200,
+      url: "https://example.com/",
+      title: "Example",
+    });
     const args = JSON.stringify({ snapshotId: null, index: null, maxChars: 3_000_000 });
     expect(findScriptCall(page.executeJavaScript as ReturnType<typeof vi.fn>, args)).toContain(args);
   });
@@ -5639,9 +5684,293 @@ describe("capture", () => {
     expect(findScriptCall(page.executeJavaScript as ReturnType<typeof vi.fn>, args)).toContain(args);
   });
 
-  it("surfaces the script's too-large error unchanged", async () => {
-    const err = { error: "Page is too large to capture (3.4M characters, limit 3.0M)." };
-    const controller = new BrowserController(makeFakeTarget(pageReturning(err)));
-    expect(await controller.capture({})).toEqual(err);
+  it("inlines a linked stylesheet, rewrites root rules, prunes unused rules (fetchText present)", async () => {
+    const fetchText = fetching({
+      "https://cdn.test/css/site.css": "html.dark{--bg:#000} html.light{--bg:#fff} .used{background:url(i.png)} .unused{color:red} .a, .b{x:1}",
+    });
+    const { page, queries } = cssPage(
+      [
+        { kind: "link", href: "https://cdn.test/css/site.css", media: "" },
+        { kind: "inline", text: ".inl{color:red} .gone{color:blue}", baseUrl: "https://example.com/", media: "" },
+      ],
+      () => ({ rootMatches: ["html.dark"], existing: [".used", ".a", ".inl"], unparseable: [] }),
+      { fetchText },
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(fetchText).toHaveBeenCalledWith("https://cdn.test/css/site.css", expect.objectContaining({ timeoutMs: 8000, maxBytes: 3_000_000 }));
+    expect(queries).toHaveLength(1);
+    expect(queries[0].rootCompounds).toEqual(expect.arrayContaining(["html.dark", "html.light"]));
+    expect(queries[0].selectors).toContain(".unused");
+    const styles = [...result.html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]);
+    expect(styles).toHaveLength(2);
+    expect(styles[0]).toContain(":is(:where(:root,:host),html.dark:not(*)){--bg:#000}");
+    expect(styles[0]).not.toContain("html.light");
+    expect(styles[0]).toContain('.used{background:url("https://cdn.test/css/i.png")}');
+    expect(styles[0]).not.toContain(".unused");
+    expect(styles[0]).toContain(".a{x:1}");
+    expect(styles[0]).not.toContain(".b");
+    expect(styles[1]).toBe(".inl{color:red}");
+    expect(result.html).toMatch(/^<!doctype html><html><head><meta charset="utf-8"><style>/);
+    expect(result.html).toMatch(/<\/head><body><p>hi<\/p><\/body><\/html>$/);
   });
+
+  it("falls back to the literal @import when the stylesheet cannot be fetched", async () => {
+    const { page } = cssPage(
+      [{ kind: "link", href: "https://cdn.test/missing.css", media: "print" }],
+      () => ({ rootMatches: [], existing: [], unparseable: [] }),
+      { fetchText: fetching({}) },
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html).toContain('<style>@import url("https://cdn.test/missing.css") print;</style>');
+  });
+
+  it("without fetchText every link becomes a literal @import, inline sheets are still pruned", async () => {
+    const { page } = cssPage(
+      [
+        { kind: "link", href: "https://cdn.test/a.css", media: "" },
+        { kind: "inline", text: ".keep{x:1} .drop{x:1}", baseUrl: "https://example.com/", media: "" },
+      ],
+      () => ({ rootMatches: [], existing: [".keep"], unparseable: [] }),
+    );
+    expect(page.fetchText).toBeUndefined();
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html).toContain('<style>@import url("https://cdn.test/a.css");</style>');
+    expect(result.html).toContain("<style>.keep{x:1}</style>");
+  });
+
+  it("emits a sheet postcss cannot parse as-is, and skips the page query when nothing needs testing", async () => {
+    const { page, queries } = cssPage(
+      [{ kind: "inline", text: "a{color:red", baseUrl: "https://example.com/", media: "" }],
+      () => ({ rootMatches: [], existing: [], unparseable: [] }),
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html).toContain("<style>a{color:red</style>");
+    expect(queries).toHaveLength(0);
+  });
+
+  it("keeps the unpruned css when the page query fails", async () => {
+    const { page } = cssPage(
+      [{ kind: "inline", text: "html.dark{x:1} .a{x:1}", baseUrl: "https://example.com/", media: "" }],
+      () => ({ error: "CSS query failed: boom" }),
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html).toContain("<style>html.dark{x:1} .a{x:1}</style>");
+  });
+
+  it("batches the selector and root-compound queries in chunks of 5000", async () => {
+    const css = Array.from({ length: 12_000 }, (_, i) => `.s${i}{x:1}`).join("") + "html.dark{x:1}";
+    const { page, queries } = cssPage(
+      [{ kind: "inline", text: css, baseUrl: "https://example.com/", media: "" }],
+      (args) => ({ rootMatches: args.rootCompounds.filter((c) => c === "html.dark"), existing: args.selectors, unparseable: [] }),
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(queries.map((q) => q.selectors.length)).toEqual([5000, 5000, 2001]);
+    // 12 000 classless first compounds (.sN) plus html.dark
+    expect(queries.map((q) => q.rootCompounds.length)).toEqual([5000, 5000, 2001]);
+    expect(result.html).toContain(".s11999{x:1}");
+    expect(result.html).toContain(":is(:where(:root,:host),html.dark:not(*)){x:1}");
+  });
+
+  it("passes the element target to the css query in element mode", async () => {
+    const { page } = cssPage(
+      [{ kind: "inline", text: ".a{x:1}", baseUrl: "https://example.com/", media: "" }],
+      () => ({ rootMatches: [], existing: [".a"], unparseable: [] }),
+    );
+    const controller = new BrowserController(makeFakeTarget(page));
+    seedSnapshot(controller, page, "snap-3");
+    await controller.capture({ index: 5, snapshotId: "snap-3" });
+    const call = (page.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.find((c) => isCssQuery(c[0] as string));
+    expect(call?.[0]).toContain('"snapshotId":"snap-3","index":5');
+  });
+
+  it("escapes </style inside css text", async () => {
+    const { page } = cssPage(
+      [{ kind: "inline", text: '.a::after{content:"</style><b>"}', baseUrl: "https://example.com/", media: "" }],
+      () => ({ rootMatches: [], existing: [".a"], unparseable: [] }),
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html.match(/<\/style/g)).toHaveLength(1);
+    expect(result.html).toContain("\\3c /style>\\3c b>");
+  });
+
+  it("escapes </style in a sheet postcss could not parse", async () => {
+    const { page } = cssPage(
+      [{ kind: "inline", text: 'a{content:"</style><b>"', baseUrl: "https://example.com/", media: "" }],
+      () => ({}),
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html.match(/<\/style/g)).toHaveLength(1);
+    expect(result.html).toContain("\\3c /style>\\3c b>");
+  });
+
+  it("puts every failed nested @import in its own <style> before the sheet's, never mid-sheet", async () => {
+    const fetchText = fetching({
+      "https://cdn.test/main.css": "@import url(a.css); @import url(b.css); .m{color:red}",
+      "https://cdn.test/a.css": ".a{color:red}",
+      "https://cdn.test/b.css": "@import url(gone.css) print; .b{color:red}",
+    });
+    const { page } = cssPage(
+      [
+        { kind: "link", href: "https://cdn.test/main.css", media: "" },
+        { kind: "link", href: "https://cdn.test/nope.css", media: "print" },
+      ],
+      () => ({ rootMatches: [], existing: [".a", ".b", ".m"], unparseable: [] }),
+      { fetchText },
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    const styles = [...result.html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]);
+    expect(styles).toHaveLength(3);
+    expect(styles[0]).toBe('@import url("https://cdn.test/gone.css") print;');
+    expect(styles[1]).toContain(".a{color:red}");
+    expect(styles[1]).not.toContain("@import");
+    expect(styles[2]).toBe('@import url("https://cdn.test/nope.css") print;');
+  });
+
+  it("retries with the v1 shape when the inlined document is over the cap", async () => {
+    const huge = ".x{color:red}".repeat(250_000); // > 3M chars once inlined
+    const fetchText = fetching({ "https://cdn.test/big.css": huge });
+    const { page } = cssPage(
+      [
+        { kind: "link", href: "https://cdn.test/big.css", media: "" },
+        { kind: "inline", text: ".y{background:url(i.png)}", baseUrl: "https://example.com/p/", media: "" },
+      ],
+      () => ({ rootMatches: [], existing: [".x", ".y"], unparseable: [] }),
+      { fetchText },
+    );
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html.length).toBeLessThan(10_000);
+    expect(result.html).toContain('<style>@import url("https://cdn.test/big.css");</style>');
+    expect(result.html).toContain('url("https://example.com/p/i.png")');
+  });
+
+  it("falls back to the v1 shape (never an empty style list) when the css phase throws", async () => {
+    const { page } = cssPage(
+      [
+        { kind: "link", href: "https://cdn.test/a.css", media: "" },
+        { kind: "inline", text: ".y{x:1}", baseUrl: "https://example.com/", media: "" },
+      ],
+      () => ({ rootMatches: [], existing: [".y"], unparseable: [] }),
+    );
+    // a throwing fetchText is contained per file; make the whole phase throw instead
+    (page as { fetchText?: unknown }).fetchText = {
+      bind() {
+        throw new Error("bind boom");
+      },
+    };
+    const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+    expect(result.html).toContain('<style>@import url("https://cdn.test/a.css");</style>');
+    expect(result.html).toContain("<style>.y{x:1}</style>");
+  });
+
+  describe("query phase deadline", () => {
+    const manySelectors = Array.from({ length: 6_000 }, (_, i) => `.s${i}{x:1}`).join("");
+    const src = [{ kind: "inline", text: manySelectors, baseUrl: "https://example.com/", media: "" }];
+
+    it("checks the budget before EACH chunk: unpruned css once under 3 s remain", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const queries: unknown[] = [];
+        const { page } = cssPage(src, (args) => {
+          queries.push(args);
+          vi.setSystemTime(Date.now() + 43_000); // the first chunk eats the budget
+          return { rootMatches: [], existing: [], unparseable: [] }; // would prune everything
+        });
+        const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+        expect(queries).toHaveLength(1);
+        expect(result.html).toContain(".s5999{x:1}"); // unpruned: nothing was applied
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("races each query against deadline - 2 s and keeps the unpruned css on timeout", async () => {
+      vi.useFakeTimers();
+      try {
+        const page = makeFakePage({
+          executeJavaScript: vi.fn((code: string) => {
+            if (isSignatureCall(code)) return Promise.resolve({ ok: true });
+            if (isCssQuery(code)) return new Promise(() => {}); // never answers
+            return Promise.resolve({ ...okResult, sources: [{ kind: "inline", text: ".a{x:1} .b{x:1}", baseUrl: "https://example.com/", media: "" }] });
+          }),
+        });
+        const pending = new BrowserController(makeFakeTarget(page)).capture({});
+        await vi.advanceTimersByTimeAsync(42_999);
+        let settled = false;
+        void pending.then(() => (settled = true));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(2);
+        const result = (await pending) as { html: string };
+        expect(result.html).toContain("<style>.a{x:1} .b{x:1}</style>");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("command deadline", () => {
+    const sources = [
+      { kind: "link", href: "https://cdn.test/a.css", media: "" },
+      { kind: "inline", text: ".keep{x:1} .drop{x:1}", baseUrl: "https://example.com/", media: "" },
+    ];
+    const run = async (elapsedMs: number) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        const fetchText = fetching({ "https://cdn.test/a.css": ".fetched{x:1}" });
+        const { page, queries } = cssPage(sources, () => ({ rootMatches: [], existing: [".keep", ".fetched"], unparseable: [] }), { fetchText });
+        const original = page.executeJavaScript as ReturnType<typeof vi.fn>;
+        const impl = original.getMockImplementation()!;
+        original.mockImplementation((code: string) => {
+          const r = (impl as (c: string) => unknown)(code);
+          if (!isSignatureCall(code) && !isCssQuery(code)) vi.setSystemTime(Date.now() + elapsedMs); // time spent by CAPTURE_JS
+          return r;
+        });
+        const result = (await new BrowserController(makeFakeTarget(page)).capture({})) as { html: string };
+        return { result, fetchText, queries };
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+    it("with plenty of time fetches and queries", async () => {
+      const { result, fetchText, queries } = await run(1_000);
+      expect(fetchText).toHaveBeenCalledTimes(1);
+      expect(queries.length).toBe(1);
+      expect(result.html).toContain(".fetched{x:1}");
+    });
+    it("under 8 s left starts no fetch (fallback @import) but still queries", async () => {
+      const { result, fetchText, queries } = await run(38_000); // 7 s left
+      expect(fetchText).not.toHaveBeenCalled();
+      expect(result.html).toContain('<style>@import url("https://cdn.test/a.css");</style>');
+      expect(queries.length).toBe(1);
+      expect(result.html).not.toContain(".drop");
+    });
+    it("under 3 s left skips the page query: unpruned css", async () => {
+      const { result, queries } = await run(43_000); // 2 s left
+      expect(queries.length).toBe(0);
+      expect(result.html).toContain(".keep{x:1} .drop{x:1}");
+    });
+  });
+
+  it("refuses a final document over the cap and keeps the message", async () => {
+    const big = "x".repeat(3_000_001);
+    const { page } = cssPage([], () => ({}));
+    (page.executeJavaScript as ReturnType<typeof vi.fn>).mockImplementation((code: string) =>
+      Promise.resolve(isSignatureCall(code) ? { ok: true } : { ...okResult, bodyHtml: big }),
+    );
+    const result = await new BrowserController(makeFakeTarget(page)).capture({});
+    expect(result).toEqual({ error: "Page is too large to capture (3.0M characters, limit 3.0M)." });
+  });
+
+  it("rejects a malformed page-script response", async () => {
+    const page = pageReturning({ html: "<html></html>" });
+    expect(await new BrowserController(makeFakeTarget(page)).capture({})).toEqual({
+      error: "Unexpected response from the page script.",
+    });
+  });
+
+  it("formats the page's tooLarge report with the controller's single message", async () => {
+    const controller = new BrowserController(makeFakeTarget(pageReturning({ tooLarge: 3_400_000 })));
+    expect(await controller.capture({})).toEqual({ error: "Page is too large to capture (3.4M characters, limit 3.0M)." });
+  });
+
 });

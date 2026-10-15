@@ -1818,13 +1818,46 @@ sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
 - `value-already-set` returned DONE when no runner-up existed, which closed
   sub-goals on a text-helper mismatch. Since v0.2.6 it falls back to typing.
 
-## `capture` (2026-10-15)
+## `capture` (2026-10-15, v2)
 
 `capture({ index?, snapshotId? })` serializes the top document (or one
-`data-pen-snap`-stamped element) into a self-contained HTML document via
-`CAPTURE_JS`: stylesheets first (`<link>` becomes `@import url(abs)`), then a
-rewritten deep clone (scripts and `on*` dropped, URLs absolute, lazy images
-resolved, form state frozen, canvas to `<img>`, open shadow roots flattened,
-`data-pen-*` and overlays removed). Success `{ html, width, height, url, title }`;
-over 3_000_000 characters it returns `{ error }`. Spec:
-`pen-editor-backend/docs/specs/2026-10-15-browse-capture-design.md`.
+`data-pen-snap`-stamped element) into a self-contained HTML document. Success
+`{ html, width, height, url, title }`; over 3_000_000 characters it returns
+`{ error }`. Spec: `pen-editor-backend/docs/specs/2026-10-15-browse-capture-design.md`
+("v2, steps 1-2").
+
+Flow in `captureUnlocked` (own 45 s budget, not the default command timeout):
+
+1. `CAPTURE_JS` returns `{ sources, htmlOpen, bodyOpen, bodyHtml, width, height, url, title }`.
+   `sources` are the document-level styles in order: `link` (href, media), `inline`
+   (text, baseUrl, media; an empty `<style>` is read from its cssRules) and `adopted`.
+   Body clone as in v1 (scripts and `on*` dropped, URLs absolute, lazy images, form
+   state, canvas to `<img>`, shadow roots flattened with nested inline styles).
+2. `resolveImports` (`captureCss.ts`): `page.fetchText` (optional; the Playwright adapter uses
+   Node `http`/`https`: cookie-less, origin-only referer, connection-time address check against
+   private/loopback/link-local ranges, 3 manual redirects, decoded-size cap; desktop uses `session.fetch`) fetches each link and every
+   `@import` recursively. Limits: 8 s/file, 3 MB/file, 100 files, depth 4, 8 MB total,
+   6 parallel, cycle guard. Every `url()` and `@import` becomes absolute against the
+   file it is written in; `@import` media/`layer()`/`supports()` and `<link media>`
+   become `@media`/`@layer`/`@supports` wrappers. A failed fetch (or no `fetchText`)
+   leaves the literal `@import url("<abs>")` (a failed nested one is hoisted to the top
+   of its sheet).
+3. Each sheet is parsed with postcss (a sheet that fails to parse is emitted as-is).
+   `collectQueries` builds the root compounds (`html`/`:root`) and "existence test"
+   selectors (user-action and pseudo-element parts stripped); `CSS_QUERY_JS` answers
+   them in the page (batches of 5000 selectors). `applyQueryResults`: a matched root
+   compound becomes `:is(:root,:host)`, an unmatched one drops its selector; selectors
+   with no match in the captured scope are dropped; empty rules/blocks are dropped
+   (an emptied named `@layer x {}` stays as `@layer x;` to keep the layer order).
+   `@font-face`, `@keyframes`, `@property`, `@page`, ... are never pruned.
+   If the page query fails, the unpruned CSS is used.
+4. One `<style>` per source, then the document is assembled; postcss escapes `</style`
+   in parsed sheets (`\3c `), `renderStyleTag` escapes it in raw ones.
+
+v2 review rounds (2026-10-15):
+
+- `isFetchableStylesheetUrl` / `isBlockedIp` guard every fetch (SSRF); the controller checks before `fetchText`, the adapter again per redirect and at connect time (`guardedLookup`).
+- A fallback `@import` (failed fetch, no `fetchText`, low budget) is its own `<style>` before the sheet's, and keeps its outer conditions (media combined with `and`, one layer, one supports). A fallback whose conditions cannot be expressed is dropped and counted in `ResolvedSheet.dropped`.
+- Leftover `@charset` / `@import` (data:) / `@namespace` are hoisted to the top of the sheet, outside wrappers.
+- Rewritten root compounds keep exact specificity: `:is(:where(:root,:host),C:not(*))` for `html`/`:root`, `:is(C,:where(:root,:host))` for classless C.
+- Budget: no new fetch under 8 s left, pending ones aborted at deadline - 3 s; the page query is checked before each 5000-selector chunk and raced against deadline - 2 s (unpruned CSS otherwise). Any CSS-phase throw or an over-cap document falls back to the v1 shape.

@@ -13,6 +13,17 @@
 // (and how dispatcher.ts's ToolCallResult never rejects either).
 
 import { decideBrowserNavigation } from "./navigation.js";
+import {
+  applyQueryResults,
+  collectQueries,
+  renderStyleTag,
+  resolveImports,
+  sheetCss,
+  importStatement,
+  type CaptureSource,
+  type ResolvedSheet,
+  v1Shape,
+} from "./captureCss.js";
 import { parseKeySpec, modifiersBitmask, resolveEditCommand, resolveNamedKey } from "./keys.js";
 import {
   ARGS_MARKER,
@@ -25,6 +36,7 @@ import {
   SIGNATURE_JS,
   READ_JS,
   CAPTURE_JS,
+  CSS_QUERY_JS,
   TARGET_BUSY_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
@@ -66,6 +78,7 @@ const SCRIPT_TEMPLATES = {
   PERFORM_JS,
   READ_JS,
   CAPTURE_JS,
+  CSS_QUERY_JS,
   TARGET_BUSY_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
@@ -106,6 +119,24 @@ const READ_MAX_CHARS_HARD_CAP = 20_000;
 /** browse-capture design (2026-10-15): the serialized HTML document of a
  * `capture` over this many characters is refused. */
 const CAPTURE_MAX_CHARS = 3_000_000;
+/** v2: capture fetches stylesheets, so it gets its own budget instead of the
+ * default command timeout (the editor's tool timeout is above it). */
+const CAPTURE_BUDGET_MS = 45_000;
+/** Below this much remaining command time the page-query phase is skipped. */
+const CSS_QUERY_MIN_REMAINING_MS = 3_000;
+/** Each page query is abandoned this long before the command deadline. */
+const CSS_QUERY_DEADLINE_MARGIN_MS = 2_000;
+/** Selectors per CSS_QUERY_JS call (keeps the injected args JSON small). */
+const CSS_QUERY_CHUNK = 5_000;
+
+/** The one "Page is too large" message (the page script only reports `tooLarge`). */
+function tooLargeMessage(chars: number): string {
+  return `Page is too large to capture (${formatCaptureSize(chars)} characters, limit ${formatCaptureSize(CAPTURE_MAX_CHARS)}).`;
+}
+
+function formatCaptureSize(v: number): string {
+  return v >= 1_000_000 ? (v / 1_000_000).toFixed(1) + "M" : v >= 1000 ? (v / 1000).toFixed(1) + "K" : String(v);
+}
 
 /** The `{ changed, changes }` signature diffed before/after an action —
  * "Addendum 2" §1. `changes` entries are stable, documented category names
@@ -559,6 +590,21 @@ export interface BrowserPageHandle {
    * than handing back a blank image.
    */
   capture?(): Promise<{ imageData: string; width: number; height: number } | null>;
+  /**
+   * Optional: fetches a text resource (a stylesheet) OUTSIDE the page's CORS
+   * and origin rules. Desktop uses the browser partition's `session.fetch`
+   * (which carries that partition's cookies); the Playwright adapter uses
+   * Node's `http`/`https` and is COOKIE-LESS (it also refuses private
+   * addresses, see the adapter). `capture` v2 uses it to inline
+   * `<link>`/`@import` CSS; a handle without it falls back to literal
+   * `@import url(...)` lines. Must reject past `maxBytes` and on timeout, and
+   * must never be pointed at an address the page could not reach publicly
+   * (`isFetchableStylesheetUrl` is checked before the call).
+   */
+  fetchText?(
+    url: string,
+    opts: { timeoutMs: number; maxBytes: number; signal?: AbortSignal },
+  ): Promise<{ status: number; text: string; contentType?: string }>;
   /**
    * Optional: sends a raw Chrome DevTools Protocol command against this
    * tab's attached debugger session (`webContents.debugger` in window.ts,
@@ -2971,7 +3017,7 @@ export class BrowserController {
     const validated = validateCaptureArgs(args);
     if (!validated.ok) return errorResult(validated.error);
     const { snapshotId, index } = validated.value;
-    return this.withCommandTimeout(async () => {
+    return this.withCommandTimeout(async (deadlineAt) => {
       const page = this.target.currentPage();
       if (!page) return errorResult("No browser tab is open — call browse_open first.");
       if (snapshotId !== null && index !== null) {
@@ -2986,8 +3032,94 @@ export class BrowserController {
           );
         }
       }
-      return this.executeScript(page, "CAPTURE_JS", { snapshotId, index, maxChars: CAPTURE_MAX_CHARS });
-    });
+      const captured = await this.executeScript(page, "CAPTURE_JS", { snapshotId, index, maxChars: CAPTURE_MAX_CHARS });
+      if ("error" in captured) return captured;
+      // The page's own pre-check (it sees the document before any CSS work).
+      if (typeof captured.tooLarge === "number") return errorResult(tooLargeMessage(captured.tooLarge));
+      const { sources, htmlOpen, bodyOpen, bodyHtml } = captured;
+      if (
+        !Array.isArray(sources) ||
+        typeof htmlOpen !== "string" ||
+        typeof bodyOpen !== "string" ||
+        typeof bodyHtml !== "string"
+      ) {
+        return errorResult("Unexpected response from the page script.");
+      }
+      const assemble = (sheets: ResolvedSheet[]): string =>
+        "<!doctype html>" + htmlOpen + '<head><meta charset="utf-8">' +
+        sheets
+          .flatMap((sh) => [...sh.fallbacks.map(importStatement), ...(sheetCss(sh).trim() ? [sheetCss(sh)] : [])])
+          .map(renderStyleTag)
+          .join("") +
+        "</head>" + bodyOpen + bodyHtml + "</body></html>";
+      const v1 = (): string => assemble(v1Shape(sources as CaptureSource[]));
+      let html: string;
+      try {
+        html = assemble(await this.buildCaptureCss(page, sources as CaptureSource[], snapshotId, index, deadlineAt));
+        // Inlined imports can push a page over the cap that the v1 shape fits.
+        if (html.length > CAPTURE_MAX_CHARS) html = v1();
+      } catch {
+        html = v1(); // any CSS-phase failure: the v1 shape, never an empty style list
+      }
+      if (html.length > CAPTURE_MAX_CHARS) {
+        return errorResult(tooLargeMessage(html.length));
+      }
+      return { html, width: captured.width, height: captured.height, url: captured.url, title: captured.title };
+    }, CAPTURE_BUDGET_MS);
+  }
+
+  /** capture v2: one finished sheet per source (imports inlined, urls
+   * absolute, root rules rewritten, unused rules pruned). Throws on an
+   * unexpected failure (the caller falls back to the v1 shape); a failing
+   * page query only degrades to the unpruned CSS. */
+  private async buildCaptureCss(
+    page: BrowserPageHandle,
+    sources: CaptureSource[],
+    snapshotId: string | null,
+    index: number | null,
+    deadlineAt: number,
+  ): Promise<ResolvedSheet[]> {
+    const sheets = await resolveImports(sources, page.fetchText ? page.fetchText.bind(page) : undefined, { deadlineAt });
+    const remainingMs = () => deadlineAt - Date.now();
+    if (remainingMs() < CSS_QUERY_MIN_REMAINING_MS) return sheets;
+    try {
+      const roots = sheets.map((sh) => sh.root);
+      const { rootCompounds, selectors } = collectQueries(roots.filter((r): r is NonNullable<typeof r> => r !== null));
+      if (rootCompounds.length === 0 && selectors.length === 0) return sheets;
+      const rootMatches = new Set<string>();
+      const existing = new Set<string>();
+      const unparseable = new Set<string>();
+      const total = Math.max(rootCompounds.length, selectors.length);
+      for (let at = 0; at === 0 || at < total; at += CSS_QUERY_CHUNK) {
+        // Budget is checked before EVERY chunk and each query is raced against
+        // the deadline; on either, the CSS stays unpruned (roots are only
+        // rewritten once every answer is in).
+        if (remainingMs() < CSS_QUERY_MIN_REMAINING_MS) return sheets;
+        const query = this.executeScript(page, "CSS_QUERY_JS", {
+          rootCompounds: rootCompounds.slice(at, at + CSS_QUERY_CHUNK),
+          selectors: selectors.slice(at, at + CSS_QUERY_CHUNK),
+          snapshotId,
+          index,
+        });
+        query.catch(() => undefined);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const answer = await Promise.race([
+          query,
+          new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), Math.max(0, remainingMs() - CSS_QUERY_DEADLINE_MARGIN_MS));
+          }),
+        ]).finally(() => clearTimeout(timer));
+        if (answer === null || "error" in answer) return sheets;
+        for (const [key, set] of [["rootMatches", rootMatches], ["existing", existing], ["unparseable", unparseable]] as const) {
+          const list = answer[key];
+          if (Array.isArray(list)) for (const v of list) if (typeof v === "string") set.add(v);
+        }
+      }
+      for (const root of roots) if (root) applyQueryResults(root, rootMatches, existing, unparseable);
+      return sheets;
+    } catch {
+      return sheets;
+    }
   }
 
   /** Walks the current page and returns an indexed element table (jev-loop

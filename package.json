@@ -92,6 +92,8 @@
     }
   },
   "dependencies": {
+    "postcss": "^8.5.30",
+    "postcss-selector-parser": "^7.1.6",
     "zod": "^3.25.0"
   },
   "devDependencies": {

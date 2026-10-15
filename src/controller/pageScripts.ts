@@ -6824,9 +6824,10 @@ export const BOT_CHECK_JS = `(() => {
  * maxChars: number }`. Returns `{ html, width, height, url, title }` or
  * `{ error }`.
  *
- * Stylesheets are emitted first, in document order, one `<style>` each
- * (`<link rel=stylesheet>` becomes `@import url("<abs>")` because a link
- * does not survive the embed sanitizer, an `@import` does). The body is a
+ * v2 (2026-10-15): returns `{ sources, htmlOpen, bodyOpen, bodyHtml, width,
+ * height, url, title }`. `sources` are the document-level style sources in
+ * document order (`link` / `inline` / `adopted`); the controller fetches
+ * and rewrites them (captureCss.ts) and assembles the final document. The body is a
  * hand-rolled deep clone (not `cloneNode(true)`) so each element can be
  * rewritten as it is copied: scripts and handlers dropped, URLs made
  * absolute, lazy images resolved, form state frozen into attributes,
@@ -6945,8 +6946,13 @@ export const CAPTURE_JS = `(() => {
       return n.hasAttribute("data-pen-cursor") || n.hasAttribute("data-pen-marks");
     }
 
-    // A <link> or <style> as { text, media }, or null when it contributes nothing.
-    function styleParts(n) {
+    // THE selection predicate for a <link> / <style>, shared by document-level
+    // sources and shadow-root styles so they cannot diverge: rel / alternate /
+    // disabled / media / sheet.disabled / the CSSOM fallback for an empty
+    // <style>. Returns { link: true, href, media } (href absolute),
+    // { link: false, text, fromSheet, media } (raw text, unrewritten), or null
+    // when the element contributes nothing.
+    function styleSelect(n) {
       var tag = n.localName;
       if (tag === "link") {
         var rel = (n.getAttribute("rel") || "").toLowerCase().split(/\\s+/);
@@ -6954,22 +6960,41 @@ export const CAPTURE_JS = `(() => {
         var href = n.getAttribute("href");
         if (!href || n.disabled) return null;
         var media = n.getAttribute("media");
-        return { text: '@import url("' + abs(href).replace(/"/g, "%22") + '");', media: media && media !== "all" ? media : "" };
+        return { link: true, href: abs(href), media: media && media !== "all" ? media : "" };
       }
       if (tag === "style") {
         if (n.sheet && n.sheet.disabled) return null;
         var text = n.textContent || "";
-        if (!text.trim() && n.sheet) text = cssAbs(sheetRules(n.sheet));
-        else text = cssAbs(text);
+        var fromSheet = false;
+        if (!text.trim() && n.sheet) {
+          text = sheetRules(n.sheet);
+          fromSheet = true;
+        }
         if (!text.trim()) return null;
-        return { text: text, media: n.getAttribute("media") || "" };
+        return { link: false, text: text, fromSheet: fromSheet, media: n.getAttribute("media") || "" };
       }
       return null;
     }
 
-    function styleFor(n) {
-      var p = styleParts(n);
-      return p ? makeStyleEl(p.text, p.media) : null;
+    // A <link> or <style> as { text, media } (urls already absolute; a link
+    // becomes an @import), or null when it contributes nothing. Used for
+    // shadow roots, whose styles stay inline in the body.
+    function styleParts(n) {
+      var sel = styleSelect(n);
+      if (!sel) return null;
+      if (sel.link) return { text: '@import url("' + sel.href.replace(/"/g, "%22") + '");', media: sel.media };
+      return { text: cssAbs(sel.text), media: sel.media };
+    }
+
+    // A document-level <link> / <style> as a style source for the Node side
+    // (captureCss.ts), or null when it contributes nothing. Links are NOT
+    // fetched here: the controller fetches them through the page handle's
+    // fetchText (outside CORS; cookie-less on the cloud adapter).
+    function sourceOf(n) {
+      var sel = styleSelect(n);
+      if (!sel) return null;
+      if (sel.link) return { kind: "link", href: sel.href, media: sel.media };
+      return { kind: "inline", text: sel.fromSheet ? cssAbs(sel.text) : sel.text, baseUrl: base, media: sel.media };
     }
 
     // The same sheet as plain CSS text that can sit inside another
@@ -7235,17 +7260,17 @@ export const CAPTURE_JS = `(() => {
       return c;
     }
 
-    var styles = [];
-    var sources = document.querySelectorAll("link, style");
-    for (var i = 0; i < sources.length; i++) {
-      if (isOverlay(sources[i])) continue;
-      var se = styleFor(sources[i]);
-      if (se) styles.push(se.outerHTML);
+    var sources = [];
+    var styleEls = document.querySelectorAll("link, style");
+    for (var i = 0; i < styleEls.length; i++) {
+      if (isOverlay(styleEls[i])) continue;
+      var se = sourceOf(styleEls[i]);
+      if (se) sources.push(se);
     }
     var adopted = document.adoptedStyleSheets || [];
     for (var a = 0; a < adopted.length; a++) {
       var ar = sheetRules(adopted[a]);
-      if (ar.trim()) styles.push(makeStyleEl(cssAbs(ar), "").outerHTML);
+      if (ar.trim()) sources.push({ kind: "adopted", text: cssAbs(ar), baseUrl: base });
     }
 
     // Every attribute of <html>/<body> except handlers and our own stamps:
@@ -7347,18 +7372,59 @@ export const CAPTURE_JS = `(() => {
     }
     if (height > 20000) height = 20000;
 
-    var html =
-      "<!doctype html><html" + attrs(document.documentElement, "") + '><head><meta charset="utf-8">' +
-      styles.join("") + "</head><body" + attrs(document.body, elementMode ? "" : inheritedStyle(document.body, true)) + ">" + bodyHtml + "</body></html>";
-
-    if (html.length > args.maxChars) {
-      var fmt = function (v) {
-        return v >= 1000000 ? (v / 1000000).toFixed(1) + "M" : v >= 1000 ? (v / 1000).toFixed(1) + "K" : String(v);
-      };
-      return { error: "Page is too large to capture (" + fmt(html.length) + " characters, limit " + fmt(args.maxChars) + ")." };
-    }
-    return { html: html, width: width, height: height, url: location.href, title: document.title || "" };
+    var htmlOpen = "<html" + attrs(document.documentElement, "") + ">";
+    var bodyOpen = "<body" + attrs(document.body, elementMode ? "" : inheritedStyle(document.body, true)) + ">";
+    var total = htmlOpen.length + bodyOpen.length + bodyHtml.length + 100;
+    for (var ti = 0; ti < sources.length; ti++) total += (sources[ti].text || sources[ti].href || "").length;
+    if (total > args.maxChars) return { tooLarge: total };
+    return {
+      sources: sources, htmlOpen: htmlOpen, bodyOpen: bodyOpen, bodyHtml: bodyHtml,
+      width: width, height: height, url: location.href, title: document.title || "",
+    };
   } catch (err) {
     return { error: "Capture failed: " + (err && err.message ? err.message : String(err)) };
+  }
+})()`;
+
+/**
+ * `capture` v2: which selectors of the copied CSS still apply. Args:
+ * `{ rootCompounds, selectors, snapshotId, index }`. `rootMatches`: root
+ * compounds the live `<html>` matches. `existing`: selectors with a match
+ * in the captured scope (the document, or in element mode the target, one of
+ * its ancestors or one of its descendants). `unparseable`: strings the browser rejects.
+ */
+export const CSS_QUERY_JS = `(() => {
+  ${FIND_BY_SNAPSHOT_JS}
+  var args = ${ARGS_MARKER};
+  try {
+    var target = null;
+    if (args.snapshotId !== null && args.snapshotId !== undefined && args.index !== null && args.index !== undefined) {
+      target = findBySnapshot(args.snapshotId, args.index, null);
+      if (!target) return { error: "Element " + args.index + " of snapshot " + args.snapshotId + " not found \u2014 take a fresh browse_snapshot." };
+    }
+    var de = document.documentElement;
+    var rc = args.rootCompounds || [];
+    var sel = args.selectors || [];
+    var rootMatches = [];
+    var existing = [];
+    var unparseable = [];
+    for (var i = 0; i < rc.length; i++) {
+      try {
+        if (de.matches(rc[i])) rootMatches.push(rc[i]);
+      } catch (err) {
+        unparseable.push(rc[i]);
+      }
+    }
+    for (var j = 0; j < sel.length; j++) {
+      try {
+        var hit = target ? !!target.closest(sel[j]) || !!target.querySelector(sel[j]) : !!document.querySelector(sel[j]);
+        if (hit) existing.push(sel[j]);
+      } catch (err2) {
+        unparseable.push(sel[j]);
+      }
+    }
+    return { rootMatches: rootMatches, existing: existing, unparseable: unparseable };
+  } catch (err3) {
+    return { error: "CSS query failed: " + (err3 && err3.message ? err3.message : String(err3)) };
   }
 })()`;
