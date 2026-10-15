@@ -40,9 +40,9 @@ jobs:
       - name: Check NPM_TOKEN
         if: ${{ env.NODE_AUTH_TOKEN == '' }}
         run: echo "::warning::NPM_TOKEN is not set. Skip npm publish. The git tag and GitHub release are done."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
         with:
           node-version: 22
