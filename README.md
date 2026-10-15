@@ -35,7 +35,7 @@ three pen-editor repos move onto this package.
 The package is private. Install it from the Git repo:
 
 ```bash
-npm install github:dan-rozhkov/browser-agent#v0.2.1
+npm install github:dan-rozhkov/browser-agent#v0.2.9
 ```
 
 `prepare` builds `dist/` on install. Peer dependencies are optional:
@@ -110,6 +110,9 @@ await close();
 | `@sideform/browser-agent/adapters/http-backend` | `createHttpBackend` |
 | `@sideform/browser-agent/adapters/local-backend` | `createLocalBackend` |
 | `@sideform/browser-agent/adapters/controller-bridge` | `controllerBridge` |
+| `@sideform/browser-agent/agent` | the browse agent mode: prompt, tool definitions, limits, session core (zod only, no `ai`) |
+| `@sideform/browser-agent/agent/session` | the light part of `/agent`: limits, result helpers, session core, `singleUseTool`. No zod, no schemas, no descriptions: use it in a browser bundle |
+| `@sideform/browser-agent/agent/ai-sdk` | `runBrowseAgent` (peer: `ai`) |
 
 **Name collisions at the root.** Two names exist in more than one layer.
 The root barrel exports the controller's `MAX_SNAPSHOT_ELEMENTS` (both are
@@ -211,6 +214,13 @@ createSystemOneClient(opts: { apiKey?: string; model?: string; baseUrl?: string;
 // adapters/ai-sdk   (peer: ai)
 aiSdkTextModel(model: LanguageModel, opts?: { id?: string; providerOptions?: Record<string, unknown> }): TextModel;
 
+// agent/ai-sdk   (peer: ai)
+runBrowseAgent(goal: string, opts: { model: LanguageModel; browser: BrowserBridge; url?: string; signal?: AbortSignal;
+  providerOptions?: Record<string, Record<string, unknown>>; extraTools?: Record<string, BrowseAgentExtraTool>;
+  prompt?: string | BuildBrowseAgentPromptOptions; toolDefinitions?: BrowseToolDefinitions; screenshots?: boolean;
+  toolResultImages?: boolean;
+  maxRequests?: number; deadlineMs?: number; runId?: string; maxOutputTokens?: number }): Promise<BrowseAgentResult>;
+
 // adapters/http-backend
 createHttpBackend(opts: { baseUrl: string; fetch?: typeof fetch;
   headers?: Record<string, string> | (() => Record<string, string>);
@@ -287,6 +297,89 @@ interface BrowseBackend {
 - A new decision service: implement `DecisionClient`.
 - The policy on a server: run `createLocalBackend` there, and use
   `createHttpBackend` in the client.
+
+## The browse agent mode (`/agent`)
+
+A second way to run a goal, next to `runBrowseTask`. A **non-reasoning chat
+model** drives seven tools (`browse_open`, `browse_snapshot`, `browse_screenshot`,
+`browse_act`, `browse_tabs`, `browse_find_images`, `browse_read`) in a plain tool
+loop and gives a text answer. There is no decision service and no cascade: the
+chat model reads the snapshot and picks the action. It is fast and cheap when
+reasoning is off. Pen Editor calls this mode `BROWSE_MODE=agent`.
+
+Minimal example (`ai` is a peer dependency; the model is yours):
+
+```ts
+import { runBrowseAgent } from "@sideform/browser-agent/agent/ai-sdk";
+import { controllerBridge } from "@sideform/browser-agent/adapters/controller-bridge";
+
+const result = await runBrowseAgent("find the price of the first result", {
+  model,                                  // any AI SDK LanguageModel, reasoning OFF
+  browser: controllerBridge(controller),  // any BrowserBridge
+  url: "https://example.com",             // optional: opened before the first request
+  providerOptions: { openrouter: { reasoning: { effort: "none" } } },
+});
+// { status: "done" | "error" | "aborted" | "step_limit" | "timeout", answer, steps, error? }
+```
+
+`examples/run-agent.ts` runs it end to end with local Chromium and OpenRouter.
+
+What the package owns:
+
+- **Prompt**: `buildBrowseAgentPrompt({ principal?, guidanceBullets?, sections? })`.
+- **Tool definitions**: `browseToolDefinitions` (`description` and a zod
+  `inputSchema` per tool), `createBrowseToolDefinitions(slots)` and
+  `BROWSE_AGENT_TOOL_NAMES`. Text that names a host feature (a canvas, a
+  wider `browse_task` tool, examples) is a *slot* in `BrowseDescriptionSlots`.
+  The defaults are neutral. A host that needs other fields extends the schema
+  (`browseScreenshotInputSchema.extend({...})`). `browse_act` has no `element`
+  field in the neutral definitions: a host that resolves `element` itself passes
+  `elementTargeting: true` in the slots (text and schema, in one switch).
+- **Limits**: `BROWSE_AGENT_MAX_REQUESTS` (60), `BROWSE_AGENT_DEADLINE_MS`
+  (14 min), answer and error caps.
+- **Session core**: `createBrowseAgentSession`. The deadline, the abort signal,
+  the request cap (`step_limit`), the step counter, the allowlist, host tool
+  guards (`singleUseTool`) and the status choice. Hooks with state (`fork`) get
+  a fresh copy per session, so one `singleUseTool` object serves every run.
+  `deadlineMs` and `maxRequests` must be positive numbers (else creation
+  throws); a `deadlineMs` above 2^31-1 ms or `Infinity` means no deadline.
+  Host result fields cannot replace `status`, `answer`, `steps` or `error`. A host plugs in how a tool
+  runs (`executeTool`) and how the model is driven (`BrowseAgentDriver`).
+  `runBrowseAgent` is one driver (AI SDK `generateText`); Pen Editor's nested
+  `Chat` is another, on the same core.
+- **Result helpers**: `finalAnswer(messages, status)` over a minimal message
+  type that `UIMessage` satisfies, and `preOpenText(goal, url, openedResult)`.
+- **Tool execution**: `executeBrowseTool(browser, name, input)` maps the seven
+  tools onto a `BrowserBridge` (a snapshot follows `browse_open` and a changed page;
+  `browse_act` batches up to 10 entries).
+
+What stays in the host:
+
+- **Model choice and provider routing.** Pick a non-reasoning model and switch
+  reasoning off in `providerOptions` (the package does not know your provider).
+  A reasoning model is slow here and gains little.
+- **Host tools.** Pass them as `extraTools` (with an optional guard such as
+  `singleUseTool`). Their fields can join the result.
+- **Nested chat transport.** A product that streams the sub-run through its
+  own chat (Pen Editor: a headless `Chat` against `/api/chat`) writes its driver
+  and uses `createBrowseAgentSession` for everything else.
+- **`element` targeting** of `browse_act` (a description instead of an index)
+  is not in the package: `executeBrowseTool` answers "not available, use target
+  or index", so the neutral definitions do not offer the field.
+- **Vision.** By default the `browse_screenshot` result is text only: the JSON
+  without `imageData`, plus an `imageNote` that an image was taken but is not
+  attached. OpenAI-compatible providers (`@ai-sdk/openai-compatible`) print an
+  image part as JSON text, so base64 would fill the prompt of every later
+  request. Pass `toolResultImages: true` ONLY for a provider whose AI SDK
+  integration carries tool-result images natively. For a model that cannot read
+  images at all, pass `screenshots: false` to drop the tool.
+
+### Light entry for browsers
+
+`@sideform/browser-agent/agent/session` exports the limits, the result helpers,
+`createBrowseAgentSession` and `singleUseTool` and imports no zod, no schemas
+and no descriptions (about 13 KB of text). A frontend that drives the session
+with its own chat (Pen Editor) imports this entry, not `/agent`.
 
 ## Isomorphism
 

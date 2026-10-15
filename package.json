@@ -54,6 +54,18 @@
     "./adapters/controller-bridge": {
       "types": "./dist/adapters/controllerBridge.d.ts",
       "default": "./dist/adapters/controllerBridge.js"
+    },
+    "./agent": {
+      "types": "./dist/agent/index.d.ts",
+      "default": "./dist/agent/index.js"
+    },
+    "./agent/session": {
+      "types": "./dist/agent/sessionEntry.d.ts",
+      "default": "./dist/agent/sessionEntry.js"
+    },
+    "./agent/ai-sdk": {
+      "types": "./dist/agent/aiSdk.d.ts",
+      "default": "./dist/agent/aiSdk.js"
     }
   },
   "scripts": {
@@ -119,6 +131,15 @@
       ],
       "adapters/controller-bridge": [
         "dist/adapters/controllerBridge.d.ts"
+      ],
+      "agent": [
+        "dist/agent/index.d.ts"
+      ],
+      "agent/session": [
+        "dist/agent/sessionEntry.d.ts"
+      ],
+      "agent/ai-sdk": [
+        "dist/agent/aiSdk.d.ts"
       ]
     }
   },

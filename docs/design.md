@@ -266,3 +266,38 @@ answers 5xx like the route.
    frontend's Vite build and desktop's bundler both accept it.
 6. TypeScript ~5.9 (matches pen-editor; the desktop's TS 7 can consume
    the emitted `.d.ts`).
+
+
+## Browse agent mode (`src/agent`)
+
+Added in 0.2.9. A second runner next to `runBrowseTask`: a non-reasoning chat
+model drives seven `browse_*` tools in a plain tool loop (Pen Editor's
+`BROWSE_MODE=agent`). The pieces:
+
+- `agent/` (zod and plain types only, no `ai`): prompt builders, the seven tool
+  definitions (schemas moved as-is from Pen Editor's backend; host text is a
+  *slot*), limits, `finalAnswer` / `preOpenText`, `executeBrowseTool` (tools to
+  a `BrowserBridge`) and the **session core**.
+- The session core (`session.ts`) holds the control flow that every driver
+  needs: deadline timer, abort signal (parent + deadline), request cap
+  (`step_limit`), step counter, allowlist with its error text, host tool guards
+  and the status choice. It does not know how the model is driven. A driver
+  implements `BrowseAgentDriver` (`send`, `stop`, `messages`, `error?`).
+- `agent/aiSdk.ts` (peer `ai`): `runBrowseAgent`, one driver on `generateText`
+  with `stopWhen: () => !session.continueRequest()`. Pen Editor's nested
+  `Chat` is the other driver; it keeps its own transport and uses the core.
+- Byte identity: Pen Editor must keep the prompt and tool strings its model sees.
+  `test/agent/golden/` holds the strings dumped from the backend before the move,
+  and `penEditorFixtures.ts` the host text that gives them back.
+- `agent/sessionEntry.ts` (`agent/session`): limits, result helpers and the
+  session core only, with no zod, schemas or descriptions, for browser bundles.
+  `test/agent/sessionEntry.test.ts` checks its import graph and built JS.
+- Screenshots: the `runBrowseAgent` tool result is text only by default (no
+  `imageData`, an `imageNote` instead); `toolResultImages: true` adds the image
+  part for providers that carry tool-result images natively.
+- Element targeting: neutral `browse_act` has no `element` field or text;
+  `elementTargeting: true` in the slots adds both.
+- Session state: hooks with state expose `fork()`; a session forks them at
+  creation, so `singleUseTool` objects can be reused across runs.
+- Boundaries: model choice, provider routing, reasoning switch, nested chat
+  transport and `element` targeting stay in the host.

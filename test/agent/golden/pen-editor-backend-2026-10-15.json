@@ -1,0 +1,246 @@
+{
+  "BROWSE_AGENT_PROMPT": "You are a browsing subagent working for a design assistant. The user message is your whole task. You do not see any earlier conversation. Work only in the browser with the browse tools. Do not ask questions: if the task is unclear, make the most reasonable choice and say so in your answer.\n\nDrive the built-in browser yourself with the browse tools: `browse_open`, `browse_snapshot`, `browse_act`, `browse_read`, `browse_tabs`, `browse_find_images`, and `browse_screenshot` when it is available.\n- Take a snapshot before you act on a page you have not seen. Put several actions on the same page into one `browse_act` call when no action depends on the result of an earlier one.\n- Report a value (name, price, rating, time) only if you saw it in a snapshot or in `browse_read` output. Never invent a value.\n- Report a goal that failed as not completed. Say what you tried. Never say that the thing does not exist on the site, and never invent reasons (availability, shipping, restrictions).\n- Never type a password. If a login, password, CAPTCHA or anti-bot wall stops you, tell the user what to do in the browser tab, then continue after they confirm.\n- Before an irreversible step (purchase, booking, payment, sending, submitting a form with personal data, deleting), stop. Do not do the step. Give your final answer: say what is pending and what you found. Exception: if the task text says the user already confirmed that exact step, do it.\n- To put a screenshot of the browser page on the canvas, call `browse_screenshot` with `placeOnCanvas: true`.\n\nIf browse_capture is in your tools, the user asked for a copy of a page on the canvas: get to the right page (and element), call browse_capture once, and report its nodeId.\n\nWhen the task is done, or when you are blocked (a CAPTCHA, a login or anti-bot wall, a missing page), stop calling tools and give your final answer in plain text. Before you stop, make sure the current tab shows the page that holds the answer (the results list, the filtered search, the forecast or the detail page you report from). If you went to another page after you found the answer, go back to the answer page first. Do not open other pages after that: the user sees the page you stop on. The final answer holds only facts you observed on the pages, the final URL, and what is missing or not completed. Do not add facts you did not see.",
+  "MANUAL_BROWSER_GUIDANCE": "Drive the built-in browser yourself with the browse tools: `browse_open`, `browse_snapshot`, `browse_act`, `browse_read`, `browse_tabs`, `browse_find_images`, and `browse_screenshot` when it is available.\n- Take a snapshot before you act on a page you have not seen. Put several actions on the same page into one `browse_act` call when no action depends on the result of an earlier one.\n- Report a value (name, price, rating, time) only if you saw it in a snapshot or in `browse_read` output. Never invent a value.\n- Report a goal that failed as not completed. Say what you tried. Never say that the thing does not exist on the site, and never invent reasons (availability, shipping, restrictions).\n- Never type a password. If a login, password, CAPTCHA or anti-bot wall stops you, tell the user what to do in the browser tab, then continue after they confirm.\n- Before an irreversible step that the user did not ask for (reserve, buy, pay, submit an order or a form that sends data), stop. Report what you found and ask the user to confirm in chat. Do the step only after the user confirms. If the user's request asks for that step, do it.\n- To put a screenshot of the browser page on the canvas, call `browse_screenshot` with `placeOnCanvas: true`.\n- To put an editable copy of the page on the canvas when the user asks for it, call `browse_capture`.",
+  "tools": {
+    "browse_open": {
+      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Opening a page the user just wants to look at is fine. Opens the built-in browser tab (a REAL browser tab — in the desktop app it runs on the user's OWN logged-in session, cookies and all; in the web app it is a fresh cloud browser with no logins) and navigate it to `url`, waiting for the page to finish loading. Returns `{ url, title }` with the FINAL url after any redirects, plus `snapshot` (the same shape browse_snapshot returns — `{ snapshotId, elements, scroll, truncated? }`) taken once the page has settled, so you usually don't need a separate browse_snapshot call right after opening. May also carry `botCheck: true` when the loaded page looks like a CAPTCHA/anti-bot wall (\"just a moment\", \"verify you are human\", captcha, cloudflare…) — when set, hand the task back to the user instead of trying to click through it. This is how you reach outside references the canvas can't otherwise see: a Pinterest search URL (e.g. \"https://www.pinterest.com/search/pins/?q=minimal%20fintech%20app%20ui\") is the worked example — search results load as an infinite-scroll image grid you then read with browse_find_images. Once open, act on the returned `snapshot` directly with browse_act (by index or selector); take a fresh browse_snapshot/browse_screenshot only if it's missing or the page has since changed.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The URL to navigate the browser tab to."
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    "browse_snapshot": {
+      "description": "Get an indexed table of every interactive element on the currently open browser tab's page — buttons, links, inputs, selects — without any pixels. Returns `{ snapshotId, url, title, elements: [{ index, tag, label, ops, role?, options?, value?, hasValue?, isPassword?, checked?, scrollable?, frame? }], scroll: { y, height, atBottom } }`. `ops` lists which browse_act actions apply to that element — values are `CLICK` (click/hover), `TYPE_TEXT` (fill a text input/textarea), `SELECT` (pick a `<select>` option). `checked` is the current checkbox/radio state; `scrollable: true` marks an element that is itself a scroll container (pass its `index` to browse_act's `scroll` action to scroll inside it instead of the window); `frame` names the iframe the element lives in when it's not in the top-level document (acting on it by `index` still works the same way, across frames). Pass an element's `index` together with THIS `snapshotId` to browse_act — the indices are only valid for that snapshotId and go stale the moment you call browse_snapshot, browse_screenshot with annotate, or browse_task again, so take a fresh one before acting if you're not sure yours is still current. If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Prefer this over browse_screenshot when you just need to know what's clickable and don't need to actually see the page (cheaper, no image tokens); use browse_screenshot when the layout itself matters or the snapshot's labels are ambiguous.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    "browse_screenshot": {
+      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Take a screenshot of the browser tab's current viewport (not the whole page) for visual verification — use this when the layout itself matters (does a modal actually cover the CTA, is a canvas-rendered widget visible, does this look broken) rather than just \"what's clickable\", which browse_snapshot answers more cheaply. Returns `{ url, title, width, height }` plus the image; on a text-only model this costs a second vision-model call that returns a description rather than the image itself, same as get_screenshot. Pass `annotate: true` to additionally get numbered labels drawn over every interactive element PLUS `snapshotId` and `elements` (the same shape as browse_snapshot) in the same call — use this set-of-marks mode when you want to both see the page and act on it by index in one round trip, instead of calling browse_snapshot separately first. When the user asks to capture, save, or put a browser page on the canvas or as a reference, call this tool with `placeOnCanvas: true`. The result then adds `placedNodeId`, the id of the new canvas layer, and the image is also returned to you as usual.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "annotate": {
+            "type": "boolean",
+            "description": "If true, overlays numbered labels on interactive elements and also returns snapshotId + elements for acting by index. Default false (plain screenshot)."
+          },
+          "placeOnCanvas": {
+            "type": "boolean",
+            "description": "If true, also put the screenshot on the design canvas as a new image layer (a rectangle with an image fill, sized to the screenshot). The result then carries `placedNodeId`. The placed image never has the annotate labels on it. Default false."
+          },
+          "x": {
+            "type": "number",
+            "description": "Canvas position (absolute) for the placed image's top-left corner. Only used with placeOnCanvas. If omitted, the image goes into empty space to the right of the existing content."
+          },
+          "y": {
+            "type": "number",
+            "description": "Canvas position (absolute) for the placed image's top-left corner. Only used with placeOnCanvas. If omitted, the image goes into empty space to the right of the existing content."
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    "browse_act": {
+      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Act on the currently open browser tab: click, type, scroll, go back/forward, press a key, hover, pick a `<select>` option, reload, or wait. `target` (for click/type) is matched first as visible text (case-insensitive, trimmed, first match in document order), then as a CSS selector; alternatively pass `index` (from browse_snapshot or an annotated browse_screenshot) together with that call's `snapshotId` to act on a specific element by its number — more reliable than text matching once you have a snapshot; or pass `element` instead (see below) to skip taking a snapshot yourself. Scrolling is what makes an infinite-scroll grid like Pinterest's usable: call `scroll` to load more results, then call browse_find_images (or browse_snapshot) again — `scroll` also takes `index`+`snapshotId` (or `target`) to scroll INSIDE that element (a scrollable panel/modal, or any element browse_snapshot marked `scrollable: true`) instead of the whole window. `press` sends a real key event (`key`: \"Enter\", \"Escape\", \"Tab\", \"ArrowDown\", \"Meta+a\", …), optionally focusing `target`/`index`/`element` first — this is how you submit a form with Enter or close a modal with Escape. `hover` moves the pointer over `target`/`index`/`element` without clicking, for hover-revealed menus. `select` needs `index`+`snapshotId` (or `element`) and `text` = the option's label or value. `reload` takes no fields. `wait` polls for `text` to appear (or just sleeps `ms`, default 3000, hard cap 15000) — use it after an action that triggers an async page update before your next snapshot/screenshot. Batching: pass `actions` (1-10 entries, each the same shape as this call minus `snapshotId` — all index-based entries refer to THIS call's top-level `snapshotId`) instead of a single `action` to run several simple steps in one round trip — e.g. fill a few fields then press Enter to submit — rather than spending one chat turn per step. When `actions` is given the top-level `action`/`target`/`index`/etc. fields are ignored; provide exactly one of `action` or `actions`. Entries run in order and stop at the first one that errors or whose target goes stale; the result is `{ results: [...one per entry actually run], completed, stoppedAt?, error? }` alongside the usual fields below. An `element` entry re-snapshots the page to resolve it, which makes the batch's top-level `snapshotId` stale for every entry after it — put `element` entries LAST in the batch, or split into separate batches, never an index-based entry after one; a batch that violates this order is rejected up front with an error naming the offending entry, before anything runs. A batch also has its own internal time budget and may stop early with `stoppedAt` and an error saying so if it runs too long — check `completed` rather than assuming every entry ran. Returns `{ url, title, matched }` on success or `{ error }` naming what wasn't found; resolving via `element` takes a fresh snapshot to match against, so it also returns `resolved: { index, label, confidence, snapshotId?, note }` on both success and failure — `snapshotId` is the NEW current snapshot (any snapshotId you already had is now stale) and `note` says so, UNLESS this same result also carries a `snapshot` field (see below), in which case `resolved.snapshotId` is omitted and `note` instead points you at `snapshot.snapshotId` — always use whichever snapshotId `note` actually names, never an older one you already had. If it can't resolve (no fast model configured, or nothing matched clearly) the error says to retry with `target`/`index` instead. A click/type/press result may also carry `openedTab: { tabId, url, title }` when the action opened a new browser tab — a click on your own tab that opens a popup DOES make that popup your current tab, so your next browse_* call already acts on it; use browse_tabs to switch back to the previous one — and `dialogs: [{ type, message }]` listing any JS alert/confirm/prompt the browser auto-handled since your last command. `changed` (with `changes`, when present) tells you whether the action actually altered the page — check it instead of assuming success; when the action changed the page (or at the end of an `actions` batch, or for `wait`/`scroll`), the result also carries `snapshot` — a compact current snapshot (same shape as browse_snapshot) taken after the action settles, whose `snapshotId` is current — use it for your next index-based call instead of taking a fresh browse_snapshot yourself. May also carry `consoleErrors: string[]` listing new page JS errors observed since your last command.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "click",
+              "type",
+              "scroll",
+              "back",
+              "forward",
+              "press",
+              "hover",
+              "select",
+              "reload",
+              "wait"
+            ],
+            "description": "Which action to perform. Omit when `actions` is given instead."
+          },
+          "target": {
+            "type": "string",
+            "description": "Visible text or CSS selector to act on. Used by click/type/press (to focus first)/hover."
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Element index from a browse_snapshot or annotated browse_screenshot call, used instead of `target`. Requires `snapshotId` from that same call. Also used by `scroll` to scroll inside that element instead of the window."
+          },
+          "snapshotId": {
+            "type": "string",
+            "description": "The snapshotId that `index` refers to — from the browse_snapshot/browse_screenshot call that produced it (or a previous browse_act/browse_open result's `snapshot`). Stale once a newer snapshot has been taken. Also the snapshotId every entry in `actions` resolves its own `index` against."
+          },
+          "element": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Describe the element in words instead of passing target/index, e.g. \"the Continue button in the cookie banner\" or \"the site search box\". A fast model picks it from a fresh snapshot of the page in one quick call — cheaper than a browse_snapshot round trip. That snapshot becomes the new current one, so any snapshotId you already had goes stale; use the result's `resolved.snapshotId` for further index-based calls. Works for click/type/select/hover and for press's optional focus target — press resolves `element` against any focusable candidate (button, text input, or select), not click-only, so it can match a text input too."
+          },
+          "text": {
+            "type": "string",
+            "description": "Text to type (action: type), or the option label/value to choose (action: select)."
+          },
+          "amount": {
+            "type": "number",
+            "description": "Scroll distance in viewport heights. Used by scroll, default 1."
+          },
+          "key": {
+            "type": "string",
+            "description": "Key to press, e.g. \"Enter\", \"Escape\", \"Tab\", \"ArrowDown\", \"Meta+a\". Used by press."
+          },
+          "ms": {
+            "type": "number",
+            "maximum": 15000,
+            "description": "Milliseconds to wait. Used by wait, default 3000, hard cap 15000."
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "click",
+                    "type",
+                    "scroll",
+                    "back",
+                    "forward",
+                    "press",
+                    "hover",
+                    "select",
+                    "reload",
+                    "wait"
+                  ]
+                },
+                "target": {
+                  "type": "string"
+                },
+                "index": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "element": {
+                  "type": "string",
+                  "maxLength": 300
+                },
+                "text": {
+                  "type": "string"
+                },
+                "amount": {
+                  "type": "number"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "ms": {
+                  "type": "number",
+                  "maximum": 15000
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "additionalProperties": false
+            },
+            "minItems": 1,
+            "maxItems": 10,
+            "description": "Run up to 10 steps in one call instead of a single `action` — see the description above. Each entry has the same fields as this call except `snapshotId` (they all share the top-level one)."
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    "browse_tabs": {
+      "description": "List, switch, close, or open browser tabs in the built-in browser. `action: \"list\"` returns every open browser tab; `\"switch\"` (needs `tabId`) makes that tab your current one for browse_act/browse_snapshot/browse_screenshot/browse_read; `\"close\"` (needs `tabId`) closes a browser tab (not the app itself); `\"new\"` opens a fresh browser tab, optionally navigating it to `url`, and makes it current. Returns `{ tabs: [{ tabId, url, title, current }], current }`. A browse_act click that opens a popup already makes that popup current (see browse_act's `openedTab`); call this with `action: \"switch\"` when you want to go back to the tab you were on before.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "switch",
+              "close",
+              "new"
+            ],
+            "description": "Which tab operation to perform."
+          },
+          "tabId": {
+            "type": "integer",
+            "description": "Target tab id. Required for switch/close; ignored for list; optional for new (rare)."
+          },
+          "url": {
+            "type": "string",
+            "description": "URL to load in the newly created tab. Used only by action: new."
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    "browse_find_images": {
+      "description": "Read every image currently visible on the open browser tab's page — both <img> elements and CSS background-images — sorted largest-first and capped at `limit`. Returns `{ images: [{ url, alt, width, height }], count, pageUrl }`. The returned URLs go straight onto the canvas: imageFill.url already accepts remote http(s) URLs (falling back to the image proxy when direct loading trips CORS), so no download step is needed. On a search results grid (Pinterest et al.) this typically only sees the first screenful — call browse_act with `scroll` and call this again to see more, repeating the loop until you have enough references.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "minWidth": {
+            "type": "number",
+            "description": "Minimum rendered width in px to include. Default 200."
+          },
+          "minHeight": {
+            "type": "number",
+            "description": "Minimum rendered height in px to include. Default 200."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of images to return. Default 30, hard cap 100."
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    "browse_read": {
+      "description": "Read the TEXT of the page currently open in the built-in browser tab — headings, visible body text, and links — with scripts, styles, and nav chrome already stripped out. Returns `{ url, title, headings: string[], text: string, links: [{ label, href }], truncated: boolean }`. This is how you read a page you've already navigated to with browse_open/browse_task: once the browser is sitting on the page you need, call this INSTEAD OF falling back to web_search for the same information — web_search only re-finds pages you can already see, and cannot read this one's actual current content (a search result, a filtered listing, anything behind a click). Prefer browse_find_images when you want images rather than text, and browse_snapshot/browse_screenshot when you need to see or act on the page rather than read its content. `maxChars` bounds the returned text (default 6000, hard cap 20000); `selector` narrows the read to one subtree of the page (e.g. \"main\", \"article\") — an unmatched selector is an error, not a silent whole-page read.",
+      "jsonSchema": {
+        "type": "object",
+        "properties": {
+          "maxChars": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 20000,
+            "description": "Maximum characters of visible text to return. Default 6000, hard cap 20000."
+          },
+          "selector": {
+            "type": "string",
+            "description": "CSS selector to narrow the read to one subtree of the page. Omit to read the whole page."
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    }
+  }
+}
