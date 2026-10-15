@@ -132,6 +132,7 @@ class BrowserController {
   findImages(args: unknown): Promise<BrowserCommandResult>;
   screenshot(args: unknown): Promise<BrowserCommandResult>;
   tabs(args: unknown): Promise<BrowserCommandResult>;
+  capture(args?: unknown): Promise<BrowserCommandResult>; // { html, width, height, url, title } of the page or one snapshot element
 }
 type BrowserCommandResult = Record<string, unknown>;
 decideBrowserNavigation(targetUrl: string): "allow" | "deny";
@@ -266,7 +267,7 @@ interface TextModel {
 
 // loop
 interface KeyValueStorage { getItem(k: string): string | null; setItem(k: string, v: string): void; removeItem?(k: string): void }
-interface BrowserBridge {   // open, act, read, snapshot, perform; optional findImages, screenshot, tabs
+interface BrowserBridge {   // open, act, read, snapshot, perform; optional findImages, screenshot, tabs, capture
   open(args: { url: string }): Promise<unknown>; act(args: Record<string, unknown>): Promise<unknown>;
   read(args: Record<string, unknown>): Promise<unknown>; snapshot(): Promise<unknown>;
   perform(args: { snapshotId: string; index?: number; operation: string; text?: string }): Promise<unknown>;

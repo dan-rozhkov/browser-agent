@@ -13,5 +13,6 @@ export function controllerBridge(c: BrowserController): BrowserBridge {
     findImages: (args) => c.findImages(args),
     screenshot: (args) => c.screenshot(args),
     tabs: (args) => c.tabs(args),
+    capture: (args) => c.capture(args),
   };
 }

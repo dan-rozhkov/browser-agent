@@ -1817,3 +1817,14 @@ sees an unchanged button and clicks again (live bench: bag showed 4, not 2).
   deterministic `literal-mismatch` gate is the only guard now.
 - `value-already-set` returned DONE when no runner-up existed, which closed
   sub-goals on a text-helper mismatch. Since v0.2.6 it falls back to typing.
+
+## `capture` (2026-10-15)
+
+`capture({ index?, snapshotId? })` serializes the top document (or one
+`data-pen-snap`-stamped element) into a self-contained HTML document via
+`CAPTURE_JS`: stylesheets first (`<link>` becomes `@import url(abs)`), then a
+rewritten deep clone (scripts and `on*` dropped, URLs absolute, lazy images
+resolved, form state frozen, canvas to `<img>`, open shadow roots flattened,
+`data-pen-*` and overlays removed). Success `{ html, width, height, url, title }`;
+over 3_000_000 characters it returns `{ error }`. Spec:
+`pen-editor-backend/docs/specs/2026-10-15-browse-capture-design.md`.

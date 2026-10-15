@@ -55,4 +55,12 @@ export interface BrowserBridge {
     tabId?: number;
     url?: string;
   }): Promise<unknown>;
+  /**
+   * browse_capture (browse-capture design, 2026-10-15) — the page, or one
+   * snapshot-stamped element, as a self-contained HTML document:
+   * `{ html, width, height, url, title }`. Optional — absent on bridges
+   * older than this feature.
+   */
+  capture?(args?: { index?: number; snapshotId?: string }): Promise<unknown>;
 }
+

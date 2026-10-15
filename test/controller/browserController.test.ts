@@ -5555,3 +5555,93 @@ describe("cursor overlay around screenshots and menu toggles", () => {
     await expect(new BrowserController(makeFakeTarget(bad)).hideCursorOverlay()).resolves.toBeUndefined();
   });
 });
+
+describe("capture", () => {
+  const okResult = { html: "<!doctype html><html></html>", width: 800, height: 1200, url: "https://example.com/", title: "Example" };
+  const pageReturning = (result: unknown) =>
+    makeFakePage({
+      executeJavaScript: vi.fn((code: string) =>
+        isSignatureCall(code) ? Promise.resolve({ ok: true }) : Promise.resolve(result),
+      ),
+    });
+
+  const seedSnapshot = (
+    controller: BrowserController,
+    page: unknown,
+    id: string,
+    frameMap: Map<number, { frameId: number | null; localIndex: number }> = new Map(),
+  ) => {
+    (controller as unknown as { lastSnapshot: unknown }).lastSnapshot = { id, page, frameMap, frameRects: new Map(), fingerprints: new Map() };
+  };
+
+  it("rejects a stale or unknown snapshotId without running the script", async () => {
+    const page = pageReturning(okResult);
+    const controller = new BrowserController(makeFakeTarget(page));
+    const unknown = await controller.capture({ index: 1, snapshotId: "nope" });
+    expect(unknown).toHaveProperty("error");
+    expect((unknown as { error: string }).error).toMatch(/Stale or unknown snapshotId/);
+    seedSnapshot(controller, page, "s-new");
+    const stale = await controller.capture({ index: 1, snapshotId: "s-old" });
+    expect((stale as { error: string }).error).toMatch(/Stale or unknown snapshotId/);
+    seedSnapshot(controller, makeFakePage(), "s-new");
+    const cross = await controller.capture({ index: 1, snapshotId: "s-new" });
+    expect((cross as { error: string }).error).toMatch(/different browser tab/);
+    expect(page.executeJavaScript).not.toHaveBeenCalled();
+  });
+
+  it("refuses an index inside a child frame without running the script", async () => {
+    const page = pageReturning(okResult);
+    const controller = new BrowserController(makeFakeTarget(page));
+    seedSnapshot(controller, page, "s1", new Map([[7, { frameId: 3, localIndex: 2 }]]));
+    expect(await controller.capture({ index: 7, snapshotId: "s1" })).toEqual({
+      error:
+        "Element 7 is inside a frame; browse_capture copies the top document only. Capture the whole page or open the frame URL with browse_open.",
+    });
+    expect(page.executeJavaScript).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-object args", async () => {
+    const controller = new BrowserController(makeFakeTarget(makeFakePage()));
+    expect(await controller.capture("nope")).toHaveProperty("error");
+    expect(await controller.capture([1])).toHaveProperty("error");
+  });
+
+  it("rejects a bad index, a bad snapshotId, and a lone index or snapshotId", async () => {
+    const controller = new BrowserController(makeFakeTarget(makeFakePage()));
+    expect(await controller.capture({ index: -1, snapshotId: "s1" })).toHaveProperty("error");
+    expect(await controller.capture({ index: 1.5, snapshotId: "s1" })).toHaveProperty("error");
+    expect(await controller.capture({ index: "2", snapshotId: "s1" })).toHaveProperty("error");
+    expect(await controller.capture({ index: 2, snapshotId: 7 })).toHaveProperty("error");
+    expect(await controller.capture({ index: 2 })).toHaveProperty("error");
+    expect(await controller.capture({ snapshotId: "s1" })).toHaveProperty("error");
+  });
+
+  it("errors cleanly when no browser tab is open", async () => {
+    const controller = new BrowserController(makeFakeTarget(null));
+    expect(await controller.capture({})).toEqual({ error: "No browser tab is open — call browse_open first." });
+  });
+
+  it("injects whole-document args and passes the script result through", async () => {
+    const page = pageReturning(okResult);
+    const controller = new BrowserController(makeFakeTarget(page));
+    const result = await controller.capture(undefined);
+    expect(result).toEqual(okResult);
+    const args = JSON.stringify({ snapshotId: null, index: null, maxChars: 3_000_000 });
+    expect(findScriptCall(page.executeJavaScript as ReturnType<typeof vi.fn>, args)).toContain(args);
+  });
+
+  it("injects element args when index and snapshotId are given", async () => {
+    const page = pageReturning(okResult);
+    const controller = new BrowserController(makeFakeTarget(page));
+    seedSnapshot(controller, page, "snap-9");
+    await controller.capture({ index: 4, snapshotId: "snap-9" });
+    const args = JSON.stringify({ snapshotId: "snap-9", index: 4, maxChars: 3_000_000 });
+    expect(findScriptCall(page.executeJavaScript as ReturnType<typeof vi.fn>, args)).toContain(args);
+  });
+
+  it("surfaces the script's too-large error unchanged", async () => {
+    const err = { error: "Page is too large to capture (3.4M characters, limit 3.0M)." };
+    const controller = new BrowserController(makeFakeTarget(pageReturning(err)));
+    expect(await controller.capture({})).toEqual(err);
+  });
+});

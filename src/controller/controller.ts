@@ -24,6 +24,7 @@ import {
   PERFORM_JS,
   SIGNATURE_JS,
   READ_JS,
+  CAPTURE_JS,
   TARGET_BUSY_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
@@ -64,6 +65,7 @@ const SCRIPT_TEMPLATES = {
   SNAPSHOT_JS,
   PERFORM_JS,
   READ_JS,
+  CAPTURE_JS,
   TARGET_BUSY_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
@@ -100,6 +102,10 @@ const SLIDER_TIME_MARGIN_MS = 3_000;
  * browse_read's `maxChars`. */
 const READ_MAX_CHARS_DEFAULT = 6_000;
 const READ_MAX_CHARS_HARD_CAP = 20_000;
+
+/** browse-capture design (2026-10-15): the serialized HTML document of a
+ * `capture` over this many characters is refused. */
+const CAPTURE_MAX_CHARS = 3_000_000;
 
 /** The `{ changed, changes }` signature diffed before/after an action —
  * "Addendum 2" §1. `changes` entries are stable, documented category names
@@ -796,6 +802,39 @@ function validateReadArgs(args: unknown): { ok: true; value: ValidatedReadArgs }
   }
 
   return { ok: true, value: { maxChars, selector } };
+}
+
+interface ValidatedCaptureArgs {
+  snapshotId: string | null;
+  index: number | null;
+}
+
+function validateCaptureArgs(args: unknown): { ok: true; value: ValidatedCaptureArgs } | { ok: false; error: string } {
+  if (args !== undefined && !isRecord(args)) {
+    return { ok: false, error: "browse_capture requires an object (or no arguments)." };
+  }
+  const raw = isRecord(args) ? args : {};
+  const hasIndex = raw.index !== undefined && raw.index !== null;
+  const hasSnapshot = raw.snapshotId !== undefined && raw.snapshotId !== null;
+  if (hasIndex && !isNonNegativeInteger(raw.index)) {
+    return { ok: false, error: 'browse_capture requires "index" to be a non-negative integer when provided.' };
+  }
+  if (hasSnapshot && (typeof raw.snapshotId !== "string" || raw.snapshotId === "")) {
+    return { ok: false, error: 'browse_capture requires "snapshotId" to be a non-empty string when provided.' };
+  }
+  if (hasIndex && !hasSnapshot) {
+    return { ok: false, error: 'browse_capture requires "snapshotId" (from browse_snapshot) alongside "index".' };
+  }
+  if (hasSnapshot && !hasIndex) {
+    return { ok: false, error: 'browse_capture requires "index" alongside "snapshotId".' };
+  }
+  return {
+    ok: true,
+    value: {
+      snapshotId: hasSnapshot ? (raw.snapshotId as string) : null,
+      index: hasIndex ? (raw.index as number) : null,
+    },
+  };
 }
 
 // Full browser use (design doc `2026-09-23-full-browser-use-design.md`)
@@ -2917,6 +2956,37 @@ export class BrowserController {
       }
       const truncated = text.length > maxChars || top.truncated === true;
       return { ...top, text: text.length > maxChars ? text.slice(0, maxChars) : text, truncated };
+    });
+  }
+
+  /** Serializes the current page (or one snapshot-stamped element) into a
+   * self-contained HTML document for the editor canvas (browse-capture design,
+   * 2026-10-15). Read-only, top document only (no frames). Success is
+   * `{ html, width, height, url, title }`. */
+  async capture(args?: unknown): Promise<BrowserCommandResult> {
+    return this.runExclusive(() => this.captureUnlocked(args));
+  }
+
+  private async captureUnlocked(args: unknown): Promise<BrowserCommandResult> {
+    const validated = validateCaptureArgs(args);
+    if (!validated.ok) return errorResult(validated.error);
+    const { snapshotId, index } = validated.value;
+    return this.withCommandTimeout(async () => {
+      const page = this.target.currentPage();
+      if (!page) return errorResult("No browser tab is open — call browse_open first.");
+      if (snapshotId !== null && index !== null) {
+        const staleError = this.checkSnapshotStale(snapshotId, page);
+        if (staleError) return staleError;
+        // The capture script reads the top document only: an index that
+        // belongs to a child frame cannot be found there.
+        const route = this.lastSnapshot?.frameMap.get(index);
+        if (route && route.frameId !== null) {
+          return errorResult(
+            `Element ${index} is inside a frame; browse_capture copies the top document only. Capture the whole page or open the frame URL with browse_open.`,
+          );
+        }
+      }
+      return this.executeScript(page, "CAPTURE_JS", { snapshotId, index, maxChars: CAPTURE_MAX_CHARS });
     });
   }
 

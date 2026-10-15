@@ -6816,3 +6816,549 @@ export const BOT_CHECK_JS = `(() => {
     return { botCheck: false };
   }
 })()`;
+
+/**
+ * `capture` (browse-capture design, 2026-10-15): serializes the current
+ * document, or one snapshot-stamped element, into a self-contained HTML
+ * document string. Args: `{ snapshotId: string | null, index: number | null,
+ * maxChars: number }`. Returns `{ html, width, height, url, title }` or
+ * `{ error }`.
+ *
+ * Stylesheets are emitted first, in document order, one `<style>` each
+ * (`<link rel=stylesheet>` becomes `@import url("<abs>")` because a link
+ * does not survive the embed sanitizer, an `@import` does). The body is a
+ * hand-rolled deep clone (not `cloneNode(true)`) so each element can be
+ * rewritten as it is copied: scripts and handlers dropped, URLs made
+ * absolute, lazy images resolved, form state frozen into attributes,
+ * canvases turned into images, open shadow roots flattened.
+ */
+export const CAPTURE_JS = `(() => {
+  ${FIND_BY_SNAPSHOT_JS}
+  var args = ${ARGS_MARKER};
+  try {
+    var base = document.baseURI;
+    // Every copied node comes from this INERT document (no browsing context):
+    // cloned media never loads or autoplays, lazy images are not fetched by
+    // the live tab, and custom-element constructors do not run.
+    var doc = document.implementation.createHTMLDocument("");
+    var hostCount = 0;
+    var DROP = { script: 1, noscript: 1, template: 1, iframe: 1, object: 1, embed: 1, base: 1 };
+    var NESTABLE_NO = /^@(font-face|keyframes|-webkit-keyframes|-moz-keyframes|import|property|charset|namespace|counter-style|font-feature-values|page)\\b/i;
+
+    function abs(u) {
+      if (!u) return u;
+      try {
+        return new URL(u, base).href;
+      } catch (err) {
+        return u;
+      }
+    }
+
+    function cssAbs(t) {
+      if (!t) return t;
+      t = t.replace(/url\\(\\s*(?:"([^"]*)"|'([^']*)'|([^)"'\\s][^)]*?))\\s*\\)/gi, function (m, a, b, c) {
+        var u = a !== undefined ? a : b !== undefined ? b : c;
+        u = (u || "").trim();
+        if (!u || u.charAt(0) === "#" || /^data:/i.test(u)) return m;
+        return 'url("' + abs(u).replace(/"/g, "%22") + '")';
+      });
+      t = t.replace(/@import\\s+(?:"([^"]*)"|'([^']*)')/gi, function (m, a, b) {
+        return '@import url("' + abs(a !== undefined ? a : b).replace(/"/g, "%22") + '")';
+      });
+      return t;
+    }
+
+    function safeCss(t) {
+      return t.replace(/<\\/style/gi, "<\\\\/style");
+    }
+
+    function isWs(ch) {
+      return ch === " " || ch === "\\n" || ch === "\\t" || ch === "\\r" || ch === "\\f";
+    }
+
+    // HTML srcset grammar: a candidate is a URL (any non-whitespace run, so
+    // it may contain commas) followed by optional descriptors up to the next
+    // comma outside parentheses. A URL that ends in commas ends the candidate.
+    function parseSrcset(s) {
+      var out = [];
+      var i = 0;
+      var n = s.length;
+      while (i < n) {
+        while (i < n && (isWs(s.charAt(i)) || s.charAt(i) === ",")) i++;
+        if (i >= n) break;
+        var st = i;
+        while (i < n && !isWs(s.charAt(i))) i++;
+        var url = s.slice(st, i);
+        var desc = "";
+        if (url.charAt(url.length - 1) === ",") {
+          while (url.length && url.charAt(url.length - 1) === ",") url = url.slice(0, -1);
+        } else {
+          var ds = i;
+          var paren = false;
+          while (i < n) {
+            var ch = s.charAt(i);
+            if (ch === "(") paren = true;
+            else if (ch === ")") paren = false;
+            else if (ch === "," && !paren) break;
+            i++;
+          }
+          desc = s.slice(ds, i).trim();
+          i++;
+        }
+        if (url) out.push({ url: url, desc: desc });
+      }
+      return out;
+    }
+
+    function absSrcset(s) {
+      var cands = parseSrcset(s);
+      var parts = [];
+      for (var i = 0; i < cands.length; i++) {
+        parts.push(abs(cands[i].url) + (cands[i].desc ? " " + cands[i].desc : ""));
+      }
+      return parts.join(", ");
+    }
+
+    function escAttr(v) {
+      return String(v).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function sheetRules(sheet) {
+      var out = [];
+      try {
+        var rules = sheet.cssRules;
+        for (var i = 0; i < rules.length; i++) out.push(rules[i].cssText);
+      } catch (err) {
+        // cross-origin sheet: rules unreadable
+      }
+      return out.join("\\n");
+    }
+
+    function makeStyleEl(text, media) {
+      var s = doc.createElement("style");
+      if (media) s.setAttribute("media", media);
+      s.textContent = safeCss(text);
+      return s;
+    }
+
+    function isOverlay(n) {
+      return n.hasAttribute("data-pen-cursor") || n.hasAttribute("data-pen-marks");
+    }
+
+    // A <link> or <style> as { text, media }, or null when it contributes nothing.
+    function styleParts(n) {
+      var tag = n.localName;
+      if (tag === "link") {
+        var rel = (n.getAttribute("rel") || "").toLowerCase().split(/\\s+/);
+        if (rel.indexOf("stylesheet") === -1 || rel.indexOf("alternate") !== -1) return null;
+        var href = n.getAttribute("href");
+        if (!href || n.disabled) return null;
+        var media = n.getAttribute("media");
+        return { text: '@import url("' + abs(href).replace(/"/g, "%22") + '");', media: media && media !== "all" ? media : "" };
+      }
+      if (tag === "style") {
+        if (n.sheet && n.sheet.disabled) return null;
+        var text = n.textContent || "";
+        if (!text.trim() && n.sheet) text = cssAbs(sheetRules(n.sheet));
+        else text = cssAbs(text);
+        if (!text.trim()) return null;
+        return { text: text, media: n.getAttribute("media") || "" };
+      }
+      return null;
+    }
+
+    function styleFor(n) {
+      var p = styleParts(n);
+      return p ? makeStyleEl(p.text, p.media) : null;
+    }
+
+    // The same sheet as plain CSS text that can sit inside another
+    // stylesheet: a media attribute becomes an @media wrapper (or an
+    // @import media list for a link).
+    function inlineCssOf(n) {
+      var p = styleParts(n);
+      if (!p) return "";
+      if (n.localName === "link") return p.media ? p.text.replace(/;$/, " " + p.media + ";") : p.text;
+      return p.media ? "@media " + p.media + "{" + p.text + "}" : p.text;
+    }
+
+    // All CSS a shadow root carries: its <style>/<link> elements, then its
+    // adopted sheets (later in the cascade).
+    function rootCss(root) {
+      var parts = [];
+      var els = root.querySelectorAll("style, link");
+      for (var i = 0; i < els.length; i++) {
+        if (isOverlay(els[i])) continue;
+        var t = inlineCssOf(els[i]);
+        if (t.trim()) parts.push(t);
+      }
+      var sa = root.adoptedStyleSheets || [];
+      for (var j = 0; j < sa.length; j++) {
+        var r = cssAbs(sheetRules(sa[j]));
+        if (r.trim()) parts.push(r);
+      }
+      return parts.join("\\n");
+    }
+
+    // :host(<sel>) -> &:is(<sel>), bare :host -> &. :host-context( is left alone.
+    function rewriteHost(css) {
+      var out = "";
+      var i = 0;
+      while (i < css.length) {
+        var k = css.indexOf(":host", i);
+        if (k < 0) {
+          out += css.slice(i);
+          break;
+        }
+        out += css.slice(i, k);
+        var after = css.charAt(k + 5);
+        if (after === "(") {
+          var d = 0;
+          var j = k + 5;
+          for (; j < css.length; j++) {
+            var c2 = css.charAt(j);
+            if (c2 === "(") d++;
+            else if (c2 === ")") {
+              d--;
+              if (d === 0) break;
+            }
+          }
+          out += "&:is(" + css.slice(k + 6, j) + ")";
+          i = j + 1;
+        } else if (/[\\w-]/.test(after)) {
+          out += ":host";
+          i = k + 5;
+        } else {
+          out += "&";
+          i = k + 5;
+        }
+      }
+      return out;
+    }
+
+    // Scope a shadow root's CSS to its flattened host with native CSS
+    // nesting. At-rules that cannot be nested are split out, unwrapped
+    // (best effort: a brace-depth scanner over the text).
+    function nestCss(css, id) {
+      css = rewriteHost(css);
+      var pre = [];
+      var inner = [];
+      function push(chunk) {
+        var head = chunk.replace(/^(?:\\s|\\/\\*[\\s\\S]*?\\*\\/)+/, "");
+        if (!head) return;
+        if (NESTABLE_NO.test(head)) pre.push(chunk);
+        else if (/^@layer\\b/i.test(head) && head.indexOf("{") < 0) pre.push(chunk);
+        else inner.push(chunk);
+      }
+      var depth = 0;
+      var st = 0;
+      var q = "";
+      var n = css.length;
+      for (var i = 0; i < n; i++) {
+        var ch = css.charAt(i);
+        if (q) {
+          if (ch === "\\\\") i++;
+          else if (ch === q) q = "";
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          q = ch;
+        } else if (ch === "/" && css.charAt(i + 1) === "*") {
+          var e = css.indexOf("*/", i + 2);
+          i = e < 0 ? n : e + 1;
+        } else if (ch === "{") {
+          depth++;
+        } else if (ch === "}") {
+          depth = depth > 0 ? depth - 1 : 0;
+          if (depth === 0) {
+            push(css.slice(st, i + 1));
+            st = i + 1;
+          }
+        } else if (ch === ";" && depth === 0) {
+          push(css.slice(st, i + 1));
+          st = i + 1;
+        }
+      }
+      if (css.slice(st).trim()) push(css.slice(st));
+      var out = pre.join("\\n");
+      if (inner.length) out += (out ? "\\n" : "") + '[data-capture-host="' + id + '"]{' + inner.join("\\n") + "}";
+      return out;
+    }
+
+    function cloneChildren(src, dst, inShadow) {
+      var kids = src.childNodes;
+      for (var i = 0; i < kids.length; i++) {
+        var c = cl(kids[i], inShadow);
+        if (c) dst.appendChild(c);
+      }
+    }
+
+    function cl(n, inShadow) {
+      if (n.nodeType === 3) return doc.createTextNode(n.nodeValue);
+      if (n.nodeType !== 1) return null;
+      var tag = n.localName;
+      if (isOverlay(n)) return null;
+      // Top-level styles are emitted in <head>; a shadow root's are scoped
+      // under its host (see rootCss), so neither is copied in place.
+      if (tag === "style" || tag === "link") return null;
+      if (DROP[tag]) return null;
+      if (tag === "slot" && inShadow && n.assignedNodes) {
+        var assigned = n.assignedNodes({ flatten: true });
+        if (assigned.length) {
+          var frag = doc.createDocumentFragment();
+          for (var ai = 0; ai < assigned.length; ai++) {
+            var ac = cl(assigned[ai], false);
+            if (ac) frag.appendChild(ac);
+          }
+          return frag;
+        }
+      }
+
+      // A <source> whose srcset is a data: placeholder must not override the
+      // resolved <img>: promote data-srcset / data-src, else drop it.
+      var sourceSrcAttr = "";
+      if (tag === "source") {
+        var sset = n.getAttribute("srcset") || "";
+        if (!sset.trim() || /^\\s*data:/i.test(sset)) {
+          var dset = n.getAttribute("data-srcset");
+          var dsrc = n.getAttribute("data-src");
+          if (dset) sourceSrcAttr = "srcset:" + dset;
+          else if (dsrc) sourceSrcAttr = (n.parentNode && n.parentNode.localName === "picture" ? "srcset:" : "src:") + dsrc;
+          else if (sset.trim()) return null;
+        }
+      }
+
+      if (tag === "canvas") {
+        try {
+          var data = n.toDataURL("image/webp", 0.85);
+          var crect = n.getBoundingClientRect();
+          var cw = Math.round(crect.width);
+          var chh = Math.round(crect.height);
+          var sizeCss = "";
+          if (!n.style || !n.style.width) if (cw > 0) sizeCss += "width:" + cw + "px;";
+          if (!n.style || !n.style.height) if (chh > 0) sizeCss += "height:" + chh + "px;";
+          if (data.length > 500000) {
+            var ph = doc.createElement("div");
+            ph.setAttribute("style", "width:" + cw + "px;height:" + chh + "px");
+            return ph;
+          }
+          var img = doc.createElement("img");
+          for (var qa = 0; qa < n.attributes.length; qa++) {
+            var qn = n.attributes[qa].name;
+            var ql = qn.toLowerCase();
+            if (ql.indexOf("on") === 0 || ql.indexOf("data-pen-") === 0 || ql === "width" || ql === "height" || ql === "src") continue;
+            var qv = n.attributes[qa].value;
+            img.setAttribute(qn, ql === "style" ? cssAbs(qv) : qv);
+          }
+          img.setAttribute("src", data);
+          if (sizeCss) img.setAttribute("style", (img.getAttribute("style") ? img.getAttribute("style") + ";" : "") + sizeCss);
+          return img;
+        } catch (err) {
+          // tainted canvas: fall through and clone it empty
+        }
+      }
+
+      var c = doc.importNode(n, false);
+      var names = [];
+      for (var ai2 = 0; ai2 < n.attributes.length; ai2++) names.push(n.attributes[ai2].name);
+      for (var k = 0; k < names.length; k++) {
+        var name = names[k];
+        var lname = name.toLowerCase();
+        var val = n.getAttribute(name);
+        if (lname.indexOf("on") === 0 || lname.indexOf("data-pen-") === 0) {
+          c.removeAttribute(name);
+        } else if (lname === "src" || lname === "poster" || lname === "href" || lname === "xlink:href") {
+          if (/^\\s*javascript:/i.test(val)) c.removeAttribute(name);
+          else if (val.charAt(0) !== "#") c.setAttribute(name, abs(val));
+        } else if (lname === "srcset") {
+          c.setAttribute(name, absSrcset(val));
+        } else if (lname === "style") {
+          c.setAttribute(name, cssAbs(val));
+        }
+      }
+
+      if (sourceSrcAttr) {
+        var sp = sourceSrcAttr.indexOf(":");
+        var sk = sourceSrcAttr.slice(0, sp);
+        var sv = sourceSrcAttr.slice(sp + 1);
+        if (sk === "srcset") c.setAttribute("srcset", absSrcset(sv));
+        else c.setAttribute("src", abs(sv));
+      }
+
+      if (tag === "img") {
+        var lazy = n.getAttribute("data-src") || n.getAttribute("data-lazy-src");
+        var lazySet = n.getAttribute("data-srcset") || n.getAttribute("data-lazy-srcset");
+        var cur = n.currentSrc || "";
+        var unresolved = !cur || /^data:/i.test(cur);
+        if ((lazy || lazySet) && unresolved) {
+          if (lazy) c.setAttribute("src", abs(lazy));
+          if (lazySet) {
+            c.setAttribute("srcset", absSrcset(lazySet));
+          } else {
+            c.removeAttribute("srcset");
+            c.removeAttribute("sizes");
+          }
+        } else if (cur) {
+          c.setAttribute("src", cur);
+        }
+        c.removeAttribute("loading");
+      } else if (tag === "input") {
+        var type = (n.getAttribute("type") || "text").toLowerCase();
+        if (type === "checkbox" || type === "radio") {
+          if (n.checked) c.setAttribute("checked", "");
+          else c.removeAttribute("checked");
+        } else if (type !== "file" && type !== "password") {
+          c.setAttribute("value", n.value);
+        } else {
+          c.removeAttribute("value");
+        }
+      } else if (tag === "option") {
+        if (n.selected) c.setAttribute("selected", "");
+        else c.removeAttribute("selected");
+      }
+
+      if (tag === "textarea") {
+        c.textContent = n.value;
+        return c;
+      }
+
+      var root = n.shadowRoot;
+      if (root) {
+        var hid = ++hostCount;
+        c.setAttribute("data-capture-host", String(hid));
+        var rcss = rootCss(root);
+        if (rcss.trim()) c.appendChild(makeStyleEl(nestCss(rcss, hid), ""));
+        cloneChildren(root, c, true);
+      } else {
+        cloneChildren(n, c, inShadow);
+      }
+      return c;
+    }
+
+    var styles = [];
+    var sources = document.querySelectorAll("link, style");
+    for (var i = 0; i < sources.length; i++) {
+      if (isOverlay(sources[i])) continue;
+      var se = styleFor(sources[i]);
+      if (se) styles.push(se.outerHTML);
+    }
+    var adopted = document.adoptedStyleSheets || [];
+    for (var a = 0; a < adopted.length; a++) {
+      var ar = sheetRules(adopted[a]);
+      if (ar.trim()) styles.push(makeStyleEl(cssAbs(ar), "").outerHTML);
+    }
+
+    // Every attribute of <html>/<body> except handlers and our own stamps:
+    // theme switches often live in data-* attributes (data-theme="dark").
+    // \`extraStyle\` goes BEFORE the element's own inline style, so the
+    // page's inline declarations still win.
+    function attrs(el, extraStyle) {
+      var out = "";
+      var hasStyle = false;
+      if (el) {
+        for (var q = 0; q < el.attributes.length; q++) {
+          var an = el.attributes[q].name;
+          var lower = an.toLowerCase();
+          if (lower.indexOf("on") === 0 || lower.indexOf("data-pen-") === 0) continue;
+          var v = el.attributes[q].value;
+          if (lower === "style") {
+            hasStyle = true;
+            v = (extraStyle ? extraStyle + ";" : "") + cssAbs(v);
+          }
+          out += " " + an + '="' + escAttr(v) + '"';
+        }
+      }
+      if (!hasStyle && extraStyle) out += ' style="' + escAttr(extraStyle) + '"';
+      return out;
+    }
+
+    // The editor mounts an embed in a shadow root: there is no <html> and
+    // :root does not match, so rules like html[data-theme=dark] { --bg: … }
+    // never apply. Bake the custom properties and the base text/background
+    // style that the captured box actually inherits into the output body
+    // (or the element wrapper). Custom properties inherit, so this carries
+    // the theme down to every descendant.
+    function isTransparent(c) {
+      return !c || c === "transparent" || /^rgba\\(\\s*0\\s*,\\s*0\\s*,\\s*0\\s*,\\s*0\\s*\\)$/i.test(c);
+    }
+    function inheritedStyle(el, withBackground) {
+      var parts = [];
+      if (!el || el.nodeType !== 1) return "";
+      var ics = window.getComputedStyle(el);
+      for (var k = 0; k < ics.length; k++) {
+        var pn = ics[k];
+        if (pn.indexOf("--") !== 0) continue;
+        var pv = ics.getPropertyValue(pn).trim();
+        if (pv && pv.indexOf(";") < 0 && pv.indexOf("<") < 0) parts.push(pn + ":" + cssAbs(pv));
+      }
+      parts.push("color:" + ics.color, "font-family:" + ics.fontFamily, "font-size:" + ics.fontSize,
+        "line-height:" + ics.lineHeight, "color-scheme:" + ics.colorScheme);
+      if (withBackground) {
+        for (var bgEl = el; bgEl && bgEl.nodeType === 1; bgEl = bgEl.parentElement) {
+          var bgc = window.getComputedStyle(bgEl).backgroundColor;
+          if (!isTransparent(bgc)) {
+            parts.push("background-color:" + bgc);
+            break;
+          }
+        }
+      }
+      return parts.join(";");
+    }
+
+    var snapshotId = args.snapshotId;
+    var index = args.index;
+    var bodyHtml;
+    var width;
+    var height;
+    var elementMode = snapshotId !== null && snapshotId !== undefined && index !== null && index !== undefined;
+    if (elementMode) {
+      var target = findBySnapshot(snapshotId, index, null);
+      if (!target) {
+        return { error: "Element " + index + " of snapshot " + snapshotId + " not found — take a fresh browse_snapshot." };
+      }
+      var rect = target.getBoundingClientRect();
+      width = Math.round(rect.width);
+      height = Math.round(rect.height);
+      var wrap = doc.createElement("div");
+      wrap.setAttribute("style", "width:" + width + "px;" + inheritedStyle(target.parentElement || target, true));
+      // A target inside shadow roots: carry every enclosing root's styles,
+      // scoped under the wrapper, so they still apply to the cloned element.
+      var enclosing = [];
+      for (var gr = target.getRootNode(); gr && gr.host; gr = gr.host.getRootNode()) enclosing.unshift(gr);
+      if (enclosing.length) {
+        var wid = ++hostCount;
+        wrap.setAttribute("data-capture-host", String(wid));
+        for (var er = 0; er < enclosing.length; er++) {
+          var ecss = rootCss(enclosing[er]);
+          if (ecss.trim()) wrap.appendChild(makeStyleEl(nestCss(ecss, wid), ""));
+        }
+      }
+      var inner = cl(target, false);
+      if (inner) wrap.appendChild(inner);
+      bodyHtml = wrap.outerHTML;
+    } else {
+      var body = document.body || document.documentElement;
+      var holder = doc.createElement("div");
+      cloneChildren(body, holder, false);
+      bodyHtml = holder.innerHTML;
+      var de = document.documentElement;
+      width = Math.round(de.clientWidth || window.innerWidth || 0);
+      height = Math.round(Math.max(de.scrollHeight || 0, body.scrollHeight || 0));
+    }
+    if (height > 20000) height = 20000;
+
+    var html =
+      "<!doctype html><html" + attrs(document.documentElement, "") + '><head><meta charset="utf-8">' +
+      styles.join("") + "</head><body" + attrs(document.body, elementMode ? "" : inheritedStyle(document.body, true)) + ">" + bodyHtml + "</body></html>";
+
+    if (html.length > args.maxChars) {
+      var fmt = function (v) {
+        return v >= 1000000 ? (v / 1000000).toFixed(1) + "M" : v >= 1000 ? (v / 1000).toFixed(1) + "K" : String(v);
+      };
+      return { error: "Page is too large to capture (" + fmt(html.length) + " characters, limit " + fmt(args.maxChars) + ")." };
+    }
+    return { html: html, width: width, height: height, url: location.href, title: document.title || "" };
+  } catch (err) {
+    return { error: "Capture failed: " + (err && err.message ? err.message : String(err)) };
+  }
+})()`;
