@@ -1,6 +1,6 @@
 {
   "name": "@sideform/browser-agent",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "private": true,
   "description": "Goal-driven browser agent: page controller, step policy and browse_task loop, decoupled from pen-editor.",
   "type": "module",
