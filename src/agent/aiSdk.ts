@@ -99,8 +99,6 @@ export interface RunBrowseAgentOptions {
   maxOutputTokens?: number;
 }
 
-/** Longest the end of a run waits for the browser to remove its mocks. */
-
 const DATA_URL = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/;
 
 type ModelOutput =
