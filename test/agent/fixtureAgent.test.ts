@@ -68,10 +68,11 @@ describe("session setup hook", () => {
     expect(ran).toBe(false);
   });
 
-  it("a throwing setup gives status error and no request", async () => {
+  it("a throwing setup gives status setup_failed and no request", async () => {
     let sent = false;
     const r = await session().run("goal", driver(async () => { sent = true; }), { setup: async () => { throw new Error("no cookies"); } });
-    expect(r).toMatchObject({ status: "error", error: "no cookies", steps: 1 });
+    expect(r).toMatchObject({ status: "setup_failed", error: "no cookies", steps: 1 });
+    expect("setupStage" in r).toBe(false);
     expect(sent).toBe(false);
   });
 
@@ -130,24 +131,24 @@ describe("runBrowseAgent with a fixture", () => {
     expect(got.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("a bridge without applyFixture gives status error and no model request", async () => {
+  it("a bridge without applyFixture gives status setup_failed and no model request", async () => {
     const { model, prompts } = recordingModel();
     const b = bridge([]);
     delete b.applyFixture;
     const r = await runBrowseAgent("goal", { model, browser: b, fixture });
-    expect(r.status).toBe("error");
+    expect(r.status).toBe("setup_failed");
     expect(r.error).toContain("does not support page fixtures");
     expect(prompts).toHaveLength(0);
   });
 
-  it("a failed apply gives status error with its message", async () => {
+  it("a failed apply gives status setup_failed with its message and stage", async () => {
     const { model, prompts } = recordingModel();
     const r = await runBrowseAgent("goal", {
       model,
-      browser: bridge([], { applyFixture: async () => ({ ok: false, error: "step 1 (click #a) failed: element not found" }) }),
+      browser: bridge([], { applyFixture: async () => ({ ok: false, stage: "steps", error: "step 1 (click #a) failed: element not found" }) }),
       fixture,
     });
-    expect(r).toMatchObject({ status: "error", error: "step 1 (click #a) failed: element not found" });
+    expect(r).toMatchObject({ status: "setup_failed", setupStage: "steps", error: "step 1 (click #a) failed: element not found" });
     expect(prompts).toHaveLength(0);
   });
 
@@ -208,7 +209,7 @@ describe("secrets never reach the model", () => {
     cases.push(loadFail);
     for (const target of cases) {
       const { text, result } = await run(target);
-      expect(result.status).toBe("error");
+      expect(result.status).toBe("setup_failed");
       expect(typeof result.error).toBe("string");
       expect(text).not.toContain(SECRET);
     }
@@ -218,17 +219,7 @@ describe("secrets never reach the model", () => {
     const bad = { version: 1, storage: { origins: [{ origin: "https://a.test", localStorage: { [`lk-${SECRET}`]: 5 } }] } } as unknown as PageFixture;
     const { model, prompts } = recordingModel();
     const r = await runBrowseAgent("goal", { model, browser: controllerBridge(new BrowserController(fakeTarget())), fixture: bad });
-    expect(r.status).toBe("error");
+    expect(r).toMatchObject({ status: "setup_failed", setupStage: "validate" });
     expect(JSON.stringify([prompts, r])).not.toContain(SECRET);
-  });
-
-  it("network mocks give 'not supported yet'", async () => {
-    const { model } = recordingModel();
-    const r = await runBrowseAgent("goal", {
-      model,
-      browser: controllerBridge(new BrowserController(fakeTarget())),
-      fixture: { version: 1, network: [{ match: "x" }] },
-    });
-    expect(r).toMatchObject({ status: "error", error: "PageFixture.network is not supported yet" });
   });
 });

@@ -25,6 +25,9 @@ import type {
   FixtureCookie,
   FixtureHookResult,
   FixtureHooks,
+  FixtureMockResponse,
+  FixtureRequestInfo,
+  FixtureStage,
   PageFixture,
 } from "../fixture/types.js";
 import {
@@ -522,6 +525,8 @@ const CURSOR_TIMEOUT_MS = 900;
  * to settle before letting the next command run anyway — see
  * `BrowserController.overrun`. */
 const OVERRUN_GRACE_MS = 10_000;
+/** Longest `releaseFixture` waits for an apply that is still running. */
+const FIXTURE_RELEASE_WAIT_MS = 5_000;
 
 /** `open`'s DOM-ready-not-full-load fix: `webContents.loadURL()` resolves
  * only at `did-finish-load` — every subresource, including ads/trackers on a
@@ -784,6 +789,23 @@ export interface BrowserTarget {
    */
   getCookies?(urls?: string[]): Promise<FixtureCookie[]>;
   setCookies?(cookies: FixtureCookie[]): Promise<void>;
+  /**
+   * Optional: QA start network mocks (docs/specs/2026-10-15-qa-start-design.md).
+   * `handler` runs for every request of every tab of the browser context; it
+   * returns the mock response, or `undefined` to let the request through. The
+   * returned function removes the interception. A fixture with `network` fails
+   * clearly on a target without it. A target that runs in the user's own
+   * profile (desktop) must not implement it without scoping the rules to the
+   * agent's tabs.
+   */
+  routeRequests?(handler: (req: FixtureRequestInfo) => FixtureMockResponse | undefined): Promise<() => Promise<void>>;
+  /**
+   * Optional: `PageFixture.fresh`. Closes ALL tabs and opens one new blank
+   * tab (so sessionStorage and history are gone), then clears cookies, permissions and the storage of every origin the
+   * target saw (main-frame navigations) plus `origins` (the fixture's own). NEVER implement it on a profile shared with the user: it
+   * would log the user out of everything.
+   */
+  resetSession?(origins?: string[]): Promise<void>;
 }
 
 export type BrowserCommandResult = Record<string, unknown>;
@@ -794,9 +816,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** A fixture command's result as the fixture shape: a timeout comes back from
  * `withCommandTimeout` as a bare `{ error }`. */
-function fixtureResult<T>(result: BrowserCommandResult): T {
+function fixtureResult<T>(result: BrowserCommandResult, stage?: FixtureStage): T {
   if (typeof result.ok === "boolean") return result as unknown as T;
-  return { ok: false, error: String(result.error ?? "The fixture command failed.") } as unknown as T;
+  return { ok: false, ...(stage !== undefined ? { stage } : {}), error: String(result.error ?? "The fixture command failed.") } as unknown as T;
 }
 
 function errorResult(message: string): BrowserCommandResult {
@@ -1508,13 +1530,18 @@ export class BrowserController {
    * is refused as stale). Never rejects: a failure is `{ ok: false, error }`.
    */
   async applyFixture(fixture: PageFixture, opts?: FixtureApplyOptions): Promise<FixtureApplyResult> {
-    const parsed = parsePageFixture(fixture);
-    if (!parsed.ok) return { ok: false, error: parsed.error };
     return this.runExclusive(async () => {
+      // A new fixture replaces the previous one, mocks included, even when the new one is invalid.
+      // A release that fails (the old context is likely gone) is already marked released: it never fails this apply.
+      await this.releaseFixture().catch(() => {});
+      const parsed = parsePageFixture(fixture);
+      if (!parsed.ok) return { ok: false as const, stage: "validate" as const, error: parsed.error };
+      let stage: FixtureStage = "validate";
       // The deadline abandons the work, not stops it: this signal stops it.
       const stop = new AbortController();
       const signal = opts?.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal;
       const aborted = { ok: false as const, error: "aborted" };
+      const hooksBase: FixtureHooks = { onStage: (reached) => { stage = reached; } };
       // What a nested `open` reports, as a hook result: its drained dialogs travel up
       // (the outer drain would not see them again), and a bot-check wall fails the fixture.
       const opened = (url: string, result: BrowserCommandResult): FixtureHookResult => {
@@ -1525,6 +1552,7 @@ export class BrowserController {
         return { ok: true, ...extra };
       };
       const hooks: FixtureHooks = {
+        ...hooksBase,
         navigate: async (url, abortSignal) => {
           if (abortSignal?.aborted) return aborted;
           return opened(url, await this.openUnlocked({ url }));
@@ -1569,18 +1597,70 @@ export class BrowserController {
       };
       try {
         const result = await this.withCommandTimeout(
-          async () => (await applyParsedFixture(this.target, parsed.value, { signal }, hooks)) as BrowserCommandResult,
+          async () => {
+            const work = applyParsedFixture(this.target, parsed.value, { signal, allowNetworkMocks: opts?.allowNetworkMocks }, hooks);
+            this.fixtureInFlight = work.then(() => undefined, () => undefined);
+            const applied = await work;
+            if (!applied.ok || !applied.release) return applied as BrowserCommandResult;
+            // Owned here, inside the work itself: a command the deadline abandoned still hands its mocks over.
+            // (The apply releases them on its own when its signal aborted first.)
+            const token = `fixture-${++this.fixtureSeq}`;
+            this.fixtureActive = { release: applied.release, token };
+            const rest = { ...applied, fixtureToken: token };
+            delete rest.release;
+            return rest as BrowserCommandResult;
+          },
           fixtureBudgetMs(parsed.value, {
             navigationMs: this.openTimeoutMs + OPEN_COMMAND_MARGIN_MS,
             settleMs: CLICK_LOAD_SETTLE_TIMEOUT_MS + NETWORK_QUIET_HARD_CAP_MS,
           }),
         );
-        return fixtureResult<FixtureApplyResult>(result);
+        return fixtureResult<FixtureApplyResult>(result, stage);
       } finally {
         stop.abort();
         this.lastSnapshot = null;
       }
     });
+  }
+
+  /** Network mocks of the last applied fixture, until `releaseFixture`. */
+  private fixtureActive: { release: () => Promise<void>; token: string } | null = null;
+  private fixtureSeq = 0;
+  /** The apply that runs now (or was abandoned by its deadline): its mocks are not in `fixtureActive` yet. */
+  private fixtureInFlight: Promise<void> | null = null;
+
+  /**
+   * Removes the network mocks the last `applyFixture` installed. Idempotent.
+   * Call it when the task ends (`runBrowseAgent({ fixture })` does). A new
+   * `applyFixture` calls it first. An apply still running (or abandoned by its
+   * deadline) is waited for (at most `FIXTURE_RELEASE_WAIT_MS`), so the mocks
+   * it installs are removed too; past the bound the abandoned apply removes its
+   * own mocks when it ends (its signal is aborted).
+   *
+   * `token` is the `fixtureToken` of an `applyFixture` result. With a token the
+   * call releases only the fixture that token names, and does nothing when a
+   * newer apply replaced it (a late finally of run A must not remove the mocks
+   * of run B). Without a token it releases whatever is active.
+   */
+  async releaseFixture(token?: string): Promise<void> {
+    if (token !== undefined && this.fixtureActive?.token !== token) return;
+    if (token === undefined) {
+      const inFlight = this.fixtureInFlight;
+      if (inFlight) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const bound = new Promise<void>((resolve) => { timer = setTimeout(resolve, FIXTURE_RELEASE_WAIT_MS); });
+        try {
+          await Promise.race([inFlight, bound]);
+        } finally {
+          clearTimeout(timer);
+        }
+        if (this.fixtureInFlight === inFlight) this.fixtureInFlight = null;
+      }
+    }
+    const active = this.fixtureActive;
+    if (!active || (token !== undefined && active.token !== token)) return;
+    this.fixtureActive = null;
+    await active.release();
   }
 
   /** Reads the browser state as a `PageFixture` (host use: it holds secrets). Bounded like any command. */

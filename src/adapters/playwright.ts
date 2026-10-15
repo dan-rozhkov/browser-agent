@@ -1,9 +1,9 @@
 // Playwright-backed BrowserTarget / BrowserPageHandle for the BrowserController.
 // Wraps an EXISTING BrowserContext (from chromium.connectOverCDP to a Steel session) —
 // there is no launch path: no Chromium runs on this host.
-// Implemented optional methods: getCookies/setCookies (PageFixture), isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
+// Implemented optional methods: getCookies/setCookies/routeRequests/resetSession (PageFixture), isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
 // onNavigationEvent, networkStats, listFrames, executeJavaScriptInFrame, listPages/selectPage/closePage/newPage/pageHandles.
-import type { BrowserContext, Page, CDPSession, Frame } from "playwright-core";
+import type { BrowserContext, Page, CDPSession, Frame, Route } from "playwright-core";
 import { promises as dns } from "node:dns";
 import http from "node:http";
 import https from "node:https";
@@ -13,7 +13,9 @@ import type { Readable } from "node:stream";
 import { BrowserController } from "../controller/index.js";
 import { isBlockedIp, isFetchableStylesheetUrl } from "../controller/captureCss.js";
 import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../controller/index.js";
-import type { FixtureCookie } from "../fixture/types.js";
+import { sleep } from "../fixture/apply.js";
+import { httpOrigin } from "../fixture/util.js";
+import type { FixtureCookie, FixtureMockResponse, FixtureRequestInfo } from "../fixture/types.js";
 
 const MAX_FETCH_REDIRECTS = 3;
 
@@ -398,17 +400,33 @@ function toPlaywrightCookie(c: FixtureCookie): PwCookieInput {
   return { ...common, domain: c.domain!, path: c.path ?? "/" };
 }
 
+const MAX_SEEN_ORIGINS = 500;
+
+/** How many origins `resetSession` clears at once. */
+const RESET_CLEAR_CONCURRENCY = 16;
+
 export class PlaywrightTarget implements BrowserTarget {
   private readonly ctx: BrowserContext;
   private pages = new Map<number, PwPage>();
   private ids = new Map<Page, number>();
   private seq = 1;
   private currentId: number | null = null;
+  /** Origins the main frame of any page navigated to, oldest first: `resetSession` clears their storage. */
+  private seenOrigins = new Set<string>();
 
   constructor(existing: BrowserContext) {
     this.ctx = existing;
     existing.on("page", (p) => this.register(p));
     for (const p of existing.pages()) this.register(p);
+  }
+
+  private noteOrigin(url: string) {
+    const origin = httpOrigin(url);
+    if (!origin) return;
+    // Re-noting moves an origin to the newest end; the oldest is forgotten past the cap.
+    this.seenOrigins.delete(origin);
+    this.seenOrigins.add(origin);
+    if (this.seenOrigins.size > MAX_SEEN_ORIGINS) this.seenOrigins.delete(this.seenOrigins.values().next().value as string);
   }
 
   private drop(id: number, p: Page) {
@@ -425,6 +443,9 @@ export class PlaywrightTarget implements BrowserTarget {
     this.ids.set(p, id);
     this.currentId = id; // popups / new pages become current
     p.on("close", () => this.drop(id, p));
+    this.noteOrigin(p.url());
+    // Only the main frame: an ad iframe's origin has no storage the next run could notice, and would crowd the list.
+    p.on("framenavigated", (frame: Frame) => { if (frame === p.mainFrame()) this.noteOrigin(frame.url()); });
     // A page whose CDP init failed is unusable: forget it (ensurePage makes a fresh one).
     h.ready.catch(() => this.drop(id, p));
     return h;
@@ -474,6 +495,82 @@ export class PlaywrightTarget implements BrowserTarget {
   }
   async setCookies(cookies: FixtureCookie[]): Promise<void> {
     await this.ctx.addCookies(cookies.map(toPlaywrightCookie));
+  }
+
+  // Network mocks for the whole context (every tab, popup included). The rules
+  // live in `handler`; this method only answers. A request nobody mocks goes to
+  // `route.fallback()`, so the host's own route handlers still see it. After
+  // removal, a request that waits for its delay falls back too, instead of
+  // getting a stale mock.
+  async routeRequests(handler: (req: FixtureRequestInfo) => FixtureMockResponse | undefined): Promise<() => Promise<void>> {
+    const removal = new AbortController();
+    const onRoute = async (route: Route): Promise<void> => {
+      const request = route.request();
+      let mock: FixtureMockResponse | undefined;
+      try {
+        mock = removal.signal.aborted ? undefined : handler({ url: request.url(), method: request.method() });
+      } catch {
+        mock = undefined;
+      }
+      try {
+        if (!mock) return await route.fallback();
+        if (mock.delayMs) {
+          try {
+            await sleep(mock.delayMs, removal.signal);
+          } catch {
+            return await route.fallback();
+          }
+        }
+        if (mock.abort) return await route.abort("failed");
+        await route.fulfill({ status: mock.status, headers: mock.headers, body: mock.body });
+      } catch {
+        // The answer failed (a bad header, a closed page). A request left unanswered would hang
+        // the page until the route is removed: hand it on, and fail it as the last resort.
+        try {
+          await route.fallback();
+        } catch {
+          await route.abort().catch(() => {});
+        }
+      }
+    };
+    await this.ctx.route("**/*", onRoute);
+    return async () => {
+      removal.abort();
+      await this.ctx.unroute("**/*", onRoute);
+    };
+  }
+
+  // PageFixture `fresh`. Everything the next task could notice from the last one is cleared.
+  // Every tab goes (sessionStorage and history live in a tab) and one new blank tab replaces them,
+  // before cookies and storage are cleared: an open page could write storage again afterwards.
+  async resetSession(origins: string[] = []): Promise<void> {
+    await Promise.all(
+      [...this.pages].map(async ([id, h]) => {
+        await h.page.close().catch(() => {});
+        this.drop(id, h.page);
+      }),
+    );
+    const kept = (await this.ensurePage()) as PwPage;
+    await kept.loadURL("about:blank");
+    await this.ctx.clearCookies();
+    await this.ctx.clearPermissions();
+    const all = new Set(this.seenOrigins);
+    for (const url of origins) {
+      const origin = httpOrigin(url);
+      if (origin) all.add(origin);
+    }
+    const queue = [...all];
+    let failed = 0;
+    const worker = async () => {
+      for (let origin = queue.shift(); origin !== undefined; origin = queue.shift()) {
+        try {
+          await kept.sendCdp("Storage.clearDataForOrigin", { origin, storageTypes: "all" });
+        } catch { failed += 1; }
+      }
+    };
+    await Promise.all(Array.from({ length: RESET_CLEAR_CONCURRENCY }, worker));
+    if (failed > 0) throw new Error(`clearing the storage of ${failed} origin${failed === 1 ? "" : "s"} failed`);
+    this.seenOrigins.clear();
   }
 }
 

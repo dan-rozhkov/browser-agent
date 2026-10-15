@@ -77,5 +77,12 @@ export interface BrowserBridge {
    */
   applyFixture?(fixture: PageFixture, opts?: FixtureApplyOptions): Promise<unknown>;
   captureFixture?(opts?: FixtureCaptureOptions): Promise<unknown>;
+  /**
+   * Removes what `applyFixture` installed and must not outlive the task
+   * (network mocks). Idempotent. `token` is the `fixtureToken` of this run's
+   * `applyFixture` result: with it, only that fixture is released. A bridge that can apply a fixture with
+   * `network` must have it: `runBrowseAgent` refuses such a bridge otherwise.
+   */
+  releaseFixture?(token?: string): Promise<unknown>;
 }
 

@@ -284,3 +284,348 @@ describe("PlaywrightTarget cookies", () => {
     expect(asked).toEqual([["https://a.test/"]]);
   });
 });
+
+// QA start: network mocks and session reset (docs/specs/2026-10-15-qa-start-design.md).
+type FakeRoute = { request(): { url(): string; method(): string }; continue: ReturnType<typeof vi.fn>; fallback: ReturnType<typeof vi.fn>; abort: ReturnType<typeof vi.fn>; fulfill: ReturnType<typeof vi.fn> };
+function fakeRoute(url: string, method = "GET"): FakeRoute {
+  return { request: () => ({ url: () => url, method: () => method }), continue: vi.fn(async () => {}), fallback: vi.fn(async () => {}), abort: vi.fn(async () => {}), fulfill: vi.fn(async () => {}) };
+}
+
+function routingContext() {
+  const ctx = fakeContext(async () => new FakeCdp(), []);
+  const routes: { pattern: string; handler: (r: unknown) => Promise<void> }[] = [];
+  const unroute = vi.fn(async (pattern: string, handler: unknown) => {
+    const i = routes.findIndex((r) => r.pattern === pattern && r.handler === handler);
+    if (i >= 0) routes.splice(i, 1);
+  });
+  Object.assign(ctx, {
+    route: async (pattern: string, handler: (r: unknown) => Promise<void>) => { routes.push({ pattern, handler }); },
+    unroute,
+  });
+  return { ctx, routes, unroute };
+}
+
+describe("PlaywrightTarget.routeRequests", () => {
+  it("routes every request of the context and answers by the handler", async () => {
+    const { ctx, routes } = routingContext();
+    const target = new PlaywrightTarget(ctx as never);
+    const seen: unknown[] = [];
+    await target.routeRequests((req) => {
+      seen.push(req);
+      return req.url.includes("/api/") ? { status: 503, headers: { "x-a": "b" }, body: "down" } : undefined;
+    });
+    expect(routes).toHaveLength(1);
+    expect(routes[0].pattern).toBe("**/*");
+
+    const mocked = fakeRoute("https://a.test/api/cart", "POST");
+    await routes[0].handler(mocked);
+    expect(mocked.fulfill).toHaveBeenCalledWith({ status: 503, headers: { "x-a": "b" }, body: "down" });
+    expect(mocked.continue).not.toHaveBeenCalled();
+    expect(seen[0]).toEqual({ url: "https://a.test/api/cart", method: "POST" });
+
+    const passed = fakeRoute("https://a.test/page");
+    await routes[0].handler(passed);
+    // fallback, not continue: the host's other route handlers still run.
+    expect(passed.fallback).toHaveBeenCalled();
+    expect(passed.continue).not.toHaveBeenCalled();
+    expect(passed.fulfill).not.toHaveBeenCalled();
+  });
+
+  it("fails a request on abort, and lets it through when the handler throws", async () => {
+    const { ctx, routes } = routingContext();
+    await new PlaywrightTarget(ctx as never).routeRequests((req) => {
+      if (req.url.endsWith("/boom")) throw new Error("handler bug");
+      return { status: 0, headers: {}, body: "", abort: true };
+    });
+    const aborted = fakeRoute("https://a.test/x");
+    await routes[0].handler(aborted);
+    expect(aborted.abort).toHaveBeenCalledWith("failed");
+    expect(aborted.fulfill).not.toHaveBeenCalled();
+    const thrown = fakeRoute("https://a.test/boom");
+    await routes[0].handler(thrown);
+    expect(thrown.fallback).toHaveBeenCalled();
+    expect(thrown.continue).not.toHaveBeenCalled();
+  });
+
+  it("waits for delayMs before it answers", async () => {
+    const { ctx, routes } = routingContext();
+    await new PlaywrightTarget(ctx as never).routeRequests(() => ({ status: 200, headers: {}, body: "ok", delayMs: 60 }));
+    const route = fakeRoute("https://a.test/slow");
+    const started = Date.now();
+    const pending = routes[0].handler(route);
+    await tick();
+    expect(route.fulfill).not.toHaveBeenCalled();
+    await pending;
+    expect(Date.now() - started).toBeGreaterThanOrEqual(50);
+    expect(route.fulfill).toHaveBeenCalledTimes(1);
+  });
+
+  it("removal unroutes, wakes a delayed request at once and lets it through instead of a stale mock", async () => {
+    const { ctx, routes, unroute } = routingContext();
+    const remove = await new PlaywrightTarget(ctx as never).routeRequests(() => ({ status: 200, headers: {}, body: "ok", delayMs: 20_000 }));
+    const route = fakeRoute("https://a.test/slow");
+    const pending = routes[0].handler(route);
+    await tick();
+    const started = Date.now();
+    await remove();
+    await pending;
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(route.fulfill).not.toHaveBeenCalled();
+    expect(route.fallback).toHaveBeenCalled();
+    expect(route.continue).not.toHaveBeenCalled();
+    expect(unroute).toHaveBeenCalledWith("**/*", expect.any(Function));
+    expect(routes).toHaveLength(0);
+  });
+
+  it("a request that arrives after removal passes through untouched", async () => {
+    const { ctx, routes } = routingContext();
+    const handler = vi.fn(() => ({ status: 200, headers: {}, body: "" }));
+    const remove = await new PlaywrightTarget(ctx as never).routeRequests(handler);
+    const [{ handler: onRoute }] = routes;
+    await remove();
+    const late = fakeRoute("https://a.test/late");
+    await onRoute(late);
+    expect(handler).not.toHaveBeenCalled();
+    expect(late.fallback).toHaveBeenCalled();
+    expect(late.continue).not.toHaveBeenCalled();
+  });
+
+  it("a route call on a closed page does not reject", async () => {
+    const { ctx, routes } = routingContext();
+    await new PlaywrightTarget(ctx as never).routeRequests(() => ({ status: 200, headers: {}, body: "" }));
+    const route = fakeRoute("https://a.test/");
+    route.fulfill.mockRejectedValue(new Error("Target closed"));
+    await expect(routes[0].handler(route)).resolves.toBeUndefined();
+  });
+});
+
+describe("PlaywrightTarget.routeRequests: failed answers never leave a request hanging", () => {
+  async function installed(mock: object) {
+    const { ctx, routes } = routingContext();
+    await new PlaywrightTarget(ctx as never).routeRequests(() => mock as never);
+    return routes[0].handler;
+  }
+
+  it("falls back when fulfill rejects", async () => {
+    const route = fakeRoute("https://a.test/");
+    route.fulfill.mockRejectedValue(new Error("invalid header"));
+    await (await installed({ status: 200, headers: {}, body: "" }))(route);
+    expect(route.fallback).toHaveBeenCalledTimes(1);
+    expect(route.abort).not.toHaveBeenCalled();
+  });
+
+  it("falls back when abort rejects", async () => {
+    const route = fakeRoute("https://a.test/");
+    route.abort.mockRejectedValueOnce(new Error("gone"));
+    await (await installed({ status: 0, headers: {}, body: "", abort: true }))(route);
+    expect(route.fallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts as the last resort when the fallback fails too, and still resolves", async () => {
+    const route = fakeRoute("https://a.test/");
+    route.fulfill.mockRejectedValue(new Error("bad"));
+    route.fallback.mockRejectedValue(new Error("already handled"));
+    route.abort.mockRejectedValue(new Error("gone"));
+    await expect((await installed({ status: 200, headers: {}, body: "" }))(route)).resolves.toBeUndefined();
+    expect(route.abort).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("PlaywrightTarget.resetSession", () => {
+  type ResetPage = ReturnType<typeof fakePage> & { closed: boolean };
+  function resetPage(url = "about:blank"): ResetPage {
+    const page = fakePage() as ResetPage;
+    page.closed = false;
+    const main = { url: () => url, childFrames: () => [] };
+    Object.assign(page, {
+      mainFrame: () => main,
+      url: () => url,
+      goto: vi.fn(async (to: string) => { url = to; }),
+      waitForLoadState: async () => {},
+      close: vi.fn(async () => { page.closed = true; page.emit("close"); }),
+    });
+    return page;
+  }
+  function resetContext(pages: ResetPage[], cdp = new FakeCdp()) {
+    const calls: string[] = [];
+    const ctx = fakeContext(async () => cdp, pages);
+    Object.assign(ctx, {
+      clearCookies: vi.fn(async () => { calls.push("clearCookies"); }),
+      clearPermissions: vi.fn(async () => { calls.push("clearPermissions"); }),
+      newPage: vi.fn(async () => { const p = resetPage(); pages.push(p); return p; }),
+    });
+    return { ctx, cdp, calls };
+  }
+  const cleared = (cdp: FakeCdp) =>
+    (cdp.send.mock.calls as unknown as unknown[][]).filter((c) => c[0] === "Storage.clearDataForOrigin").map((c) => c[1]);
+  type SendFn = (method: string, params?: unknown) => Promise<unknown>;
+  // The shared FakeCdp.send ignores params; wrap it to record them.
+  function recordingCdp() {
+    const cdp = new FakeCdp();
+    const original = cdp.send as unknown as SendFn;
+    cdp.send = vi.fn(async (method: string, params?: unknown) => original(method, params)) as never;
+    return cdp;
+  }
+
+  it("clears cookies and permissions, closes every tab and opens one new blank tab", async () => {
+    const a = resetPage("https://a.test/x");
+    const b = resetPage("https://b.test/y");
+    const c = resetPage("https://c.test/z");
+    const { ctx, calls } = resetContext([a, b, c], recordingCdp());
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    await target.resetSession();
+    expect(calls).toEqual(["clearCookies", "clearPermissions"]);
+    // Even the current tab goes: its sessionStorage and history must not survive.
+    expect([a, b, c].every((p) => p.closed)).toBe(true);
+    expect(ctx.newPage).toHaveBeenCalledTimes(1);
+    const tabs = await target.listPages();
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0].current).toBe(true);
+  });
+
+  it("a tab that is already closed mid-reset does not crash it", async () => {
+    const a = resetPage("https://a.test/");
+    (a.close as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Target closed"));
+    const { ctx } = resetContext([a], recordingCdp());
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    await expect(target.resetSession()).resolves.toBeUndefined();
+    expect(await target.listPages()).toHaveLength(1);
+  });
+
+  it("opens a page when there is none", async () => {
+    const { ctx } = resetContext([], recordingCdp());
+    const target = new PlaywrightTarget(ctx as never);
+    await target.resetSession();
+    expect(ctx.newPage).toHaveBeenCalledTimes(1);
+    expect(await target.listPages()).toHaveLength(1);
+  });
+
+  it("clears the storage of every http(s) origin it saw, through CDP, and forgets them", async () => {
+    const page = resetPage();
+    const cdp = recordingCdp();
+    const { ctx } = resetContext([page], cdp);
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    const main = (page.mainFrame as () => { url: () => string })();
+    const nav = (frame: { url: () => string }) => page.emit("framenavigated", frame);
+    const at = (url: string) => Object.create(main, { url: { value: () => url } }) as { url: () => string };
+    const mainAt = (url: string) => { (main as { url: () => string }).url = () => url; nav(main); };
+    mainAt("https://a.test/login?x=1");
+    mainAt("https://a.test/other");
+    mainAt("http://b.test:8080/");
+    mainAt("about:blank");
+    mainAt("data:text/html,hi");
+    // A subframe (an ad iframe) is not tracked.
+    nav(at("https://ads.test/frame"));
+    await target.resetSession();
+    expect(cleared(cdp)).toEqual([
+      { origin: "https://a.test", storageTypes: "all" },
+      { origin: "http://b.test:8080", storageTypes: "all" },
+    ]);
+    // A second reset has nothing left to clear.
+    cdp.send.mockClear();
+    await target.resetSession();
+    expect(cleared(cdp)).toEqual([]);
+  });
+
+  it("learns the origin of a popup that opened later", async () => {
+    const first = resetPage();
+    const cdp = recordingCdp();
+    const { ctx } = resetContext([first], cdp);
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    const popup = resetPage("https://pop.test/p");
+    ctx.emit("page", popup);
+    await tick();
+    await target.resetSession();
+    expect(cleared(cdp)).toEqual([{ origin: "https://pop.test", storageTypes: "all" }]);
+  });
+
+  it("fails when a storage clear fails, so a run is never called fresh by mistake", async () => {
+    const page = resetPage("https://a.test/");
+    const cdp = recordingCdp();
+    const original = cdp.send as unknown as SendFn;
+    cdp.send = vi.fn(async (method: string, params?: unknown) => {
+      if (method === "Storage.clearDataForOrigin") throw new Error("denied");
+      return original(method, params);
+    }) as never;
+    const { ctx } = resetContext([page], cdp);
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    await expect(target.resetSession()).rejects.toThrow("clearing the storage of 1 origin failed");
+  });
+
+  it("closes tabs and loads about:blank first, then clears cookies and permissions, then storage", async () => {
+    const a = resetPage("https://a.test/x");
+    const b = resetPage("https://b.test/y");
+    const order: string[] = [];
+    const cdp = recordingCdp();
+    const original = cdp.send as unknown as SendFn;
+    cdp.send = vi.fn(async (method: string, params?: unknown) => { if (method === "Storage.clearDataForOrigin") order.push("storage"); return original(method, params); }) as never;
+    const { ctx } = resetContext([a, b], cdp);
+    (b.close as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("close b"); b.closed = true; b.emit("close"); });
+    (a.close as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("close a"); a.closed = true; a.emit("close"); });
+    for (const p of [a, b]) (p.goto as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("blank"); });
+    (ctx.clearCookies as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("cookies"); });
+    (ctx.clearPermissions as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("permissions"); });
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    await target.resetSession();
+    expect(order.slice(0, 3).filter((x) => x.startsWith("close") || x === "blank")).toHaveLength(2);
+    expect(order.indexOf("blank")).toBeLessThan(order.indexOf("cookies"));
+    expect(order.indexOf("cookies")).toBeLessThan(order.indexOf("permissions"));
+    expect(order.indexOf("permissions")).toBeLessThan(order.indexOf("storage"));
+  });
+
+  it("also clears the origins the fixture names, even when never seen", async () => {
+    const page = resetPage();
+    const cdp = recordingCdp();
+    const { ctx } = resetContext([page], cdp);
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    await target.resetSession(["https://fixture.test", "not a url"]);
+    expect(cleared(cdp)).toEqual([{ origin: "https://fixture.test", storageTypes: "all" }]);
+  });
+
+  it("clears at most 16 origins at a time", async () => {
+    const page = resetPage();
+    const cdp = recordingCdp();
+    const original = cdp.send as unknown as SendFn;
+    let active = 0;
+    let peak = 0;
+    cdp.send = vi.fn(async (method: string, params?: unknown) => {
+      if (method !== "Storage.clearDataForOrigin") return original(method, params);
+      active += 1;
+      peak = Math.max(peak, active);
+      await tick();
+      active -= 1;
+      return {};
+    }) as never;
+    const { ctx } = resetContext([page], cdp);
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    await target.resetSession(Array.from({ length: 40 }, (_, i) => `https://o${i}.test`));
+    expect(peak).toBe(16);
+  });
+
+  it("keeps the 500 newest origins and forgets the oldest", async () => {
+    const page = resetPage();
+    const cdp = recordingCdp();
+    const { ctx } = resetContext([page], cdp);
+    const target = new PlaywrightTarget(ctx as never);
+    await target.ensurePage();
+    const main = (page.mainFrame as () => { url: () => string })();
+    for (let i = 0; i < 600; i++) {
+      (main as { url: () => string }).url = () => `https://o${i}.test/`;
+      page.emit("framenavigated", main);
+    }
+    await target.resetSession();
+    const origins = cleared(cdp).map((c) => (c as { origin: string }).origin);
+    expect(origins).toHaveLength(500);
+    expect(origins).not.toContain("https://o99.test");
+    expect(origins).toContain("https://o100.test");
+    expect(origins).toContain("https://o599.test");
+  });
+});

@@ -320,7 +320,7 @@ const result = await runBrowseAgent("find the price of the first result", {
   url: "https://example.com",             // optional: opened before the first request
   providerOptions: { openrouter: { reasoning: { effort: "none" } } },
 });
-// { status: "done" | "error" | "aborted" | "step_limit" | "timeout", answer, steps, error? }
+// { status: "done" | "error" | "aborted" | "step_limit" | "timeout" | "setup_failed", answer, steps, error?, setupStage? }
 ```
 
 `examples/run-agent.ts` runs it end to end with local Chromium and OpenRouter.
@@ -439,13 +439,83 @@ const saved = await controller.captureFixture();            // { ok, fixture } -
 await runBrowseAgent(goal, { model, browser: controllerBridge(controller), fixture });
 ```
 
-Apply order: cookies, storage per origin, start URL, extra tabs, steps. Cookies
-need a target with `setCookies` (`PlaywrightTarget` has it, so Steel too).
-`network` is reserved: a non-empty list fails with "not supported yet". The model
-never sees the fixture: `runBrowseAgent({ fixture })` gives it a summary with
-counts only, plus a snapshot. `url` and `fixture` together are an error. A host
-that prepares the browser its own way uses `BrowseAgentRunOptions.setup`.
-Capture takes storage, URL and tabs, not the DOM state of a page.
+Apply order: session reset (`fresh`), network mocks, cookies, storage per origin,
+start URL, extra tabs, steps, `expect`. Cookies need a target with `setCookies`
+(`PlaywrightTarget` has it, so Steel too). The model never sees the fixture:
+`runBrowseAgent({ fixture })` gives it a summary with counts only (for example
+`1 cookie; 2 network mocks; fresh session; expect checked`), plus a snapshot. `url` and
+`fixture` together are an error. A host that prepares the browser its own way
+uses `BrowseAgentRunOptions.setup`. Capture takes storage, URL and tabs, not the
+DOM state of a page.
+
+### QA start: expect, network mocks, fresh session
+
+Design: `docs/specs/2026-10-15-qa-start-design.md`. A QA host turns a fixture
+into a test case: prepare state X, check that X is really there, then give the
+task to the agent.
+
+```ts
+const fixture: PageFixture = {
+  version: 1,
+  fresh: true,                                   // reset the session first (needs target.resetSession)
+  url: "https://shop.test/cart",
+  network: [                                     // needs allowNetworkMocks and target.routeRequests
+    { url: "https://api.shop.test/cart*", method: "GET", body: { items: [] } },
+    { url: "https://api.shop.test/pay*", status: 500, times: 1 },
+    { url: "https://cdn.shop.test/ads*", abort: true },
+  ],
+  expect: { selector: "#cart", text: "Your cart is empty", url: "https://shop.test/cart*", timeoutMs: 5000 },
+};
+```
+
+- `expect` is checked on the main tab after `steps`. All given conditions must
+  hold at once; the check polls up to `timeoutMs` (default 5000, max 30000).
+  `url` and the network `url` use one matcher: the full URL, `*` is any run of characters.
+- `network` rules: the first matching rule wins (fixture order); a rule with
+  `times` stops after N answers and later requests go through. `body` as an object is sent as JSON.
+- `allowNetworkMocks` is a host gate: `applyFixture(fixture, { allowNetworkMocks: true })`,
+  `controller.applyFixture(fixture, { allowNetworkMocks: true })`, or
+  `runBrowseAgent(goal, { ..., fixture, allowNetworkMocks: true })`. Without it a
+  non-empty `network` fails with stage `network`. So does a target without
+  `routeRequests`. `PlaywrightTarget` implements it for the whole context (every tab and popup).
+- Mocks live until the task ends, not until `applyFixture` returns. `applyFixture`
+  returns `release()` (idempotent) when it installed any; a failed apply removes them itself.
+  `BrowserController` keeps the release: `controller.releaseFixture()` calls it, and a new
+  `applyFixture` releases the previous one first. `runBrowseAgent({ fixture })` calls
+  `browser.releaseFixture()` in `finally` for every outcome, and refuses (status `setup_failed`,
+  stage `network`) a bridge with mocks but no `releaseFixture`.
+- `fresh: true` calls `target.resetSession(origins)` before anything else. `PlaywrightTarget` closes
+  ALL tabs and opens one new blank tab (sessionStorage and history are gone), then clears cookies,
+  permissions and storage (CDP `Storage.clearDataForOrigin`). **Limit:** cookies are cleared everywhere,
+  but storage only for the origins this `PlaywrightTarget` instance saw in main-frame navigations plus the
+  fixture's own origins. A reconnected target (a new `PlaywrightTarget`) or a third-party iframe may keep storage.
+  For full isolation use one new `BrowserContext` per run; `fresh` covers a reused context. A reset
+  that runs past 15 s fails with `resetting the session took too long`.
+- URL patterns (network `url`, `expect.url`): scheme and host match without case, a bare origin
+  (`https://a.test`) means `https://a.test/`, and a pattern matches the encoded URL (no percent-encoding
+  normalization). A mock `status` is 200-599; header names are HTTP tokens and values hold no line break.
+- Ownership: the controller's apply result carries `fixtureToken` when it installed mocks;
+  `releaseFixture(token)` removes only that fixture. `runBrowseAgent` uses the token of its own apply, so
+  two runs on one controller cannot remove each other's mocks; a run whose apply returned no token releases nothing.
+- Every apply failure has a `stage`: `validate`, `prepare`, `network`, `reset`, `cookies`, `storage`, `url`,
+  `tabs`, `steps`, `expect`. In an agent run it comes back as status `setup_failed`
+  (the model never ran) with `result.setupStage`; `done`, `error`, `timeout` and so on
+  mean the agent or the site failed, not the preparation. A `setup` hook can throw `SetupError(stage, message)`
+  to do the same. No error or summary holds a mock URL query, header or body.
+
+```ts
+const context = await browser.newContext();                       // a new context per QA run
+const controller = new BrowserController(new PlaywrightTarget(context));
+const result = await runBrowseAgent("Pay for the order", {
+  model, browser: controllerBridge(controller), fixture, allowNetworkMocks: true,
+});
+if (result.status === "setup_failed") console.error("setup broke at", result.setupStage, result.error);
+await context.close();
+```
+
+The desktop target runs in the user's real profile. It must not implement
+`resetSession` (it would log the user out of everything) or `routeRequests`
+(the rules would hit the user's own tabs) without scoping them to the agent's tabs.
 
 ## Isomorphism
 

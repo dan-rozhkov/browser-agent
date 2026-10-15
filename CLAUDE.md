@@ -26,7 +26,7 @@ src/policy/       decideStep / planGoal / locateTarget, step policies, schemas, 
 src/loop/         runBrowseTask, action cache, loop guard, BrowserBridge, BrowseBackend, KeyValueStorage
 src/adapters/     playwright, systemoneHttp, aiSdk, httpBackend, localBackend, controllerBridge
 src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; execute.ts + executeEntry.ts = the one executor of the seven browse tools, zod-free `agent/execute`; aiSdk.ts = runBrowseAgent (peer ai)
-src/fixture/      PageFixture: types, parsePageFixture, applyFixture, captureFixture (isomorphic, zod-free; subpath `fixture`)
+src/fixture/      PageFixture: types, parsePageFixture, applyFixture, captureFixture, network rule matcher (isomorphic, zod-free; subpath `fixture`)
 src/index.ts      root barrel: controller + policy + loop + fixture (NOT adapters)
 test/<layer>/     mirrors src; examples/ is type-checked by lint
 ```
@@ -51,6 +51,10 @@ them in step when you add an entry point.
 - Adapters carry optional peer dependencies; the root barrel never re-exports
   them. Name collisions between layers are resolved explicitly in
   `src/index.ts`.
+- `BrowserTarget.resetSession` and `routeRequests` (QA start) clear or intercept a whole
+  browser context. The desktop target runs in the user's real profile: it must never
+  implement them without scoping to the agent's own tabs (`resetSession` would log the
+  user out of everything). A network mock must be removed by `release()` when the task ends.
 - Relative imports use the `.js` suffix.
 - Fixes land here first. Consumers (pen-editor, backend, desktop) bump the
   git tag afterwards. Do not patch the copies in those repos.

@@ -86,7 +86,7 @@ describe("item 3: bot check", () => {
 
   it("the controller path fails with a clear error and no query", async () => {
     const r = await new BrowserController(fakeTarget({ exec })).applyFixture({ version: 1, url: "https://a.test/p?token=SECRETQ" });
-    expect(r).toEqual({ ok: false, error: "start page: https://a.test/p shows a bot check" });
+    expect(r).toEqual({ ok: false, stage: "url", error: "start page: https://a.test/p shows a bot check" });
   });
 
   it("the standalone path is unaffected", async () => {
@@ -128,7 +128,7 @@ describe("item 4: settle after click and press", () => {
     setTimeout(() => ctl.abort(), 400);
     const r = await applyFixture(t, { version: 1, steps: [{ action: "press", key: "Enter" }, { action: "click", selector: "#go" }] }, { signal: ctl.signal });
     // Still loading at 400 ms: the run waited (and was aborted) instead of clicking at once.
-    expect(r).toEqual({ ok: false, error: "aborted" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "aborted" });
     expect(state.page).toBe("old");
   });
 });
@@ -168,7 +168,7 @@ describe("items 5 and 6: tab identity", () => {
   it("fails clearly when the target lists no current tab", async () => {
     const t = fakeTarget({ exec: () => OK });
     t.listPages = async () => [];
-    expect(await applyFixture(t, { version: 1, url: "https://a.test/" })).toEqual({ ok: false, error: "the browser reports no current tab" });
+    expect(await applyFixture(t, { version: 1, url: "https://a.test/" })).toEqual({ ok: false, stage: "prepare", error: "the browser reports no current tab" });
   });
 
   it("fails clearly when the main tab is gone", async () => {
@@ -178,7 +178,7 @@ describe("items 5 and 6: tab identity", () => {
       t.currentId = 2;
     };
     t.selectPage = async () => false;
-    expect(await applyFixture(t, { version: 1, url: "https://a.test/" })).toEqual({ ok: false, error: "start page: the main tab is gone" });
+    expect(await applyFixture(t, { version: 1, url: "https://a.test/" })).toEqual({ ok: false, stage: "url", error: "start page: the main tab is gone" });
   });
 });
 
@@ -196,7 +196,7 @@ describe("item 7: abort", () => {
         openTab: async (url) => { calls.push(`tab ${url}`); return { ok: true }; },
       },
     );
-    expect(r).toEqual({ ok: false, error: "aborted" });
+    expect(r).toEqual({ ok: false, stage: "url", error: "aborted" });
     expect(calls).toEqual(["navigate https://a.test/"]);
   });
 
@@ -210,7 +210,7 @@ describe("item 7: abort", () => {
       return info;
     };
     const r = await applyFixture(t, { version: 1, tabs: ["https://b.test/"] }, { signal: ctl.signal });
-    expect(r).toEqual({ ok: false, error: "aborted" });
+    expect(r).toEqual({ ok: false, stage: "tabs", error: "aborted" });
     expect(t.pages.has(2)).toBe(false);
     expect(t.currentId).toBe(1);
   });
@@ -262,7 +262,7 @@ describe("item 8: waitFor timeoutMs 0", () => {
     let calls = 0;
     const t = fakeTarget({ exec: () => (calls++, JSON.stringify({ ok: true, found: false })) });
     const r = await applyFixture(t, { version: 1, steps: [{ action: "waitFor", selector: ".x", timeoutMs: 0 }] });
-    expect(r).toEqual({ ok: false, error: "step 1 (waitFor .x) failed: timed out after 0ms" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (waitFor .x) failed: timed out after 0ms" });
     expect(calls).toBe(1);
   });
 });
@@ -286,6 +286,6 @@ describe("item 10: validate once", () => {
   it("applyParsedFixture does not validate again", async () => {
     // An invalid version would fail parsePageFixture; the parsed entry point trusts its caller.
     expect(await applyParsedFixture(fakeTarget({ exec: () => OK }), { version: 2 } as never)).toMatchObject({ ok: true });
-    expect(await applyFixture(fakeTarget({ exec: () => OK }), { version: 2 } as never)).toEqual({ ok: false, error: "fixture.version must be 1" });
+    expect(await applyFixture(fakeTarget({ exec: () => OK }), { version: 2 } as never)).toEqual({ ok: false, stage: "validate", error: "fixture.version must be 1" });
   });
 });

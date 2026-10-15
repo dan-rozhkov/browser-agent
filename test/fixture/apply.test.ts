@@ -62,7 +62,7 @@ describe("applyFixture", () => {
   it("fails clearly when cookies are given but the target cannot set them", async () => {
     const target = fakeTarget({ withCookies: false });
     const r = await applyFixture(target, { version: 1, storage: { cookies: [{ name: "a", value: SECRET, domain: "a.test" }] } });
-    expect(r).toEqual({ ok: false, error: "this browser target cannot set cookies (setCookies is missing)" });
+    expect(r).toEqual({ ok: false, stage: "cookies", error: "this browser target cannot set cookies (setCookies is missing)" });
     expect(target.log).toEqual([]);
   });
 
@@ -72,10 +72,10 @@ describe("applyFixture", () => {
     if (!r.ok) expect(r.error).toContain("cannot open extra tabs");
   });
 
-  it("rejects network mocks", async () => {
+  it("refuses network mocks while the host gate is off", async () => {
     const target = fakeTarget();
     const r = await applyFixture(target, { version: 1, network: [{ url: "x" }] });
-    expect(r).toEqual({ ok: false, error: "PageFixture.network is not supported yet" });
+    expect(r).toEqual({ ok: false, stage: "network", error: "network mocks are disabled (allowNetworkMocks is off)" });
     expect(target.log).toEqual([]);
   });
 
@@ -86,7 +86,7 @@ describe("applyFixture", () => {
 
   it("rejects an invalid fixture with the parse error", async () => {
     const r = await applyFixture(fakeTarget(), { version: 2 } as never);
-    expect(r).toEqual({ ok: false, error: "fixture.version must be 1" });
+    expect(r).toEqual({ ok: false, stage: "validate", error: "fixture.version must be 1" });
   });
 
   it("reports a failed step as `step N (<action> <selector>) failed: <reason>` and stops", async () => {
@@ -101,20 +101,20 @@ describe("applyFixture", () => {
         { action: "click", selector: "#never" },
       ],
     });
-    expect(r).toEqual({ ok: false, error: "step 2 (click #missing) failed: element not found" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 2 (click #missing) failed: element not found" });
     expect(target.log.filter((l) => l.endsWith("js"))).toHaveLength(2);
   });
 
   it("a type step failure names the selector, never the text", async () => {
     const target = fakeTarget({ exec: () => JSON.stringify({ ok: false, error: "element not found" }) });
     const r = await applyFixture(target, { version: 1, steps: [{ action: "type", selector: "#pw", text: SECRET }] });
-    expect(r).toEqual({ ok: false, error: "step 1 (type #pw) failed: element not found" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (type #pw) failed: element not found" });
   });
 
   it("does not repeat a page error message that may quote storage data", async () => {
     const target = fakeTarget({ exec: () => JSON.stringify({ ok: false, name: "QuotaExceededError", message: `Setting the value of '${SECRET}' exceeded the quota` }) });
     const r = await applyFixture(target, { version: 1, storage: { origins: [{ origin: "https://a.test", localStorage: { [SECRET]: SECRET } }] } });
-    expect(r).toEqual({ ok: false, error: "storage origin 1: writing storage failed (QuotaExceededError)" });
+    expect(r).toEqual({ ok: false, stage: "storage", error: "storage origin 1: writing storage failed (QuotaExceededError)" });
   });
 
   it("does not repeat a thrown script or cookie error", async () => {
@@ -126,21 +126,21 @@ describe("applyFixture", () => {
     const cookies = fakeTarget();
     cookies.setCookies = async () => { throw new Error(`bad cookie ${SECRET}`); };
     const r2 = await applyFixture(cookies, { version: 1, storage: { cookies: [{ name: "a", value: SECRET, domain: "a.test" }] } });
-    expect(r2).toEqual({ ok: false, error: "setting cookies failed" });
+    expect(r2).toEqual({ ok: false, stage: "cookies", error: "setting cookies failed" });
   });
 
   it("fails when the origin redirects elsewhere", async () => {
     const target = fakeTarget();
     target.pages.get(1)!.loadURL = async () => { target.pages.get(1)!.url = "https://other.test/"; };
     const r = await applyFixture(target, { version: 1, storage: { origins: [{ origin: "https://a.test", localStorage: { k: "v" } }] } });
-    expect(r).toEqual({ ok: false, error: "storage origin 1: the page redirected to another origin" });
+    expect(r).toEqual({ ok: false, stage: "storage", error: "storage origin 1: the page redirected to another origin" });
   });
 
   it("fails when the start page does not load", async () => {
     const target = fakeTarget();
     target.pages.get(1)!.loadURL = async () => { throw new Error("ERR_NAME_NOT_RESOLVED"); };
     const r = await applyFixture(target, { version: 1, url: "https://a.test/" });
-    expect(r).toEqual({ ok: false, error: "start page: loading failed: ERR_NAME_NOT_RESOLVED" });
+    expect(r).toEqual({ ok: false, stage: "url", error: "start page: loading failed: ERR_NAME_NOT_RESOLVED" });
   });
 
   it("a goto step loads the URL", async () => {
@@ -174,7 +174,7 @@ describe("applyFixture", () => {
 
   it("press fails on an unknown key", async () => {
     const r = await applyFixture(fakeTarget(), { version: 1, steps: [{ action: "press", key: "NoSuchKey" }] });
-    expect(r).toEqual({ ok: false, error: "step 1 (press NoSuchKey) failed: unsupported key" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (press NoSuchKey) failed: unsupported key" });
   });
 
   it("waitFor polls until the selector appears", async () => {
@@ -188,7 +188,7 @@ describe("applyFixture", () => {
   it("waitFor times out", async () => {
     const target = fakeTarget({ exec: () => JSON.stringify({ ok: true, found: false }) });
     const r = await applyFixture(target, { version: 1, steps: [{ action: "waitFor", selector: ".ready", timeoutMs: 150 }] });
-    expect(r).toEqual({ ok: false, error: "step 1 (waitFor .ready) failed: timed out after 150ms" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (waitFor .ready) failed: timed out after 150ms" });
   });
 
   it("a wait step sleeps", async () => {
@@ -202,21 +202,21 @@ describe("applyFixture", () => {
     const ctl = new AbortController();
     const target = fakeTarget({ exec: () => { ctl.abort(); return OK; } });
     const r = await applyFixture(target, { version: 1, steps: [{ action: "click", selector: "#a" }, { action: "click", selector: "#b" }] }, { signal: ctl.signal });
-    expect(r).toEqual({ ok: false, error: "aborted" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "aborted" });
     expect(target.log.filter((l) => l.endsWith("js"))).toHaveLength(1);
 
     const ctl2 = new AbortController();
     setTimeout(() => ctl2.abort(), 20);
     const t0 = Date.now();
     const r2 = await applyFixture(fakeTarget(), { version: 1, steps: [{ action: "wait", ms: 10_000 }] }, { signal: ctl2.signal });
-    expect(r2).toEqual({ ok: false, error: "aborted" });
+    expect(r2).toEqual({ ok: false, stage: "steps", error: "aborted" });
     expect(Date.now() - t0).toBeLessThan(2000);
   });
 
   it("an already aborted signal does nothing", async () => {
     const target = fakeTarget();
     const r = await applyFixture(target, { version: 1, url: "https://a.test/" }, { signal: AbortSignal.abort() });
-    expect(r).toEqual({ ok: false, error: "aborted" });
+    expect(r).toEqual({ ok: false, stage: "validate", error: "aborted" });
     expect(target.log).toEqual([]);
   });
 
@@ -252,7 +252,7 @@ describe("applyFixture review fixes", () => {
       return info;
     };
     const r2 = await applyFixture(failing, { version: 1, tabs: ["https://b.test/x"] });
-    expect(r2).toEqual({ ok: false, error: "extra tab 1: loading failed: ERR_CONNECTION_REFUSED" });
+    expect(r2).toEqual({ ok: false, stage: "tabs", error: "extra tab 1: loading failed: ERR_CONNECTION_REFUSED" });
   });
 
   it("default press skips text and sends the editing command for a Ctrl/Meta combo", async () => {
@@ -287,7 +287,7 @@ describe("applyFixture review fixes", () => {
   it("waitFor that only ever rejects ends at its deadline with a timeout", async () => {
     const target = fakeTarget({ exec: () => { throw new Error("gone"); } });
     const r = await applyFixture(target, { version: 1, steps: [{ action: "waitFor", selector: ".x", timeoutMs: 200 }] });
-    expect(r).toEqual({ ok: false, error: "step 1 (waitFor .x) failed: timed out after 200ms" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (waitFor .x) failed: timed out after 200ms" });
   });
 
   it("a page script that never answers fails the step instead of hanging", async () => {
@@ -296,7 +296,7 @@ describe("applyFixture review fixes", () => {
       const target = fakeTarget({ exec: () => new Promise(() => {}) });
       const run = applyFixture(target, { version: 1, steps: [{ action: "click", selector: "#a" }] });
       await vi.advanceTimersByTimeAsync(10_001);
-      expect(await run).toEqual({ ok: false, error: "step 1 (click #a) failed: the page script failed" });
+      expect(await run).toEqual({ ok: false, stage: "steps", error: "step 1 (click #a) failed: the page script failed" });
     } finally {
       vi.useRealTimers();
     }

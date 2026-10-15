@@ -1,6 +1,6 @@
 import { BROWSE_AGENT_ANSWER_MAX_CHARS, BROWSE_AGENT_ERROR_MAX_CHARS } from "./limits.js";
 
-export type BrowseAgentStatus = "done" | "error" | "aborted" | "step_limit" | "timeout";
+export type BrowseAgentStatus = "done" | "error" | "aborted" | "step_limit" | "timeout" | "setup_failed";
 
 /**
  * The result of one run. Serialize it with `JSON.stringify` to get the string
@@ -13,8 +13,10 @@ export interface BrowseAgentResult {
   answer: string;
   /** Tool executions, including the pre-open. */
   steps: number;
-  /** Set for status `error` (and by `goalRequiredResult`). */
+  /** Set for status `error` and `setup_failed` (and by `goalRequiredResult`). */
   error?: string;
+  /** Set for status `setup_failed` when the setup knows which part broke (for a fixture: the apply stage). */
+  setupStage?: string;
   /** Extra fields from host tools. */
   [extra: string]: unknown;
 }

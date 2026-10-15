@@ -1,10 +1,11 @@
 // applyFixture: put a browser into the state a PageFixture describes.
 // Isomorphic: it drives a BrowserTarget (types only) and runs every page step
-// through `executeJavaScript`. Order: cookies, storage per origin, start URL,
-// extra tabs, steps. Error text never repeats cookie or storage data: page
+// through `executeJavaScript`. Order: session reset, network mocks, cookies,
+// storage per origin, start URL, extra tabs, steps, expect. Error text never repeats cookie or storage data: page
 // errors are reported with fixed words, not with the message the page gave.
 import type { BrowserPageHandle, BrowserTarget } from "../controller/controller.js";
 import { dispatchKeyPair, keyDispatchOptions, parseKeySpec } from "../controller/keys.js";
+import { createNetworkHandler, matchUrlPattern } from "./network.js";
 import { parsePageFixture } from "./parse.js";
 import {
   FIXTURE_MAX_WAIT_MS,
@@ -14,10 +15,11 @@ import {
   type FixtureDialog,
   type FixtureHookResult,
   type FixtureHooks,
+  type FixtureStage,
   type FixtureStep,
   type PageFixture,
 } from "./types.js";
-import { redactUrl, redactUrls, runScript, SCRIPT_TIMEOUT_MS, toMessage } from "./util.js";
+import { httpOrigin, redactUrl, redactUrls, runScript, SCRIPT_TIMEOUT_MS, toMessage } from "./util.js";
 
 /** What one apply run shares between its helpers. */
 interface Ctx {
@@ -28,6 +30,16 @@ interface Ctx {
   mainId: number | undefined;
   /** Dialogs the host hooks drained. */
   dialogs: FixtureDialog[];
+  allowNetworkMocks: boolean;
+  /** The part of the apply that runs now: a failure is reported with it. */
+  stage: FixtureStage;
+  /** Removes the installed network mocks (idempotent); undefined when none. */
+  release: (() => Promise<void>) | undefined;
+}
+
+function enter(ctx: Ctx, stage: FixtureStage): void {
+  ctx.stage = stage;
+  ctx.hooks?.onStage?.(stage);
 }
 
 /** Longest wait for one navigation of a fixture. */
@@ -37,6 +49,8 @@ const SETTLE_TIMEOUT_MS = 10_000;
 /** How long a click or key press may take to start a navigation (standalone). */
 const SETTLE_START_MS = 150;
 const WAIT_FOR_POLL_MS = 100;
+/** Time `fresh` may take besides one navigation: cookies, tabs, storage of every origin. */
+const RESET_BUDGET_MS = 15_000;
 /** Overall cap of `fixtureBudgetMs`. */
 const MAX_BUDGET_MS = 5 * 60_000;
 
@@ -47,7 +61,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 }
 
 /** Sleeps `ms`; rejects at once when `signal` aborts. */
-function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+export function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) return reject(new FixtureError("aborted"));
     const onAbort = () => {
@@ -285,25 +299,44 @@ async function press(ctx: Ctx, page: BrowserPageHandle, step: Extract<FixtureSte
   });
 }
 
-/** Polls for `selector` until `timeoutMs` passes. `timeoutMs` 0 checks once. */
-async function waitFor(page: BrowserPageHandle, selector: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<StepOutcome> {
+/** One try of a poll: done, or why not. `fatal` ends the poll at once. */
+type PollAttempt = { done: true } | { done: false; fatal?: boolean; detail: string };
+
+/**
+ * Tries `attempt` until it is done or `timeoutMs` passes (`0` tries once), with
+ * a short pause between tries. Shared by `waitFor` steps and `expect`.
+ */
+async function poll(
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  attempt: () => Promise<PollAttempt>,
+): Promise<{ ok: true } | { ok: false; fatal: boolean; detail: string }> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     throwIfAborted(signal);
+    const outcome = await attempt();
+    if (outcome.done) return { ok: true };
+    const remaining = deadline - Date.now();
+    if (outcome.fatal || remaining <= 0) return { ok: false, fatal: outcome.fatal === true, detail: outcome.detail };
+    await sleep(Math.min(WAIT_FOR_POLL_MS, remaining), signal);
+  }
+}
+
+/** Polls for `selector` until `timeoutMs` passes. `timeoutMs` 0 checks once. */
+async function waitFor(page: BrowserPageHandle, selector: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<StepOutcome> {
+  const outcome = await poll(signal, timeoutMs, async () => {
     let result: Record<string, unknown> | undefined;
     try {
       result = await runScript(page, existsScript(selector));
     } catch {
       // The context can be destroyed by a navigation under the poll: retry until the deadline.
     }
-    if (result) {
-      if (result.ok !== true) return { ok: false, error: typeof result.error === "string" ? result.error : "the page script failed" };
-      if (result.found === true) return { ok: true };
-    }
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) return { ok: false, error: `timed out after ${timeoutMs}ms` };
-    await sleep(Math.min(WAIT_FOR_POLL_MS, remaining), signal);
-  }
+    if (!result) return { done: false, detail: "" };
+    if (result.ok !== true) return { done: false, fatal: true, detail: typeof result.error === "string" ? result.error : "the page script failed" };
+    return result.found === true ? { done: true } : { done: false, detail: "" };
+  });
+  if (outcome.ok) return { ok: true };
+  return { ok: false, error: outcome.fatal ? outcome.detail : `timed out after ${timeoutMs}ms` };
 }
 
 async function runStep(ctx: Ctx, step: FixtureStep): Promise<StepOutcome> {
@@ -334,6 +367,81 @@ async function runStep(ctx: Ctx, step: FixtureStep): Promise<StepOutcome> {
   }
 }
 
+function expectScript(selector: string | undefined, text: string | undefined): string {
+  return `(() => {
+  const out = { ok: true };
+  ${selector === undefined ? "" : `const el = ${FIND(selector)};
+  if (el === undefined) return JSON.stringify({ ok: false, error: "invalid selector" });
+  let visible = false;
+  if (el) {
+    const r = el.getBoundingClientRect();
+    const st = getComputedStyle(el);
+    visible = r.width > 0 && r.height > 0 && st.visibility !== "hidden" && st.display !== "none";
+  }
+  out.selector = visible;`}
+  ${text === undefined ? "" : `const body = document.body;
+  out.text = !!body && String(body.innerText || "").includes(${lit(text)});`}
+  return JSON.stringify(out);
+})()`;
+}
+
+const EXPECT_TEXT_MAX = 80;
+
+/** Polls until every condition of `expect` holds, or fails naming the ones that do not. */
+async function checkExpect(ctx: Ctx, expectation: NonNullable<PageFixture["expect"]>): Promise<void> {
+  const timeoutMs = expectation.timeoutMs ?? FIXTURE_WAIT_FOR_DEFAULT_MS;
+  const needsScript = expectation.selector !== undefined || expectation.text !== undefined;
+  const outcome = await poll(ctx.signal, timeoutMs, async () => {
+    const page = await mainPage(ctx);
+    const failed: string[] = [];
+    if (needsScript) {
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = await runScript(page, expectScript(expectation.selector, expectation.text));
+      } catch {
+        // The context can be destroyed by a navigation under the poll: retry until the deadline.
+      }
+      if (!result) failed.push("the page could not be read");
+      else if (result.ok !== true) return { done: false, fatal: true, detail: typeof result.error === "string" ? result.error : "the page script failed" };
+      else {
+        if (expectation.selector !== undefined && result.selector !== true) failed.push(`element ${expectation.selector} is not visible`);
+        if (expectation.text !== undefined && result.text !== true) {
+          const quoted = expectation.text.length > EXPECT_TEXT_MAX ? `${expectation.text.slice(0, EXPECT_TEXT_MAX)}...` : expectation.text;
+          failed.push(`text "${quoted}" is not on the page`);
+        }
+      }
+    }
+    if (expectation.url !== undefined) {
+      const actual = page.getURL();
+      if (!matchUrlPattern(expectation.url, actual)) failed.push(`URL ${redactUrl(actual)} does not match the expected pattern`);
+    }
+    return failed.length === 0 ? { done: true } : { done: false, detail: failed.join("; ") };
+  });
+  if (outcome.ok) return;
+  throw new FixtureError(outcome.fatal ? `expect failed: ${outcome.detail}` : `expect failed after ${timeoutMs}ms: ${outcome.detail}`);
+}
+
+/** http(s) origins the fixture itself navigates to: `fresh` must clear their storage whatever the target saw. */
+function fixtureOrigins(fixture: PageFixture): string[] {
+  const urls = [
+    ...(fixture.url ? [fixture.url] : []),
+    ...(fixture.tabs ?? []),
+    ...(fixture.storage?.origins ?? []).map((o) => o.origin),
+    ...(fixture.steps ?? []).flatMap((step) => (step.action === "goto" ? [step.url] : [])),
+  ];
+  const origins = new Set<string>();
+  for (const url of urls) {
+    const origin = httpOrigin(url);
+    if (origin) origins.add(origin);
+  }
+  return [...origins];
+}
+
+function once(fn: () => Promise<void>): () => Promise<void> {
+  let done: Promise<void> | undefined;
+  return () => (done ??= fn());
+}
+
 function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
@@ -350,6 +458,10 @@ function summarize(fixture: PageFixture): string {
   if (tabs) parts.push(`${plural(tabs, "extra tab")}`);
   const steps = fixture.steps?.length ?? 0;
   if (steps) parts.push(plural(steps, "setup step"));
+  const mocks = fixture.network?.length ?? 0;
+  if (mocks) parts.push(plural(mocks, "network mock"));
+  if (fixture.fresh) parts.push("fresh session");
+  if (fixture.expect) parts.push("expect checked");
   return parts.length ? parts.join("; ") : "no state to prepare";
 }
 
@@ -392,17 +504,71 @@ async function openTab(ctx: Ctx, url: string): Promise<void> {
 
 async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> {
   const { target, signal } = ctx;
-  if (fixture.network && fixture.network.length > 0) throw new FixtureError("PageFixture.network is not supported yet");
+  const rules = fixture.network ?? [];
   const cookies = fixture.storage?.cookies ?? [];
   const origins = fixture.storage?.origins ?? [];
   const tabs = fixture.tabs ?? [];
-  if (cookies.length > 0 && !target.setCookies) throw new FixtureError("this browser target cannot set cookies (setCookies is missing)");
-  if (tabs.length > 0 && !(target.newPage && target.listPages && target.selectPage)) {
-    throw new FixtureError("this browser target cannot open extra tabs (newPage, listPages or selectPage is missing)");
+  throwIfAborted(signal);
+  // Every capability is checked before anything changes, under the stage of the feature checked.
+  enter(ctx, "prepare");
+  if (fixture.fresh) {
+    enter(ctx, "reset");
+    if (!target.resetSession) throw new FixtureError("this browser cannot reset its session");
   }
+  if (rules.length > 0) {
+    enter(ctx, "network");
+    if (!ctx.allowNetworkMocks) throw new FixtureError("network mocks are disabled (allowNetworkMocks is off)");
+    if (!target.routeRequests) throw new FixtureError("this browser cannot mock network requests");
+  }
+  if (cookies.length > 0) {
+    enter(ctx, "cookies");
+    if (!target.setCookies) throw new FixtureError("this browser target cannot set cookies (setCookies is missing)");
+  }
+  if (tabs.length > 0) {
+    enter(ctx, "tabs");
+    if (!(target.newPage && target.listPages && target.selectPage)) {
+      throw new FixtureError("this browser target cannot open extra tabs (newPage, listPages or selectPage is missing)");
+    }
+  }
+  // An abort here is not the fault of any feature: it reports `prepare`.
+  enter(ctx, "prepare");
   throwIfAborted(signal);
 
+  if (fixture.fresh) {
+    enter(ctx, "reset");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tooLong = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new FixtureError("resetting the session took too long")), RESET_BUDGET_MS);
+    });
+    try {
+      await Promise.race([target.resetSession!(fixtureOrigins(fixture)), tooLong]);
+    } catch (err) {
+      if (signal?.aborted || err instanceof FixtureError) throw err;
+      throw new FixtureError(`resetting the session failed: ${toMessage(err)}`);
+    } finally {
+      clearTimeout(timer);
+      tooLong.catch(() => {});
+    }
+    throwIfAborted(signal);
+  }
+
+  if (rules.length > 0) {
+    enter(ctx, "network");
+    let remove: () => Promise<void>;
+    try {
+      remove = await target.routeRequests!(createNetworkHandler(rules));
+    } catch (err) {
+      // The target's message may quote a rule.
+      if (signal?.aborted) throw err;
+      throw new FixtureError("installing network mocks failed");
+    }
+    // Set before the abort check: a failure from here on removes the mocks.
+    ctx.release = once(remove);
+    throwIfAborted(signal);
+  }
+
   if (cookies.length > 0) {
+    enter(ctx, "cookies");
     try {
       await target.setCookies!(cookies);
     } catch {
@@ -412,6 +578,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   }
 
   // The main tab: the one that is current now. A target that lists no tabs has one.
+  enter(ctx, "prepare");
   await target.ensurePage();
   if (target.listPages) {
     const current = (await target.listPages()).find((t) => t.current);
@@ -422,6 +589,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   for (const [i, entry] of origins.entries()) {
     const label = `storage origin ${i + 1}`;
     if (!entry.localStorage && !entry.sessionStorage) continue;
+    enter(ctx, "storage");
     let page: BrowserPageHandle;
     try {
       page = await navigate(ctx, `${entry.origin}/`);
@@ -442,6 +610,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   }
 
   if (fixture.url) {
+    enter(ctx, "url");
     try {
       await navigate(ctx, fixture.url);
     } catch (err) {
@@ -450,6 +619,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
     }
   }
 
+  if (tabs.length > 0) enter(ctx, "tabs");
   for (const [i, url] of tabs.entries()) {
     try {
       await openTab(ctx, url);
@@ -460,6 +630,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   }
 
   const steps = fixture.steps ?? [];
+  if (steps.length > 0) enter(ctx, "steps");
   for (const [i, step] of steps.entries()) {
     throwIfAborted(signal);
     const outcome = await runStep(ctx, step);
@@ -469,9 +640,15 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
     }
   }
 
-  // A new tab became current: the agent works on the main tab.
+  if (fixture.expect) {
+    enter(ctx, "expect");
+    await checkExpect(ctx, fixture.expect);
+  }
+
+  // A new tab became current: the agent works on the main tab. This read is `prepare`, not the stage of the last feature.
+  enter(ctx, "prepare");
   const page = await mainPage(ctx);
-  return { ok: true, url: page.getURL(), title: page.getTitle(), summary: summarize(fixture) };
+  return { ok: true, url: page.getURL(), title: page.getTitle(), summary: summarize(fixture), ...(ctx.release ? { release: ctx.release } : {}) };
 }
 
 /** Per-navigation and per-settle budgets a host may know better than the standalone defaults. */
@@ -493,6 +670,9 @@ export function fixtureBudgetMs(fixture: PageFixture, opts: FixtureBudgetOptions
   const settle = opts.settleMs ?? SETTLE_TIMEOUT_MS;
   const loads = (fixture.storage?.origins?.length ?? 0) + (fixture.url ? 1 : 0) + (fixture.tabs?.length ?? 0);
   let total = loads * nav + SCRIPT_TIMEOUT_MS;
+  if (fixture.fresh) total += nav + RESET_BUDGET_MS;
+  if (fixture.network?.length) total += SCRIPT_TIMEOUT_MS;
+  if (fixture.expect) total += Math.min(fixture.expect.timeoutMs ?? FIXTURE_WAIT_FOR_DEFAULT_MS, FIXTURE_MAX_WAIT_MS) + SCRIPT_TIMEOUT_MS;
   for (const step of fixture.steps ?? []) {
     if (step.action === "goto") total += nav;
     else if (step.action === "wait") total += step.ms;
@@ -513,14 +693,31 @@ export async function applyParsedFixture(
   opts: FixtureApplyOptions = {},
   hooks?: FixtureHooks,
 ): Promise<FixtureApplyResult> {
-  const ctx: Ctx = { target, signal: opts.signal, hooks, mainId: undefined, dialogs: [] };
+  const ctx: Ctx = {
+    target,
+    signal: opts.signal,
+    hooks,
+    mainId: undefined,
+    dialogs: [],
+    allowNetworkMocks: opts.allowNetworkMocks === true,
+    stage: "validate",
+    release: undefined,
+  };
   const withDialogs = <T extends FixtureApplyResult>(result: T): T => (ctx.dialogs.length > 0 ? { ...result, dialogs: ctx.dialogs } : result);
   try {
     const result = await run(ctx, fixture);
-    return withDialogs(result.ok ? result : { ok: false, error: redactUrls(result.error) });
+    // An apply that finishes after its signal aborted (the host stopped waiting) has no owner: its mocks go now.
+    if (opts.signal?.aborted && ctx.release) throw new FixtureError("aborted");
+    return withDialogs(result);
   } catch (err) {
+    // Mocks of a failed apply must not outlive it.
+    try {
+      await ctx.release?.();
+    } catch {
+      // Nothing more can be done for a route the target no longer lets us remove.
+    }
     const message = err instanceof FixtureError ? err.message : `applying the fixture failed: ${toMessage(err)}`;
-    return withDialogs({ ok: false, error: redactUrls(message) });
+    return withDialogs({ ok: false, stage: ctx.stage, error: redactUrls(message) });
   }
 }
 
@@ -539,6 +736,6 @@ export async function applyFixture(
   hooks?: FixtureHooks,
 ): Promise<FixtureApplyResult> {
   const parsed = parsePageFixture(fixture);
-  if (!parsed.ok) return { ok: false, error: parsed.error };
+  if (!parsed.ok) return { ok: false, stage: "validate", error: parsed.error };
   return applyParsedFixture(target, parsed.value, opts, hooks);
 }

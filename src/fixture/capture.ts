@@ -3,7 +3,7 @@
 // It captures storage, URL and tabs. The DOM and JS state of a page cannot be
 // serialized, so a modal or a half-filled form is not part of it.
 import type { BrowserPageHandle, BrowserTarget } from "../controller/controller.js";
-import { redactUrls, runScript, toMessage } from "./util.js";
+import { httpOrigin, redactUrls, runScript, toMessage } from "./util.js";
 import type { FixtureCaptureOptions, FixtureCaptureResult, FixtureOrigin, PageFixture } from "./types.js";
 
 const READ_STORAGE_JS = `(() => {
@@ -11,15 +11,6 @@ const READ_STORAGE_JS = `(() => {
   try { return JSON.stringify({ ok: true, localStorage: dump(localStorage), sessionStorage: dump(sessionStorage) }); }
   catch { return JSON.stringify({ ok: false }); }
 })()`;
-
-function httpOrigin(url: string): string | undefined {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.origin : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function stringRecord(value: unknown): Record<string, string> {
   const out: Record<string, string> = {};

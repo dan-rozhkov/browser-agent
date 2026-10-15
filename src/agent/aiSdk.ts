@@ -21,6 +21,7 @@ import { fixtureSetupBody, type BrowseAgentMessage, type BrowseAgentMessagePart,
 import {
   createBrowseAgentSession,
   parseJsonObject,
+  SetupError,
   type BrowseAgentExtraToolHooks,
   type BrowseAgentSession,
 } from "./session.js";
@@ -51,9 +52,19 @@ export interface RunBrowseAgentOptions {
    * browser applies it through `browser.applyFixture`, then the run takes a
    * snapshot. The model gets a summary with counts only: never a cookie or a
    * storage key or value. Counts as one step. A bridge without `applyFixture`
-   * gives status `error`. `url` and `fixture` together are an error.
+   * gives status `setup_failed`, and so does a failed apply (the stage is in
+   * `result.setupStage`; the model never runs). `url` and `fixture` together are
+   * an error. When the browser's apply returned a `fixtureToken`, the run calls
+   * `browser.releaseFixture(token)`
+   * at the end, in every outcome.
    */
   fixture?: PageFixture;
+  /**
+   * Host gate for `fixture.network`. Without it a fixture with network mocks
+   * fails with status `setup_failed` (stage "network"). The mocks are removed
+   * when the run ends, in every outcome. Default false.
+   */
+  allowNetworkMocks?: boolean;
   /** Aborts the run (status `aborted`). */
   signal?: AbortSignal;
   /** Provider options for every request (the reasoning switch goes here). */
@@ -87,6 +98,9 @@ export interface RunBrowseAgentOptions {
   /** Max output tokens per request. */
   maxOutputTokens?: number;
 }
+
+/** Longest the end of a run waits for the browser to remove its mocks. */
+const RELEASE_TIMEOUT_MS = 10_000;
 
 const DATA_URL = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/;
 
@@ -150,12 +164,19 @@ function buildTools(
 }
 
 /** Applies the fixture, then snapshots the page. Returns the model-safe text after the goal. */
-async function prepareFixture(browser: BrowserBridge, fixture: PageFixture, signal: AbortSignal): Promise<string> {
-  if (!browser.applyFixture) throw new Error("This browser does not support page fixtures (BrowserBridge.applyFixture is missing).");
-  const raw = await browser.applyFixture(fixture, { signal });
+async function prepareFixture(browser: BrowserBridge, fixture: PageFixture, signal: AbortSignal, allowNetworkMocks: boolean, onToken: (token: string) => void): Promise<string> {
+  if (!browser.applyFixture) throw new SetupError(undefined, "This browser does not support page fixtures (BrowserBridge.applyFixture is missing).");
+  // Refuse rather than leak mocks: nobody could remove them.
+  if ((fixture.network?.length ?? 0) > 0 && !browser.releaseFixture) {
+    throw new SetupError("network", "This browser cannot release network mocks (BrowserBridge.releaseFixture is missing).");
+  }
+  const raw = await browser.applyFixture(fixture, { signal, allowNetworkMocks });
   const applied: Record<string, unknown> = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-  // Only `summary` (counts) and `error` (no cookie or storage data) are read from the result.
-  if (applied.ok !== true) throw new Error(typeof applied.error === "string" ? applied.error : "The page fixture could not be applied.");
+  // Only `summary` (counts), `stage` and `error` (no cookie, storage or mock data) are read from the result.
+  if (applied.ok !== true) {
+    throw new SetupError(typeof applied.stage === "string" ? applied.stage : undefined, typeof applied.error === "string" ? applied.error : "The page fixture could not be applied.");
+  }
+  if (typeof applied.fixtureToken === "string") onToken(applied.fixtureToken);
   const summary = typeof applied.summary === "string" ? applied.summary : "page fixture applied";
   return fixtureSetupBody(summary, await executeBrowseTool(browser, "browse_snapshot", {}));
 }
@@ -191,38 +212,58 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   // One assistant message, like the UI message the tool loop builds in a chat.
   const parts: BrowseAgentMessagePart[] = [];
   const messages: BrowseAgentMessage[] = [{ role: "assistant", parts }];
+  // The token of THIS run's apply: the run releases only what it applied, never a newer run's mocks.
+  let fixtureToken: string | undefined;
 
-  return session.run(
-    goal,
-    {
-      async send(text) {
-        await generateText({
-          model: opts.model,
-          system,
-          prompt: text,
-          tools: buildTools(session, opts, defs, [...baseTools]),
-          // Called after a step that ended with tool results. False ends the loop.
-          stopWhen: () => !session.continueRequest(),
-          abortSignal: session.signal,
-          providerOptions: opts.providerOptions as never,
-          maxOutputTokens: opts.maxOutputTokens,
-          onStepFinish: (step) => {
-            for (const part of step.content) {
-              if (part.type === "text") parts.push({ type: "text", text: part.text });
-              else if (part.type === "tool-call") parts.push({ type: `tool-${part.toolName}` });
-            }
-          },
-        });
+  try {
+    return await session.run(
+      goal,
+      {
+        async send(text) {
+          await generateText({
+            model: opts.model,
+            system,
+            prompt: text,
+            tools: buildTools(session, opts, defs, [...baseTools]),
+            // Called after a step that ended with tool results. False ends the loop.
+            stopWhen: () => !session.continueRequest(),
+            abortSignal: session.signal,
+            providerOptions: opts.providerOptions as never,
+            maxOutputTokens: opts.maxOutputTokens,
+            onStepFinish: (step) => {
+              for (const part of step.content) {
+                if (part.type === "text") parts.push({ type: "text", text: part.text });
+                else if (part.type === "tool-call") parts.push({ type: `tool-${part.toolName}` });
+              }
+            },
+          });
+        },
+        stop() {
+          // The abort signal given to generateText stops the request.
+        },
+        messages: () => messages,
       },
-      stop() {
-        // The abort signal given to generateText stops the request.
+      {
+        url: opts.url,
+        toolCallId: opts.runId,
+        ...(opts.fixture ? { setup: ({ signal }: { signal: AbortSignal }) => prepareFixture(opts.browser, opts.fixture!, signal, opts.allowNetworkMocks === true, (token) => { fixtureToken = token; }) } : {}),
       },
-      messages: () => messages,
-    },
-    {
-      url: opts.url,
-      toolCallId: opts.runId,
-      ...(opts.fixture ? { setup: ({ signal }: { signal: AbortSignal }) => prepareFixture(opts.browser, opts.fixture!, signal) } : {}),
-    },
-  );
+    );
+  } finally {
+    // The mocks live until the task ends, whatever the outcome.
+    if (fixtureToken !== undefined) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        // Bounded: a bridge that hangs must not hold the result of a finished run.
+        await Promise.race([
+          Promise.resolve().then(() => opts.browser.releaseFixture?.(fixtureToken)),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, RELEASE_TIMEOUT_MS); }),
+        ]);
+      } catch {
+        // A failed release cannot change the result of the run.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  }
 }

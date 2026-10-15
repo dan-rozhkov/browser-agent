@@ -112,7 +112,7 @@ describe("BrowserController fixtures", () => {
       const c = new BrowserController(t);
       const run = c.applyFixture({ version: 1, steps: [{ action: "click", selector: "#a" }] });
       await vi.advanceTimersByTimeAsync(10_001);
-      expect(await run).toMatchObject({ ok: false, error: "step 1 (click #a) failed: the page script failed" });
+      expect(await run).toMatchObject({ ok: false, stage: "steps", error: "step 1 (click #a) failed: the page script failed" });
     } finally {
       vi.useRealTimers();
     }
@@ -126,7 +126,7 @@ describe("BrowserController fixtures", () => {
       t.setCookies = () => new Promise(() => {});
       const run = new BrowserController(t).applyFixture({ version: 1, storage: { cookies: [{ name: "a", value: "b", domain: "a.test" }] } });
       await vi.advanceTimersByTimeAsync(10_001);
-      expect(await run).toEqual({ ok: false, error: "Browser command timed out after 10000ms." });
+      expect(await run).toEqual({ ok: false, stage: "cookies", error: "Browser command timed out after 10000ms." });
     } finally {
       vi.useRealTimers();
     }

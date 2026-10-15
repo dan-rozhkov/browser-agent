@@ -4,6 +4,8 @@
 import {
   FIXTURE_MAX_WAIT_MS,
   type FixtureCookie,
+  type FixtureExpect,
+  type FixtureNetworkRule,
   type FixtureOrigin,
   type FixtureStep,
   type PageFixture,
@@ -160,6 +162,70 @@ function step(value: unknown, path: string): FixtureStep {
   }
 }
 
+function integer(value: unknown, path: string, min: number, max: number): number {
+  const n = finiteNumber(value, path);
+  if (!Number.isInteger(n) || n < min || n > max) fail(path, `must be an integer between ${min} and ${max}`);
+  return n;
+}
+
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/** Header names are HTTP tokens, values hold no CR or LF. An error names the header's index, never its name or value. */
+function headerMap(value: unknown, path: string): Record<string, string> {
+  const map = stringMap(value, path);
+  for (const [i, [name, entry]] of Object.entries(map).entries()) {
+    if (!HEADER_NAME.test(name)) fail(`${path}[${i}]`, "has an invalid header name");
+    if (/[\r\n]/.test(entry)) fail(`${path}[${i}]`, "has a header value with a line break");
+  }
+  return map;
+}
+
+function jsonBody(value: unknown, path: string): string | object {
+  if (typeof value === "string") return value;
+  if (typeof value !== "object" || value === null) fail(path, "must be a string or an object");
+  try {
+    JSON.stringify(value);
+  } catch {
+    return fail(path, "must be JSON-serializable");
+  }
+  return value;
+}
+
+function networkRule(value: unknown, path: string): FixtureNetworkRule {
+  const obj = record(value, path);
+  const out: FixtureNetworkRule = { url: string(obj.url, `${path}.url`) };
+  const method = optional(obj, "method", (v) => string(v, `${path}.method`));
+  if (method !== undefined) out.method = method;
+  const status = optional(obj, "status", (v) => integer(v, `${path}.status`, 200, 599));
+  if (status !== undefined) out.status = status;
+  const headers = optional(obj, "headers", (v) => headerMap(v, `${path}.headers`));
+  if (headers !== undefined) out.headers = headers;
+  const body = optional(obj, "body", (v) => jsonBody(v, `${path}.body`));
+  if (body !== undefined) out.body = body;
+  const delayMs = optional(obj, "delayMs", (v) => waitMs(v, `${path}.delayMs`));
+  if (delayMs !== undefined) out.delayMs = delayMs;
+  const abort = optional(obj, "abort", (v) => boolean(v, `${path}.abort`));
+  if (abort !== undefined) out.abort = abort;
+  const times = optional(obj, "times", (v) => integer(v, `${path}.times`, 1, Number.MAX_SAFE_INTEGER));
+  if (times !== undefined) out.times = times;
+  return out;
+}
+
+function expectation(value: unknown, path: string): FixtureExpect {
+  const obj = record(value, path);
+  const out: FixtureExpect = {};
+  const selector = optional(obj, "selector", (v) => string(v, `${path}.selector`));
+  if (selector !== undefined) out.selector = selector;
+  const text = optional(obj, "text", (v) => string(v, `${path}.text`));
+  if (text !== undefined) out.text = text;
+  const url = optional(obj, "url", (v) => string(v, `${path}.url`));
+  if (url !== undefined) out.url = url;
+  if (out.selector === undefined && out.text === undefined && out.url === undefined) fail(path, "needs selector, text or url");
+  const timeoutMs = optional(obj, "timeoutMs", (v) => waitMs(v, `${path}.timeoutMs`));
+  if (timeoutMs !== undefined) out.timeoutMs = timeoutMs;
+  return out;
+}
+
 function parseOrThrow(input: unknown): PageFixture {
   const obj = record(input, "fixture");
   if (obj.version !== 1) fail("fixture.version", "must be 1");
@@ -176,8 +242,12 @@ function parseOrThrow(input: unknown): PageFixture {
   }
   const steps = optional(obj, "steps", (v) => array(v, "fixture.steps").map((s, i) => step(s, `fixture.steps[${i}]`)));
   if (steps !== undefined) out.steps = steps;
-  const network = optional(obj, "network", (v) => array(v, "fixture.network"));
+  const network = optional(obj, "network", (v) => array(v, "fixture.network").map((r, i) => networkRule(r, `fixture.network[${i}]`)));
   if (network !== undefined) out.network = network;
+  const expect = optional(obj, "expect", (v) => expectation(v, "fixture.expect"));
+  if (expect !== undefined) out.expect = expect;
+  const fresh = optional(obj, "fresh", (v) => boolean(v, "fixture.fresh"));
+  if (fresh !== undefined) out.fresh = fresh;
   return out;
 }
 

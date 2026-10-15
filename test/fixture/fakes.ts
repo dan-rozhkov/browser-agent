@@ -1,5 +1,5 @@
 import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../../src/controller/controller.js";
-import type { FixtureCookie } from "../../src/fixture/types.js";
+import type { FixtureCookie, FixtureMockResponse, FixtureRequestInfo } from "../../src/fixture/types.js";
 
 export interface FakePage extends BrowserPageHandle {
   url: string;
@@ -49,10 +49,16 @@ export interface FakeTarget extends BrowserTarget {
   cookiesSet: FixtureCookie[][];
   /** The argument of every `newPage` call. */
   newPageArgs: (string | undefined)[];
+  /** The handler `routeRequests` got last (present once mocks are installed). */
+  handler?: (req: FixtureRequestInfo) => FixtureMockResponse | undefined;
+  /** How many times a `routeRequests` interception was removed. */
+  unrouted: number;
+  /** The argument of every `resetSession` call. */
+  resetArgs: (string[] | undefined)[];
 }
 
 /** A target with tabs, `setCookies` and `getCookies`. */
-export function fakeTarget(opts: { exec?: (code: string) => unknown; cookies?: FixtureCookie[]; withCookies?: boolean; withTabs?: boolean; newPageIgnoresUrl?: boolean } = {}): FakeTarget {
+export function fakeTarget(opts: { exec?: (code: string) => unknown; cookies?: FixtureCookie[]; withCookies?: boolean; withTabs?: boolean; newPageIgnoresUrl?: boolean; withNetwork?: boolean; withReset?: boolean } = {}): FakeTarget {
   const log: string[] = [];
   const pages = new Map<number, FakePage>([[1, fakePage(log, "main", opts.exec)]]);
   let seq = 1;
@@ -62,6 +68,8 @@ export function fakeTarget(opts: { exec?: (code: string) => unknown; cookies?: F
     currentId: 1,
     cookiesSet: [],
     newPageArgs: [],
+    unrouted: 0,
+    resetArgs: [],
     async ensurePage() {
       return pages.get(target.currentId)!;
     },
@@ -75,6 +83,22 @@ export function fakeTarget(opts: { exec?: (code: string) => unknown; cookies?: F
     target.getCookies = async (urls) => {
       log.push(`getCookies ${JSON.stringify(urls ?? null)}`);
       return opts.cookies ?? [];
+    };
+  }
+  if (opts.withNetwork) {
+    target.routeRequests = async (handler) => {
+      log.push("route");
+      target.handler = handler;
+      return async () => {
+        log.push("unroute");
+        target.unrouted += 1;
+      };
+    };
+  }
+  if (opts.withReset) {
+    target.resetSession = async (origins) => {
+      log.push("reset");
+      target.resetArgs.push(origins);
     };
   }
   if (opts.withTabs !== false) {

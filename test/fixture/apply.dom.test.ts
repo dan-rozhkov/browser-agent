@@ -47,12 +47,12 @@ describe("fixture step scripts in a DOM", () => {
 
   it("click on a missing element fails", async () => {
     const r = await apply(domTarget(), [{ action: "click", selector: "#nope" }]);
-    expect(r).toEqual({ ok: false, error: "step 1 (click #nope) failed: element not found" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (click #nope) failed: element not found" });
   });
 
   it("an invalid selector fails", async () => {
     const r = await apply(domTarget(), [{ action: "click", selector: "##" }]);
-    expect(r).toEqual({ ok: false, error: "step 1 (click ##) failed: invalid selector" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (click ##) failed: invalid selector" });
   });
 
   it("type uses the native setter and fires input and change", async () => {
@@ -75,7 +75,7 @@ describe("fixture step scripts in a DOM", () => {
   it("type refuses a non-text element", async () => {
     document.body.innerHTML = '<div id="d"></div>';
     const r = await apply(domTarget(), [{ action: "type", selector: "#d", text: "x" }]);
-    expect(r).toEqual({ ok: false, error: "step 1 (type #d) failed: element is not a text field" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (type #d) failed: element is not a text field" });
   });
 
   it("press without CDP dispatches keydown and keyup on the focused element", async () => {
@@ -97,7 +97,7 @@ describe("fixture step scripts in a DOM", () => {
 
   it("waitFor with an invalid selector fails at once", async () => {
     const r = await apply(domTarget(), [{ action: "waitFor", selector: "##", timeoutMs: 2000 }]);
-    expect(r).toEqual({ ok: false, error: "step 1 (waitFor ##) failed: invalid selector" });
+    expect(r).toEqual({ ok: false, stage: "steps", error: "step 1 (waitFor ##) failed: invalid selector" });
   });
 
   it("the storage script writes both stores", async () => {

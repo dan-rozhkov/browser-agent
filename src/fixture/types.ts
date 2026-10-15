@@ -46,9 +46,62 @@ export interface PageFixture {
   };
   /** Deterministic steps on the main tab, run after `url` loads. No LLM. */
   steps?: FixtureStep[];
-  /** Reserved. A non-empty list makes `applyFixture` fail ("not supported yet"). */
-  network?: unknown[];
+  /** Network mocks. Need the host flag `allowNetworkMocks` and a target with `routeRequests`. */
+  network?: FixtureNetworkRule[];
+  /** Check, after `steps`, that the page is the right one. A failure is stage "expect". */
+  expect?: FixtureExpect;
+  /** Reset the browser session (cookies, storage, extra tabs) before anything else. Default false. */
+  fresh?: boolean;
 }
+
+/** All given conditions must hold at once, on the main tab. At least one of `selector`, `text`, `url`. */
+export interface FixtureExpect {
+  /** An element matching it exists and is visible. */
+  selector?: string;
+  /** The visible text of the page contains it. */
+  text?: string;
+  /** URL pattern: the same matcher as `FixtureNetworkRule.url`. */
+  url?: string;
+  /** Polling time. Default 5000, max 30000. */
+  timeoutMs?: number;
+}
+
+export interface FixtureNetworkRule {
+  /** Full URL with `*` wildcards (`*` = any characters), for example "https://api.shop.test/cart*". */
+  url: string;
+  /** Default: any method. Case-insensitive. */
+  method?: string;
+  /** Default 200. */
+  status?: number;
+  headers?: Record<string, string>;
+  /** An object is sent as JSON (content-type application/json unless given). */
+  body?: string | object;
+  /** Max 30000. */
+  delayMs?: number;
+  /** Fail the request (network error) instead of answering. */
+  abort?: boolean;
+  /** Apply at most N times, then let requests through. */
+  times?: number;
+}
+
+/** What a target sends back for a mocked request. */
+export interface FixtureMockResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+  delayMs?: number;
+  /** Fail the request instead of answering. */
+  abort?: boolean;
+}
+
+/** A request a target gives to its `routeRequests` handler. */
+export interface FixtureRequestInfo {
+  url: string;
+  method: string;
+}
+
+/** Where `applyFixture` stopped. */
+export type FixtureStage = "validate" | "prepare" | "network" | "reset" | "cookies" | "storage" | "url" | "tabs" | "steps" | "expect";
 
 export type ParsePageFixtureResult = { ok: true; value: PageFixture } | { ok: false; error: string };
 
@@ -58,12 +111,25 @@ export type FixtureDialog = Record<string, unknown>;
 export type FixtureApplyResult =
   /** `summary` is safe for a model: counts only, no cookie or storage data.
    * `dialogs` lists the dialogs auto-handled while the fixture ran (controller path). */
-  | { ok: true; url: string; title: string; summary: string; dialogs?: FixtureDialog[] }
-  | { ok: false; error: string; dialogs?: FixtureDialog[] };
+  | {
+      ok: true;
+      url: string;
+      title: string;
+      summary: string;
+      dialogs?: FixtureDialog[];
+      /** Present when the apply installed network mocks: removes them. Idempotent. Call it when the task ends. */
+      release?: () => Promise<void>;
+      /** Set by `BrowserController.applyFixture` when mocks are installed: hand it to `releaseFixture(token)`. Opaque, no secrets. */
+      fixtureToken?: string;
+    }
+  /** `stage` is the part of the apply that failed. */
+  | { ok: false; stage: FixtureStage; error: string; dialogs?: FixtureDialog[] };
 
 export interface FixtureApplyOptions {
   /** Checked between steps; aborts waits and loads. */
   signal?: AbortSignal;
+  /** Host gate: without it a non-empty `network` fails with stage "network". Default false. */
+  allowNetworkMocks?: boolean;
 }
 
 export interface FixtureCaptureOptions {
@@ -97,6 +163,8 @@ export interface FixtureHooks {
   openTab?(url: string, signal?: AbortSignal): Promise<FixtureHookResult>;
   /** Sends a trusted key press. Resolve false to fall back to the standalone page-script version. */
   press?(page: BrowserPageHandle, key: ParsedKeySpec): Promise<boolean>;
+  /** Called when the apply enters a stage, so a host that cuts the run short can still name the stage. */
+  onStage?(stage: FixtureStage): void;
   /** Runs a click or press `action` and settles after it like `act` does (navigation watcher, load stop, network quiet). */
   settled?<T>(page: BrowserPageHandle, action: () => Promise<T>): Promise<T>;
 }

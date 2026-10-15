@@ -20,6 +20,16 @@ export function redactUrl(url: string): string {
   }
 }
 
+/** `URL.origin` of an http(s) URL; undefined for anything else (about:blank, data:, a non-URL). */
+export function httpOrigin(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Replaces every http(s) URL inside `text` with its origin + pathname. */
 export function redactUrls(text: string): string {
   return text.replace(/https?:\/\/[^\s"'<>`]+/gi, (match) => redactUrl(match));

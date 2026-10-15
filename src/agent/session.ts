@@ -18,6 +18,20 @@ import {
 } from "./result.js";
 import { BROWSE_AGENT_TOOL_NAMES } from "./toolNames.js";
 
+/**
+ * Thrown by a `setup` hook when the preparation of the browser failed. The run
+ * ends with status `setup_failed` and `result.setupStage = stage`, and the model
+ * never runs. Any other throw from `setup` gives `setup_failed` too, without a stage.
+ */
+export class SetupError extends Error {
+  readonly stage: string | undefined;
+  constructor(stage: string | undefined, message: string) {
+    super(message);
+    this.name = "SetupError";
+    this.stage = stage;
+  }
+}
+
 export interface BrowseAgentToolCall {
   toolName: string;
   input: unknown;
@@ -85,7 +99,8 @@ export interface BrowseAgentRunOptions {
    * Host hook that prepares the browser (for example a PageFixture) before the
    * first model request. It runs inside the deadline and the abort signal and
    * counts as one step. Its string is the text the model gets after the goal:
-   * it must be safe for a model (no secrets). A throw gives status `error`.
+   * it must be safe for a model (no secrets). A throw gives status `setup_failed`
+   * (a `SetupError` also sets `result.setupStage`) and no model request is made.
    * `url` and `setup` together are an error.
    */
   setup?(ctx: { signal: AbortSignal }): Promise<string>;
@@ -215,12 +230,13 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
   }
 
   async function runAll(goal: string, driver: BrowseAgentDriver, runOpts: BrowseAgentRunOptions): Promise<BrowseAgentResult> {
-    const result = (status: BrowseAgentStatus, error?: string): BrowseAgentResult => ({
+    const result = (status: BrowseAgentStatus, error?: string, setupStage?: string): BrowseAgentResult => ({
       status,
       answer: finalAnswer(driver.messages(), status),
       steps,
       ...fields,
       ...(error !== undefined ? { error } : {}),
+      ...(setupStage !== undefined ? { setupStage } : {}),
     });
 
     const stop = () => {
@@ -255,7 +271,10 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
         steps += 1;
         const outcome = await runSetup(runOpts.setup);
         if (stopped || timedOut) return result(timedOut ? "timeout" : "aborted");
-        if (!outcome.ok) return result("error", browseAgentErrorMessage(outcome.error));
+        if (!outcome.ok) {
+          const stage = outcome.error instanceof SetupError ? outcome.error.stage : undefined;
+          return result("setup_failed", browseAgentErrorMessage(outcome.error), stage?.slice(0, 40));
+        }
         text = `${goal}\n\n${outcome.text}`;
       } else if (runOpts.url) {
         steps += 1;
