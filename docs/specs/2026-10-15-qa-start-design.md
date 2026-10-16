@@ -76,8 +76,14 @@ Mocks must live until the end of the task, not until the end of `applyFixture`.
 - `runBrowseAgent({ fixture })` calls `browser.releaseFixture?.()` in `finally`
   (done, error, timeout, abort, setup failure). A bridge that applied mocks but has no
   `releaseFixture` is a setup error (refuse rather than leak mocks).
-- Desktop safety: the desktop target runs in the user's real profile. It does not implement
-  `routeRequests` now. Any future implementation must scope rules to the agent's tabs.
+- Desktop safety: the desktop target runs in the user's real profile. Rules must be scoped to the agent's tabs.
+  Implemented in pen-editor-desktop 673bcbc (2026-10-15): CDP `Fetch` per built-in-browser tab (pattern `*`,
+  Request stage), never `session.webRequest`. Editor tabs are never routed.
+  The scoping is only partly met. Mocks apply to EVERY built-in-browser tab, also tabs the user opened by hand.
+  Rules match only the fixture's URLs; other requests pass through.
+  CDP `Fetch` is per page target: out-of-process iframes and service workers are not intercepted.
+  Mocks are released when the editor tab that drove the run reloads, crashes or closes.
+  If the agent's current tab has no debugger, `routeRequests` fails instead of reporting mocks it cannot deliver.
 
 ## 3. Repeatability: `fresh`
 
@@ -91,8 +97,14 @@ interface PageFixture { fresh?: boolean }   // default false
   (localStorage, sessionStorage, IndexedDB, cache storage, service workers) for every origin the
   target has seen: track origins from each page's main-frame `framenavigated` events (subframes are not tracked; the list keeps the 500 newest, least recently seen evicted first) plus the given `origins`, then
   CDP `Storage.clearDataForOrigin({ origin, storageTypes: "all" })` per origin, at most 8 at a time. A failed clear fails the reset. `fresh` adds one navigation plus 15 s to the fixture budget.
-- The desktop target must NEVER implement `resetSession` on a profile shared with the user
-  (it would log the user out of everything). Documented in README and CLAUDE.md invariants.
+- The desktop target must NEVER clear the whole profile (it would log the user out of everything).
+  Documented in README and CLAUDE.md invariants.
+  Implemented in pen-editor-desktop 673bcbc (2026-10-15) with a narrower contract than `PlaywrightTarget`:
+  `resetSession(origins)` works on the `persist:penbrowser` partition only, never the editor session.
+  It closes every browser tab and opens one blank tab.
+  It clears cookies and site data ONLY for the given origins (validated first, http/https only).
+  Parent-domain cookies (`.example.com`) stay. Cookies ignore ports, so `localhost:3000` clears every localhost port.
+  Without origins, only the tabs are reset. Other logins survive.
 - Recommended for full isolation: one new Playwright `BrowserContext` per QA run
   (README example). `fresh` covers a reused context.
 
@@ -107,7 +119,7 @@ interface PageFixture { fresh?: boolean }   // default false
 
 - A test-case runner / reporter (pass/fail of the agent's goal). Hosts own it.
 - Capture of network traffic into rules.
-- Desktop implementations of `routeRequests`, `resetSession`, cookies.
+- Desktop implementations of `routeRequests`, `resetSession`, cookies. (Done later in pen-editor-desktop 673bcbc, 2026-10-15; see "Desktop safety" and `fresh`.)
 
 ## As built, round 2 (review fixes)
 

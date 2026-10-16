@@ -13,6 +13,7 @@ This is the core only. Out of scope:
 - Network mocks. The `network` field is reserved. Any non-empty `network`
   makes `applyFixture` fail with `PageFixture.network is not supported yet`.
   A later QA sub-project implements it behind a host flag `allowNetworkMocks`.
+  (Done in 479d3d3, 2026-10-15; see `2026-10-15-qa-start-design.md`.)
 - Capture of setup steps. `captureFixture` captures storage, URL and tabs only.
   The DOM and JS state of a page cannot be serialized: a modal or a half-filled
   form comes back only through `steps`.
@@ -59,8 +60,10 @@ setCookies?(cookies: FixtureCookie[]): Promise<void>;
 
 `PlaywrightTarget` implements them over `context.cookies()` / `context.addCookies()`.
 That also covers Steel (it connects through `PlaywrightTarget`). The desktop
-target implements them later over Electron `session.cookies`. A fixture with
-cookies on a target without `setCookies` fails with a clear error.
+target implements them over Electron `session.cookies` of the `persist:penbrowser`
+partition (implemented in pen-editor-desktop 673bcbc, 2026-10-15; this core shipped
+without them). Host-only cookies and `__Host-` cookies stay host-only: no `domain` is set.
+A fixture with cookies on a target without `setCookies` fails with a clear error.
 
 Storage needs no new target method: it goes through `executeJavaScript` on the page.
 
