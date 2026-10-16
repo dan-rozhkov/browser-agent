@@ -19,7 +19,7 @@ import {
   type FixtureStep,
   type PageFixture,
 } from "./types.js";
-import { httpOrigin, redactUrl, redactUrls, runScript, SCRIPT_TIMEOUT_MS, toMessage } from "./util.js";
+import { fixtureStateParts, httpOrigin, plural, redactUrl, redactUrls, runScript, SCRIPT_TIMEOUT_MS, toMessage } from "./util.js";
 
 /** What one apply run shares between its helpers. */
 interface Ctx {
@@ -145,7 +145,7 @@ async function navigate(ctx: Ctx, url: string): Promise<BrowserPageHandle> {
   return mainPage(ctx);
 }
 
-/** After a click or key press: wait for a navigation it started (standalone version of `settled`). */
+/** After a click, select or key press: wait for a navigation it started (standalone version of `settled`). */
 async function settleStandalone(page: BrowserPageHandle, signal: AbortSignal | undefined): Promise<void> {
   const begin = Date.now();
   while (!page.isLoading() && Date.now() - begin < SETTLE_START_MS) await sleep(25, signal);
@@ -167,7 +167,7 @@ async function settleStandalone(page: BrowserPageHandle, signal: AbortSignal | u
   throwIfAborted(signal);
 }
 
-/** Runs a click or key `action` and lets the page settle: the host's way when it has one. */
+/** Runs a click, select or key `action` and lets the page settle: the host's way when it has one. */
 async function settled(ctx: Ctx, page: BrowserPageHandle, action: () => Promise<StepOutcome>): Promise<StepOutcome> {
   if (ctx.hooks?.settled) return ctx.hooks.settled(page, action);
   const outcome = await action();
@@ -221,6 +221,23 @@ function typeScript(selector: string, text: string): string {
   const proto = isArea ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
   setter.call(el, ${lit(text)});
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return JSON.stringify({ ok: true });
+})()`;
+}
+
+function selectScript(selector: string, value: string): string {
+  return `(() => {
+  const el = ${FIND(selector)};
+  if (el === undefined) return JSON.stringify({ ok: false, error: "invalid selector" });
+  if (!el) return JSON.stringify({ ok: false, error: "element not found" });
+  if (!(el instanceof HTMLSelectElement)) return JSON.stringify({ ok: false, error: "element is not a select" });
+  // The error never repeats the value: it may be data of the user.
+  if (!Array.from(el.options).some((o) => o.value === ${lit(value)})) return JSON.stringify({ ok: false, error: "no option has the given value" });
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center", inline: "center" });
+  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+  setter.call(el, ${lit(value)});
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
   return JSON.stringify({ ok: true });
@@ -360,6 +377,9 @@ async function runStep(ctx: Ctx, step: FixtureStep): Promise<StepOutcome> {
       return settled(ctx, page, () => pageStep(page, clickScript(step.selector)));
     case "type":
       return pageStep(page, typeScript(step.selector, step.text));
+    case "select":
+      // A select can fire a handler that navigates or loads (a country picker): settle like a click.
+      return settled(ctx, page, () => pageStep(page, selectScript(step.selector, step.value)));
     case "press":
       return press(ctx, page, step);
     case "waitFor":
@@ -442,20 +462,9 @@ function once(fn: () => Promise<void>): () => Promise<void> {
   return () => (done ??= fn());
 }
 
-function plural(n: number, noun: string): string {
-  return `${n} ${noun}${n === 1 ? "" : "s"}`;
-}
-
 /** Counts only: no cookie name, no storage key, no value. */
 function summarize(fixture: PageFixture): string {
-  const parts: string[] = [];
-  if (fixture.url) parts.push(`start page ${redactUrl(fixture.url)}`);
-  const cookies = fixture.storage?.cookies?.length ?? 0;
-  if (cookies) parts.push(plural(cookies, "cookie"));
-  const origins = fixture.storage?.origins?.length ?? 0;
-  if (origins) parts.push(`storage for ${plural(origins, "origin")}`);
-  const tabs = fixture.tabs?.length ?? 0;
-  if (tabs) parts.push(`${plural(tabs, "extra tab")}`);
+  const parts = fixtureStateParts(fixture);
   const steps = fixture.steps?.length ?? 0;
   if (steps) parts.push(plural(steps, "setup step"));
   const mocks = fixture.network?.length ?? 0;
@@ -677,7 +686,7 @@ export function fixtureBudgetMs(fixture: PageFixture, opts: FixtureBudgetOptions
     if (step.action === "goto") total += nav;
     else if (step.action === "wait") total += step.ms;
     else if (step.action === "waitFor") total += Math.min(step.timeoutMs ?? FIXTURE_WAIT_FOR_DEFAULT_MS, FIXTURE_MAX_WAIT_MS) + SCRIPT_TIMEOUT_MS;
-    else if (step.action === "click" || step.action === "press") total += SCRIPT_TIMEOUT_MS + settle;
+    else if (step.action === "click" || step.action === "press" || step.action === "select") total += SCRIPT_TIMEOUT_MS + settle;
     else total += SCRIPT_TIMEOUT_MS;
   }
   return Math.min(total, Math.max(MAX_BUDGET_MS, nav + 2 * SCRIPT_TIMEOUT_MS));

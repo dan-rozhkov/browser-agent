@@ -111,7 +111,7 @@ await close();
 | `@sideform/browser-agent/adapters/http-backend` | `createHttpBackend` |
 | `@sideform/browser-agent/adapters/local-backend` | `createLocalBackend` |
 | `@sideform/browser-agent/adapters/controller-bridge` | `controllerBridge` |
-| `@sideform/browser-agent/fixture` | `PageFixture` types, `parsePageFixture`, `applyFixture`, `captureFixture` (isomorphic, no zod) |
+| `@sideform/browser-agent/fixture` | `PageFixture` types, `parsePageFixture`, `applyFixture`, `captureFixture`, `CheckpointResult` (isomorphic, no zod) |
 | `@sideform/browser-agent/agent` | the browse agent mode: prompt, tool definitions, limits, session core (zod only, no `ai`) |
 | `@sideform/browser-agent/agent/session` | the light part of `/agent`: limits, result helpers, session core, `singleUseTool`. No zod, no schemas, no descriptions: use it in a browser bundle |
 | `@sideform/browser-agent/agent/ai-sdk` | `runBrowseAgent` (peer: `ai`) |
@@ -540,6 +540,84 @@ A target in a profile the user also logs into (Pen Editor's desktop built-in
 browser) must scope both: `routeRequests` to the agent's own tabs (CDP `Fetch` per
 tab, never a profile-wide hook), and `resetSession` to the `origins` it is given.
 A "clear everything" reset there would log the user out of every site.
+
+### Checkpoint: save the browser in the middle of a task
+
+A host can take a checkpoint of the browser at the end (or in the middle) of a task, and rebuild
+it later with `applyFixture`, also in a new browser. The DOM and the JS state of a page cannot be
+serialized, so a checkpoint is `base state + journal`: the URL, cookies and storage read at the
+last new document, plus the agent's state-changing actions since then (click, type, select, press),
+recorded as `FixtureStep`s with a CSS selector computed BEFORE each action. It is a normal
+`PageFixture`: no new apply code. The `select` step (`{ action: "select", selector, value }`) was added for it.
+
+```ts
+await runBrowseAgent("Fill the order form", {
+  model, browser: controllerBridge(controller), url,
+  checkpoint: {                                  // origins?: string[] limits the base cookies and storage
+    onCapture(result) {                          // called ONCE when the run ends; not after setup_failed or aborted, nor when no browser command ran; may be async
+      if (result.ok) save(result.fixture);       // for the HOST only: cookie values, storage values, typed text
+    },
+  },
+});
+// later, in a new browser: await controller2.applyFixture(saved);
+```
+
+Without the agent: `const token = controller.startJournal({ origins? })`, `controller.captureCheckpoint(token)`,
+`controller.stopJournal(token)`. The journal is off by default and costs nothing while off. The token is the owner
+of the journal: a second `startJournal` replaces the running journal and the old token goes stale (its `stopJournal`
+does nothing, its `captureCheckpoint` returns an error). Without a token both act on whatever journal runs.
+Only commands that may change the page (click, type, select, press, open, reload, back, forward, tabs new/switch/close)
+cost the journal anything; a snapshot, read or screenshot reads no marker.
+
+- **One journal per tab.** The journal follows the current tab. Switching away and back continues that tab's
+  journal. A tab the journal sees for the first time gets a fresh base at that moment. The checkpoint is the
+  current tab's journal; the other tabs are listed as `tabs` URLs.
+- **Reset = a new document.** The journal plants a marker in the page at base time (a random token on a
+  non-enumerable `window` property). After each command it checks the marker. A missing or different marker is
+  a new document: `open`, reload, a link, a form POST (also to the same URL), back/forward that restores another
+  document. The steps are cleared and the base is re-read. An action that caused the change is not recorded: the new
+  page is the base. A `pushState` or hash change is NOT a reset: the steps continue on the old base, and the replay
+  reproduces the SPA route because the recorded click that pushed the state replays. A page that cannot be asked for
+  its marker is a gap.
+- **Base storage is read at the reset, not at capture.** A step such as "Add to cart" that writes `localStorage`
+  must not be applied twice by the replay. The current page is read first (sessionStorage is per tab); other origins
+  in `origins` come from the other tabs. `origins: []` reads no cookie and no storage.
+- **`waitFor` before each action.** The journal records `{ action: "waitFor", selector }` before each click, type,
+  select and press-with-selector, so a replay waits for async content (an autocomplete list). These steps are not
+  counted toward `CHECKPOINT_MAX_STEPS`, and the summary counts actions.
+- **Gaps** (`complete: false`, `gap` says why, recording stops until the next reset; the steps before the gap
+  stay). The rule: when the journal cannot be sure a step was recorded correctly, it sets a gap. It never
+  silently drops a possibly-effective action. Gaps: an element in an iframe or a shadow tree; a back or forward inside the
+  same document (an SPA popstate; a back to a new document is a normal reset); steps on a base with no http(s) URL; no unique selector
+  (also when the lookup found nothing: the action may still succeed); an element a `type` step cannot replay
+  (range, file, contenteditable); a `type` that was retargeted to another element; a command that failed or timed
+  out after it staged something (or a timed-out action); a document that could not be checked; more than
+  `CHECKPOINT_MAX_STEPS` (100) actions; a successful `hover` (it opens menus and tooltips that no step replays);
+  a `select` whose option value another option shares (the replay would pick the first one); an `open` that
+  changes only the hash (the document stays, nothing replays it). A command rejected by argument validation
+  before any page effect leaves no trace; so does an action whose page script refused before it touched the
+  page (no element matched, a disabled control, no such option).
+- **A key-only `press`** records the focused element (`document.activeElement`) as its target, so the replay focuses it
+  before the key (the replayed `click` is `el.click()` and does not focus). Focus on the body records a bare press.
+- **A fixture applied with the journal on becomes the base** of the current tab: base URL = `fixture.url`, base
+  steps = the fixture's steps (they do not count toward the cap), base storage = the state the profile held BEFORE the apply
+  (for the journal's origins and the fixture's) with the fixture's storage on top (the fixture wins per cookie and per key).
+  With `fresh: true` the earlier state is ignored and the checkpoint says `fresh: true`.
+  `network` and `expect` are not copied: the host owns them. A fixture with steps and no URL is a gap (its steps
+  ran on a page the checkpoint does not know). A failed apply is a normal reset on the current page plus a gap.
+- **Not recorded.** `scroll`, `wait` and read-only commands (a `hover` is a gap, see above). Known limit: a scroll
+  is not replayed, so a page that loads content on scroll (infinite scroll, lazy lists) may lack the element
+  when the replay reaches the next step. Then `applyFixture` fails at that step (its `waitFor` times out), loudly, not
+  silently. Server-side state is out of reach: a replayed
+  "Add to cart" that calls the server adds a second item there. The host owns this (test server, network mocks, `fresh`).
+- **Secrets.** `fixture` holds secrets. `summary` and `gap` hold counts, step kinds and origin + pathname only.
+  The checkpoint reaches the host only through `onCapture`: `BrowseAgentResult` has no checkpoint field, so
+  `JSON.stringify(result)` cannot leak it. A bridge without `startJournal`, `stopJournal` and `captureCheckpoint`
+  gives `{ ok: false, error }` to `onCapture`, not a failed run. When the run ends the journal is stopped, but the result
+  waits for that at most 2 s.
+- A host that drives `createBrowseAgentSession` itself uses `createCheckpointRecorder(browser, { origins? })`
+  (`start()`, `capture()` returns the `CheckpointResult`, `stop()`; zod-free, from `agent/session`).
+- Pen Editor does not use this yet (its browser lives on between `browse_agent` calls).
 
 ## Isomorphism
 

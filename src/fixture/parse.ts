@@ -144,6 +144,8 @@ function step(value: unknown, path: string): FixtureStep {
         selector: string(obj.selector, `${path}.selector`),
         text: string(obj.text, `${path}.text`, { allowEmpty: true }),
       };
+    case "select":
+      return { action, selector: string(obj.selector, `${path}.selector`), value: string(obj.value, `${path}.value`, { allowEmpty: true }) };
     case "press": {
       const selector = optional(obj, "selector", (v) => string(v, `${path}.selector`));
       const key = string(obj.key, `${path}.key`, { allowEmpty: true });
@@ -158,7 +160,7 @@ function step(value: unknown, path: string): FixtureStep {
     case "wait":
       return { action, ms: waitMs(obj.ms, `${path}.ms`) };
     default:
-      return fail(`${path}.action`, "must be one of goto, click, type, press, waitFor, wait");
+      return fail(`${path}.action`, "must be one of goto, click, type, select, press, waitFor, wait");
   }
 }
 

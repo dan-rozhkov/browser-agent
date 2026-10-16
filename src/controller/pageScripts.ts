@@ -2520,11 +2520,11 @@ export const CLICK_JS = `(() => {
   if (!el && found && found.hidden) {
     // Item 3: a text match that only exists hidden must never be clicked —
     // see FIND_BY_TEXT_JS's doc comment.
-    return { error: "target is not visible (hidden element)" };
+    return { error: "target is not visible (hidden element)", noEffect: true };
   }
-  if (!el) return { error: "No element matched: " + target };
+  if (!el) return { error: "No element matched: " + target, noEffect: true };
   var penRefusalC = penDisabledError(el, "CLICK");
-  if (penRefusalC) return { error: penRefusalC };
+  if (penRefusalC) return { error: penRefusalC, noEffect: true };
 
   penStampSigTarget(el);
   var scopedBefore = scopedSignatureOf(el);
@@ -2689,11 +2689,11 @@ export const TYPE_JS = `(() => {
   if (!el) el = findBySelector(target);
   if (!el && found && found.hidden) {
     // Item 3: see CLICK_JS's comment — a hidden-only text match is refused.
-    return { error: "target is not visible (hidden element)" };
+    return { error: "target is not visible (hidden element)", noEffect: true };
   }
-  if (!el) return { error: "No element matched: " + target };
+  if (!el) return { error: "No element matched: " + target, noEffect: true };
   var penRefusalT = penDisabledError(el, "TYPE_TEXT");
-  if (penRefusalT) return { error: penRefusalT };
+  if (penRefusalT) return { error: penRefusalT, noEffect: true };
 
   penStampSigTarget(el);
   var scopedBefore = scopedSignatureOf(el);
@@ -2796,12 +2796,12 @@ export const CLICK_RESOLVE_JS = `(() => {
   ${FOCUS_FOLLOW_HELPER_JS}
 
   var located = locateTarget(args);
-  if (located.hidden) return { error: "target is not visible (hidden element)" };
+  if (located.hidden) return { error: "target is not visible (hidden element)", noEffect: true };
   var el = located.el;
-  if (!el) return { error: "No element matched: " + (args.target || "index " + args.index) };
+  if (!el) return { error: "No element matched: " + (args.target || "index " + args.index), noEffect: true };
 
   var penRefusal = penDisabledError(el, args.operation);
-  if (penRefusal) return { error: penRefusal };
+  if (penRefusal) return { error: penRefusal, noEffect: true };
 
   penStampSigTarget(el);
 
@@ -4294,11 +4294,11 @@ export const PERFORM_JS = `(() => {
   // it can't drift between the two call sites.
   var el = findBySnapshot(snapshotId, index, args.fingerprint);
   if (!el) {
-    return { error: "No element at index " + index + " for this snapshot (stale or removed)." };
+    return { error: "No element at index " + index + " for this snapshot (stale or removed).", noEffect: true };
   }
 
   var penRefusal2 = penDisabledError(el, operation);
-  if (penRefusal2) return { error: penRefusal2 };
+  if (penRefusal2) return { error: penRefusal2, noEffect: true };
 
   penStampSigTarget(el);
   var scopedBefore = scopedSignatureOf(el);
@@ -4364,7 +4364,7 @@ export const PERFORM_JS = `(() => {
   if (operation === "SELECT") {
     var tagName = (el.tagName || "").toLowerCase();
     if (tagName !== "select") {
-      return { error: "Element at index " + index + " is not a <select>." };
+      return { error: "Element at index " + index + " is not a <select>.", noEffect: true };
     }
     var matched = false;
     for (var i = 0; i < el.options.length; i++) {
@@ -4375,7 +4375,7 @@ export const PERFORM_JS = `(() => {
       }
     }
     if (!matched) {
-      return { error: "No option matching " + JSON.stringify(text) + " in element at index " + index + "." };
+      return { error: "No option matching " + JSON.stringify(text) + " in element at index " + index + ".", noEffect: true };
     }
     el.dispatchEvent(new Event("change", { bubbles: true }));
     return penResult();
@@ -7427,4 +7427,181 @@ export const CSS_QUERY_JS = `(() => {
   } catch (err3) {
     return { error: "CSS query failed: " + (err3 && err3.message ? err3.message : String(err3)) };
   }
+})()`;
+
+/**
+ * The document marker, as a function body shared by `DOC_MARKER_JS` and `SELECTOR_JS`
+ * (the latter returns it too, so the journal's check before an action costs no extra
+ * page round trip). Returns the marker string, or null when none can be planted.
+ */
+const DOC_MARKER_FN_JS = `
+  function penDocMarker() {
+    try {
+      var key = "__penJournalDoc";
+      var existing = Object.getOwnPropertyDescriptor(window, key);
+      if (existing && typeof existing.value === "string") return existing.value;
+      var marker = "";
+      if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+        var bytes = new Uint32Array(4);
+        window.crypto.getRandomValues(bytes);
+        for (var i = 0; i < bytes.length; i++) marker += bytes[i].toString(36);
+      } else {
+        marker = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      }
+      marker += "-" + Date.now().toString(36);
+      Object.defineProperty(window, key, { value: marker, enumerable: false, configurable: false, writable: false });
+      return marker;
+    } catch (err) {
+      return null;
+    }
+  }
+`;
+
+/**
+ * Checkpoint journal (docs/specs/2026-10-16-checkpoint-design.md): a unique CSS
+ * selector for the element an action is about to act on, computed BEFORE the
+ * action (a click can remove the element). The element is found by the same
+ * `locateTarget` every action script uses (snapshot stamp + fingerprint, or
+ * text/selector target), without scrolling, so there is one way to find it.
+ *
+ * Order of preference: a stable `#id`; `tag[data-testid|data-test|data-qa]`;
+ * `tag[name]`, `tag[aria-label]`; a `tag:nth-of-type(n)` path from the nearest
+ * ancestor with a stable id (or from `body`). A candidate is used only when
+ * `document.querySelectorAll(candidate)` returns exactly that element. The
+ * answer is `{ ok: true, selector, optionValue? }` or `{ ok: false, reason }`
+ * with reason `not-found`, `no-unique` or `unsupported`.
+ * `args.op` is `click`, `type`, `select`, `press` or `active` (the focused element,
+ * for a key-only press: `{ ok: true, none: true }` when nothing but the page body has focus,
+ * reason `iframe` when the focus is inside an iframe); for `select`,
+ * `args.optionText` is the visible option text and `optionValue` its value.
+ */
+export const SELECTOR_JS = `(() => {
+  var args = ${ARGS_MARKER};
+
+  ${LOCATE_TARGET_JS}
+  ${DOC_MARKER_FN_JS}
+
+  // CSS.escape, with a plain fallback for a document that lacks it.
+  function esc(s) {
+    s = String(s);
+    if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(s);
+    return s.replace(/[^a-zA-Z0-9_\\u00A0-\\uFFFF-]/g, function (c) { return "\\\\" + c; });
+  }
+  function quoted(s) { return '"' + esc(s) + '"'; }
+  function uniqueFor(el, sel) {
+    try {
+      var found = document.querySelectorAll(sel);
+      return found.length === 1 && found[0] === el;
+    } catch (err) {
+      return false;
+    }
+  }
+  // An id that looks generated (a long digit or hex run, a framework prefix, a leading colon) is not stable.
+  function stableId(id) {
+    if (!id) return false;
+    if (/[0-9]{4,}/.test(id) || /[0-9a-f]{8,}/i.test(id)) return false;
+    if (id.charAt(0) === ":" || /^(radix|headlessui|react-aria|mui|ember|ext-gen)[-_]?/i.test(id)) return false;
+    return true;
+  }
+  function idSelector(el) {
+    var id = el.getAttribute("id");
+    if (!stableId(id)) return null;
+    var sel = "#" + esc(id);
+    return uniqueFor(el, sel) ? sel : null;
+  }
+  function nthPath(el) {
+    var parts = [];
+    var node = el;
+    while (node && node.nodeType === 1) {
+      var anchor = node !== el ? idSelector(node) : null;
+      if (anchor) { parts.unshift(anchor); return parts.join(" > "); }
+      var tag = node.tagName.toLowerCase();
+      if (tag === "body" || tag === "html") { parts.unshift(tag); return parts.join(" > "); }
+      var n = 1;
+      for (var sib = node.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        if (sib.tagName === node.tagName) n++;
+      }
+      parts.unshift(tag + ":nth-of-type(" + n + ")");
+      node = node.parentElement;
+    }
+    return null;
+  }
+  function selectorFor(el) {
+    var byId = idSelector(el);
+    if (byId) return byId;
+    var tag = el.tagName.toLowerCase();
+    var attrs = ["data-testid", "data-test", "data-qa", "name", "aria-label"];
+    for (var i = 0; i < attrs.length; i++) {
+      var v = el.getAttribute(attrs[i]);
+      if (!v) continue;
+      var sel = tag + "[" + attrs[i] + "=" + quoted(v) + "]";
+      if (uniqueFor(el, sel)) return sel;
+    }
+    var path = nthPath(el);
+    return path && uniqueFor(el, path) ? path : null;
+  }
+
+  function lookup() {
+    var el;
+    if (args.op === "active") {
+      // A key-only press goes to the focused element: the replay must focus it first.
+      el = document.activeElement;
+      if (!el || el === document.body || el === document.documentElement) return { ok: true, none: true };
+      var activeTag = el.tagName.toLowerCase();
+      if (activeTag === "iframe" || activeTag === "frame") return { ok: false, reason: "iframe" };
+      // Focus inside a shadow tree: the host is the active element here, the real target is out of reach.
+      if (el.shadowRoot && el.shadowRoot.activeElement) return { ok: false, reason: "no-unique" };
+    } else {
+      var located = locateTarget({ target: args.target, index: args.index, snapshotId: args.snapshotId, fingerprint: args.fingerprint, skipReveal: true });
+      el = located.el;
+    }
+    if (!el) return { ok: false, reason: "not-found" };
+    // A shadow tree is out of reach of document.querySelectorAll.
+    if (el.getRootNode && el.getRootNode() !== document) return { ok: false, reason: "no-unique" };
+    var tagName = el.tagName.toLowerCase();
+    var inputType = (el.getAttribute("type") || "").toLowerCase();
+    if (args.op === "type") {
+      var textual = tagName === "textarea" || (tagName === "input" && inputType !== "range" && inputType !== "file");
+      if (!textual) return { ok: false, reason: "unsupported" };
+    }
+    var out = { ok: true };
+    if (args.op === "select") {
+      if (tagName !== "select") return { ok: false, reason: "unsupported" };
+      var value = null;
+      var sameValue = 0;
+      for (var oi = 0; oi < el.options.length; oi++) {
+        if (value === null && el.options[oi].text === args.optionText) value = el.options[oi].value;
+      }
+      if (value === null) return { ok: false, reason: "not-found" };
+      // The replay sets the value, and the page picks the FIRST option that has it: a shared value may be the wrong option.
+      for (var vi = 0; vi < el.options.length; vi++) {
+        if (el.options[vi].value === value) sameValue++;
+      }
+      if (sameValue > 1) return { ok: false, reason: "option-not-unique" };
+      out.optionValue = value;
+    }
+    var selector = selectorFor(el);
+    if (!selector) return { ok: false, reason: "no-unique" };
+    out.selector = selector;
+    return out;
+  }
+
+  // The document marker rides along: the journal's check before an action costs no extra page round trip.
+  var answer = lookup();
+  answer.marker = penDocMarker();
+  return answer;
+})()`;
+
+/**
+ * Checkpoint journal: the marker of the current DOCUMENT. The first run plants a
+ * random token on a non-enumerable, non-writable `window` property and returns
+ * it; a later run on the same document returns the same token. A new document
+ * (open, reload, a link, a form POST, back/forward restoring another document)
+ * has no token, so it gets a different one. A `pushState` or hash change keeps
+ * the document, so it keeps the token.
+ */
+export const DOC_MARKER_JS = `(() => {
+  ${DOC_MARKER_FN_JS}
+  var marker = penDocMarker();
+  return marker === null ? { ok: false } : { ok: true, marker: marker };
 })()`;

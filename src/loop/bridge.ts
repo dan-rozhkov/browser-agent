@@ -1,4 +1,5 @@
 import type {
+  CheckpointJournalOptions,
   FixtureApplyOptions,
   FixtureCaptureOptions,
   PageFixture,
@@ -84,5 +85,21 @@ export interface BrowserBridge {
    * `network` must have it: `runBrowseAgent` refuses such a bridge otherwise.
    */
   releaseFixture?(token?: string): Promise<unknown>;
+  /**
+   * Mid-task checkpoint (docs/specs/2026-10-16-checkpoint-design.md).
+   * `startJournal` makes the browser record the agent's state-changing actions
+   * (off by default, no cost while off) and returns the OWNER TOKEN of that
+   * journal; `stopJournal(token)` ends it and `captureCheckpoint(token)` resolves
+   * to a `CheckpointResult`: a `PageFixture` that `applyFixture` rebuilds (host
+   * use: it holds secrets). A token that is not the running journal's (it was
+   * replaced by another `startJournal`) stops nothing and takes no checkpoint.
+   * Without a token they act on whatever journal runs (bridges that predate
+   * tokens return nothing from `startJournal`). Optional - absent on bridges
+   * older than this feature; `runBrowseAgent({ checkpoint })` then gives
+   * `{ ok: false, error }` to `onCapture`.
+   */
+  startJournal?(opts?: CheckpointJournalOptions): string | void | Promise<string | void>;
+  stopJournal?(token?: string): unknown;
+  captureCheckpoint?(token?: string): Promise<unknown>;
 }
 

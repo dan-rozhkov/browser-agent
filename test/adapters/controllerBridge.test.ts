@@ -27,6 +27,21 @@ describe("controllerBridge", () => {
     expect(fake.tabs).toHaveBeenCalledWith({ action: "list" });
   });
 
+  it("forwards the checkpoint journal methods", async () => {
+    const fake = {
+      startJournal: vi.fn(() => "journal-7"),
+      stopJournal: vi.fn(),
+      captureCheckpoint: vi.fn(async () => ({ ok: true })),
+    };
+    const bridge = controllerBridge(fake as unknown as BrowserController);
+    expect(bridge.startJournal?.({ origins: ["https://a.test"] })).toBe("journal-7");
+    bridge.stopJournal?.("journal-7");
+    expect(await bridge.captureCheckpoint?.("journal-7")).toEqual({ ok: true });
+    expect(fake.startJournal).toHaveBeenCalledWith({ origins: ["https://a.test"] });
+    expect(fake.stopJournal).toHaveBeenCalledWith("journal-7");
+    expect(fake.captureCheckpoint).toHaveBeenCalledWith("journal-7");
+  });
+
   it("propagates the controller's rejection", async () => {
     const fake = { snapshot: vi.fn(async () => Promise.reject(new Error("gone"))) };
     const bridge = controllerBridge(fake as unknown as BrowserController);

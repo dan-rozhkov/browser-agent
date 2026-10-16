@@ -17,5 +17,8 @@ export function controllerBridge(c: BrowserController): BrowserBridge {
     applyFixture: (fixture, opts) => c.applyFixture(fixture, opts),
     captureFixture: (opts) => c.captureFixture(opts),
     releaseFixture: (token) => c.releaseFixture(token),
+    startJournal: (opts) => c.startJournal(opts),
+    stopJournal: (token) => c.stopJournal(token),
+    captureCheckpoint: (token) => c.captureCheckpoint(token),
   };
 }

@@ -4,6 +4,7 @@
 // itself (Pen Editor's frontend) uses the same logic as `runBrowseAgent`.
 import type { BrowserBridge } from "../loop/bridge.js";
 import type { PageFixture } from "../fixture/types.js";
+import { boundedCall } from "../fixture/util.js";
 import { fixtureSetupBody } from "./result.js";
 import { SetupError } from "./session.js";
 
@@ -40,16 +41,10 @@ export function createFixtureSetup(browser: BrowserBridge, fixture: PageFixture,
 
   /** Bounded: a bridge that hangs must not hold the result of a finished run. */
   async function releaseToken(t: string): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        Promise.resolve().then(() => browser.releaseFixture?.(t)),
-        new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
-      ]);
+      await boundedCall(() => browser.releaseFixture?.(t), timeoutMs);
     } catch {
       // A failed release cannot change the result of the run.
-    } finally {
-      clearTimeout(timer);
     }
   }
 

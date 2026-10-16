@@ -10,13 +10,15 @@
 // or the `reasoningEffort` of an OpenAI-compatible provider).
 import { generateText, tool, type LanguageModel, type ToolSet } from "ai";
 import type { ZodTypeAny } from "zod";
-import type { PageFixture } from "../fixture/types.js";
+import type { CheckpointResult, PageFixture } from "../fixture/types.js";
 import type { BrowserBridge } from "../loop/bridge.js";
 import { executeBrowseTool } from "./execute.js";
 import {
   buildBrowseAgentPrompt,
   type BuildBrowseAgentPromptOptions,
 } from "./prompt.js";
+import { boundedCall } from "../fixture/util.js";
+import { createCheckpointRecorder } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
 import { type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
 import {
@@ -38,6 +40,11 @@ export interface BrowseAgentExtraTool extends BrowseAgentExtraToolHooks {
   /** Runs the call. Returns the result string (JSON by convention). */
   execute(input: unknown, ctx: { toolCallId: string; signal: AbortSignal }): Promise<string>;
 }
+
+/** The host's `onCapture` may take this long before the result is returned without it. */
+const CHECKPOINT_CALLBACK_MS = 15_000;
+/** The result waits at most this long for the journal to stop (the stop goes on in the background, bounded by the recorder). */
+const CHECKPOINT_STOP_WAIT_MS = 2_000;
 
 export interface RunBrowseAgentOptions {
   /** The chat model. Use a non-reasoning model, or switch reasoning off in `providerOptions`. */
@@ -65,6 +72,21 @@ export interface RunBrowseAgentOptions {
    * when the run ends, in every outcome. Default false.
    */
   allowNetworkMocks?: boolean;
+  /**
+   * Take a checkpoint of the browser (docs/specs/2026-10-16-checkpoint-design.md):
+   * the browser records the agent's state-changing actions from before the
+   * setup or start URL. When the run ends (any status except `setup_failed` and `aborted`, and not when no browser command ran),
+   * `onCapture` is called ONCE with a `CheckpointResult`: a `PageFixture` that
+   * `applyFixture` rebuilds, or `{ ok: false, error }`. A browser without
+   * `startJournal`, `stopJournal` and `captureCheckpoint` gives
+   * `{ ok: false, error }`, not a failed run. `origins` limits the cookies and
+   * storage of the base state (default: the base page's origin). The checkpoint
+   * holds secrets, so it reaches the host ONLY through this callback: it is not a
+   * field of the result, and `JSON.stringify(result)` cannot leak it. A throw or a
+   * rejection in `onCapture` is ignored; an async callback is awaited for at most 15 s. The journal is
+   * stopped when the run ends, in every outcome; the result waits for the stop at most 2 s.
+   */
+  checkpoint?: { origins?: string[]; onCapture(result: CheckpointResult): void | Promise<void> };
   /** Aborts the run (status `aborted`). */
   signal?: AbortSignal;
   /** Provider options for every request (the reasoning switch goes here). */
@@ -199,8 +221,14 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       })
     : undefined;
 
+  const recorder = opts.checkpoint
+    ? createCheckpointRecorder(opts.browser, opts.checkpoint.origins ? { origins: opts.checkpoint.origins } : {})
+    : undefined;
+
   try {
-    return await session.run(
+    // Before the setup or the start URL: the journal must see the page the run starts on.
+    await recorder?.start();
+    const result = await session.run(
       goal,
       {
         async send(text) {
@@ -233,8 +261,19 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         ...(fixtureSetup ? { setup: fixtureSetup.setup } : {}),
       },
     );
+    // No checkpoint when: the setup failed (no task state to keep), the run was aborted (the host walked away; a
+    // capture would only hold the result), or no browser command ran (a call without a goal): nothing to keep.
+    if (recorder && opts.checkpoint && result.status !== "setup_failed" && result.status !== "aborted" && result.steps > 0) {
+      const captured = await recorder.capture();
+      // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
+      const onCapture = opts.checkpoint.onCapture;
+      await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
+    }
+    return result;
   } finally {
     // The mocks live until the task ends, whatever the outcome.
     await fixtureSetup?.release();
+    // The stop is bounded by the recorder, and the RESULT waits for it only a moment: a hung browser must not hold a finished run.
+    if (recorder) await boundedCall(() => recorder.stop(), CHECKPOINT_STOP_WAIT_MS).catch(() => undefined);
   }
 }

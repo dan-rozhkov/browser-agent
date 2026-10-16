@@ -30,6 +30,8 @@ export type FixtureStep =
   | { action: "click"; selector: string }
   /** Native value setter, then `input` and `change` events. */
   | { action: "type"; selector: string; text: string }
+  /** Sets a `<select>` by option value (native setter), then `input` and `change` events. */
+  | { action: "select"; selector: string; value: string }
   | { action: "press"; key: string; selector?: string }
   | { action: "waitFor"; selector: string; timeoutMs?: number }
   | { action: "wait"; ms: number };
@@ -167,4 +169,22 @@ export interface FixtureHooks {
   onStage?(stage: FixtureStage): void;
   /** Runs a click or press `action` and settles after it like `act` does (navigation watcher, load stop, network quiet). */
   settled?<T>(page: BrowserPageHandle, action: () => Promise<T>): Promise<T>;
+}
+
+/** Most steps a checkpoint journal keeps after the last new document. More is a gap. */
+export const CHECKPOINT_MAX_STEPS = 100;
+
+/**
+ * A mid-task checkpoint (docs/specs/2026-10-16-checkpoint-design.md): a normal
+ * `PageFixture` (base URL, base cookies and storage, the journal as `steps`).
+ * The fixture holds secrets (cookie and storage values, typed text): for the
+ * host only. `summary` and `gap` are safe for a model.
+ */
+export type CheckpointResult =
+  | { ok: true; fixture: PageFixture; complete: boolean; gap?: string; summary: string }
+  | { ok: false; error: string };
+
+export interface CheckpointJournalOptions {
+  /** Origins whose cookies and storage go into the base state. Default: the base page's origin only. */
+  origins?: string[];
 }

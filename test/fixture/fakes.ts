@@ -10,7 +10,7 @@ export interface FakePage extends BrowserPageHandle {
 export function fakePage(
   log: string[],
   name = "main",
-  exec: (code: string) => unknown = () => JSON.stringify({ ok: true, found: true }),
+  exec: (code: string, page: FakePage) => unknown = () => JSON.stringify({ ok: true, found: true }),
   withCdp = true,
 ): FakePage {
   const page: FakePage = {
@@ -22,7 +22,7 @@ export function fakePage(
     },
     async executeJavaScript(code) {
       log.push(`${name}: js`);
-      return exec(code);
+      return exec(code, page);
     },
     getURL: () => page.url,
     getTitle: () => `title of ${page.url}`,
@@ -58,7 +58,7 @@ export interface FakeTarget extends BrowserTarget {
 }
 
 /** A target with tabs, `setCookies` and `getCookies`. */
-export function fakeTarget(opts: { exec?: (code: string) => unknown; cookies?: FixtureCookie[]; withCookies?: boolean; withTabs?: boolean; newPageIgnoresUrl?: boolean; withNetwork?: boolean; withReset?: boolean } = {}): FakeTarget {
+export function fakeTarget(opts: { exec?: (code: string, page: FakePage) => unknown; cookies?: FixtureCookie[]; withCookies?: boolean; withTabs?: boolean; newPageIgnoresUrl?: boolean; withNetwork?: boolean; withReset?: boolean } = {}): FakeTarget {
   const log: string[] = [];
   const pages = new Map<number, FakePage>([[1, fakePage(log, "main", opts.exec)]]);
   let seq = 1;

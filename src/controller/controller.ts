@@ -14,20 +14,26 @@
 
 import { decideBrowserNavigation } from "./navigation.js";
 import { applyParsedFixture, fixtureBudgetMs } from "../fixture/apply.js";
-import { redactUrl } from "../fixture/util.js";
+import { boundedCall, httpOrigin, redactUrl, redactUrls, withTimeout } from "../fixture/util.js";
 import { parsePageFixture } from "../fixture/parse.js";
-import { captureFixture } from "../fixture/capture.js";
+import { captureFixture, readBaseState, type BaseState } from "../fixture/capture.js";
+import { CHECKPOINT_GAPS, mergeStorage } from "../fixture/checkpoint.js";
+import { JournalSession, type JournalBase, type JournalCommand, type StagedAction } from "./journal.js";
 import type {
+  CheckpointJournalOptions,
+  CheckpointResult,
   FixtureApplyOptions,
   FixtureApplyResult,
   FixtureCaptureOptions,
   FixtureCaptureResult,
   FixtureCookie,
+  FixtureOrigin,
   FixtureHookResult,
   FixtureHooks,
   FixtureMockResponse,
   FixtureRequestInfo,
   FixtureStage,
+  FixtureStep,
   PageFixture,
 } from "../fixture/types.js";
 import {
@@ -75,6 +81,8 @@ import {
   SLIDER_SCROLL_JS,
   BOT_CHECK_JS,
   IFRAME_RECTS_JS,
+  SELECTOR_JS,
+  DOC_MARKER_JS,
 } from "./pageScripts.js";
 
 const randomUUID = () => globalThis.crypto.randomUUID();
@@ -116,6 +124,8 @@ const SCRIPT_TEMPLATES = {
   SLIDER_SCROLL_JS,
   BOT_CHECK_JS,
   IFRAME_RECTS_JS,
+  SELECTOR_JS,
+  DOC_MARKER_JS,
 } as const;
 
 type ScriptName = keyof typeof SCRIPT_TEMPLATES;
@@ -825,6 +835,22 @@ function errorResult(message: string): BrowserCommandResult {
   return { error: message };
 }
 
+/**
+ * Set on an error result whose page script refused BEFORE it touched the page
+ * (no element matched, a disabled control, no such option). The checkpoint journal
+ * reads it to tell "nothing was dispatched" (no trace) from "it may have changed
+ * something" (a gap). A symbol key survives the object spreads the result goes
+ * through and is never serialized, so a host does not see it.
+ */
+const NO_EFFECT = Symbol("noEffect");
+
+/** A page script's answer: the script's `noEffect` marker on an error becomes the `NO_EFFECT` tag, and never reaches the host. */
+function scriptAnswer(result: Record<string, unknown>): BrowserCommandResult {
+  if (!("noEffect" in result)) return result;
+  const { noEffect, ...rest } = result;
+  return noEffect === true && "error" in rest ? Object.assign(rest, { [NO_EFFECT]: true }) : rest;
+}
+
 const FRAME_LABEL_MAX = 80;
 const FRAME_NAME_MAX = 60;
 
@@ -851,24 +877,55 @@ function frameLabel(frame: { url: string; name: string }, title?: string): strin
   return cap(frame.url || "") || "frame";
 }
 
-function toMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+/** Longest wait for the base cookies of the checkpoint journal. */
+const JOURNAL_READ_TIMEOUT_MS = 5_000;
+/** Longest wait for one document-marker check (a command that may change the page runs one before the action and one after). */
+const JOURNAL_MARKER_TIMEOUT_MS = 3_000;
+/**
+ * The journal's work after a command that may change the page (marker check,
+ * new base) is bounded to this share, beyond the command's own budget. When it
+ * runs out, the tab gets a gap (`unknownDocument`) and the late work is not allowed to write.
+ * A read-only command (snapshot, read, screenshot, findImages, tabs list...) runs none of it.
+ */
+const JOURNAL_SETTLE_BUDGET_MS = 10_000;
+/** Added to an `applyFixture` budget when the journal reads the pre-apply state (inside that command's deadline). */
+const JOURNAL_PRE_APPLY_BUDGET_MS = JOURNAL_READ_TIMEOUT_MS + JOURNAL_MARKER_TIMEOUT_MS;
+
+/** What a command declares so the journal can stage it (see `journalPreAction`). */
+interface JournalAction {
+  op: "click" | "type" | "select" | "press";
+  locate: { target?: string; index?: number; snapshotId?: string };
+  /** Non-null: the element is in a child frame. */
+  frameId: number | null;
+  text?: string;
+  optionText?: string;
+  key?: string;
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err: unknown) => {
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(toMessage(err)));
-      },
-    );
-  });
+/** What `SELECTOR_JS` found: the staged action and the document marker (null: it could not be read). */
+interface JournalLookup {
+  staged: StagedAction;
+  marker: string | null;
+}
+
+/**
+ * What a command that may change the page declares to `withCommandTimeout`:
+ * an action to stage, a navigation (`nav`: open, reload, tabs new/switch/close:
+ * the settle step checks the document), or a `history` move (back, forward: a
+ * move inside the same document is a gap, a new document a reset), or a `hover`
+ * (lasting page state no step replays: a gap when it succeeds).
+ */
+type JournalDeclare = JournalAction | { op: "nav" } | { op: "history" } | { op: "hover" };
+
+/** The state read before an `applyFixture` changes anything (see `journalAfterApply`). */
+interface PreApply {
+  /** The journal had to read it (journal on, no `fresh`, an origin to read). */
+  needed: boolean;
+  state?: BaseState;
+}
+
+function toMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function validateOpenArgs(args: unknown): { ok: true; url: string } | { ok: false; error: string } {
@@ -1246,7 +1303,8 @@ export class BrowserController {
       // it out from under it.
       const run = (): Promise<T> => {
         this.latchedCursorEnabled = null;
-        return fn();
+        // The journal is off by default: then the command starts exactly as before, in this tick.
+        return this.journal ? this.runJournaled(fn) : fn();
       };
       const p = pendingOverrun ? pendingOverrun.then(run) : run();
       p.then(
@@ -1515,7 +1573,7 @@ export class BrowserController {
       // the full load never completed, so `loaded` stays false.
       const loaded = graceOutcome !== "timeout" && graceOutcome.via === "load" && graceOutcome.error === null;
       return { url: page.getURL(), title: page.getTitle(), loaded, ...(await this.checkBotWall(page)) };
-    }, this.openTimeoutMs);
+    }, this.openTimeoutMs, this.journal ? { op: "nav" } : undefined);
   }
 
   /**
@@ -1537,6 +1595,8 @@ export class BrowserController {
       const parsed = parsePageFixture(fixture);
       if (!parsed.ok) return { ok: false as const, stage: "validate" as const, error: parsed.error };
       let stage: FixtureStage = "validate";
+      const journalSession = this.journal;
+      const journalCommand = journalSession?.current ?? null;
       // The deadline abandons the work, not stops it: this signal stops it.
       const stop = new AbortController();
       const signal = opts?.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal;
@@ -1595,9 +1655,24 @@ export class BrowserController {
           }
         },
       };
+      // The pre-apply state is read INSIDE the apply's deadline, before anything changes; a `fresh` fixture ignores it.
+      const preApply: PreApply = { needed: false };
+      const readsPreState = journalSession !== null && journalCommand !== null && parsed.value.fresh !== true;
       try {
         const result = await this.withCommandTimeout(
           async () => {
+            if (readsPreState && journalSession) {
+              const before = this.target.currentPage();
+              const list = before ? this.journalPreApplyOrigins(journalSession, before, parsed.value) : null;
+              if (before && list) {
+                preApply.needed = true;
+                try {
+                  preApply.state = await readBaseState(this.target, before, list, { cookieTimeoutMs: JOURNAL_READ_TIMEOUT_MS });
+                } catch {
+                  // Left unset: the base gets a gap.
+                }
+              }
+            }
             const work = applyParsedFixture(this.target, parsed.value, { signal, allowNetworkMocks: opts?.allowNetworkMocks }, hooks);
             this.fixtureInFlight = work.then(() => undefined, () => undefined);
             const applied = await work;
@@ -1613,8 +1688,13 @@ export class BrowserController {
           fixtureBudgetMs(parsed.value, {
             navigationMs: this.openTimeoutMs + OPEN_COMMAND_MARGIN_MS,
             settleMs: CLICK_LOAD_SETTLE_TIMEOUT_MS + NETWORK_QUIET_HARD_CAP_MS,
-          }),
+          }) + (readsPreState ? JOURNAL_PRE_APPLY_BUDGET_MS : 0),
         );
+        if (journalSession && journalCommand) {
+          await this.journalAfterApply(journalSession, journalCommand, parsed.value, result, preApply);
+          // The apply made the base itself: the nested `open`s it ran must not make the settle step re-check the page.
+          journalSession.skipSettle(journalCommand);
+        }
         return fixtureResult<FixtureApplyResult>(result, stage);
       } finally {
         stop.abort();
@@ -1647,13 +1727,7 @@ export class BrowserController {
     if (token === undefined) {
       const inFlight = this.fixtureInFlight;
       if (inFlight) {
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const bound = new Promise<void>((resolve) => { timer = setTimeout(resolve, FIXTURE_RELEASE_WAIT_MS); });
-        try {
-          await Promise.race([inFlight, bound]);
-        } finally {
-          clearTimeout(timer);
-        }
+        await boundedCall(() => inFlight, FIXTURE_RELEASE_WAIT_MS);
         if (this.fixtureInFlight === inFlight) this.fixtureInFlight = null;
       }
     }
@@ -1661,6 +1735,482 @@ export class BrowserController {
     if (!active || (token !== undefined && active.token !== token)) return;
     this.fixtureActive = null;
     await active.release();
+  }
+
+  /**
+   * Checkpoint journal (docs/specs/2026-10-16-checkpoint-design.md). Off by
+   * default; while it is off no command pays for it. While on, the controller
+   * keeps ONE journal per tab: a base state (URL, cookies, storage), read at the
+   * tab's last new document, and the successful state-changing actions since
+   * (click, type, select, press) as deterministic `FixtureStep`s with a CSS
+   * selector computed BEFORE the action. A new DOCUMENT resets that tab's
+   * journal; it is detected by a marker planted in the page at base time (open,
+   * reload, a link, a form POST and a back/forward that restores another
+   * document all give a different marker; a `pushState` or hash change keeps it).
+   * The journal follows the current tab; switching away and back continues that
+   * tab's journal. `origins` limits the cookies and storage of the base (default:
+   * the base page's origin only, so a shared profile's other logins are never
+   * read; `[]` reads nothing).
+   *
+   * Returns the OWNER TOKEN of this journal. Starting again while a journal runs
+   * REPLACES it: the old token is stale, and its owner's `captureCheckpoint(token)`
+   * gets an error while its `stopJournal(token)` does nothing, so one owner can
+   * never stop or read another owner's journal. `stopJournal()` and
+   * `captureCheckpoint()` without a token act on whatever journal runs (hosts
+   * that predate tokens).
+   */
+  startJournal(opts?: CheckpointJournalOptions): string {
+    const token = `journal-${++this.journalSeq}`;
+    this.journal = new JournalSession(opts, token);
+    return token;
+  }
+
+  /**
+   * Stops the journal and drops what it holds. With a `token`, only when it is
+   * the running journal's token (a stale token does nothing). Returns whether a journal was stopped.
+   */
+  stopJournal(token?: string): boolean {
+    if (!this.journal) return false;
+    if (token !== undefined && token !== this.journal.token) return false;
+    this.journal = null;
+    return true;
+  }
+
+  /**
+   * The checkpoint of the CURRENT tab as a `PageFixture`: the base URL, base
+   * cookies and storage (read at the last new document, NOT now: a replayed
+   * step would apply a storage change twice), the other tabs' URLs and the
+   * recorded steps. For the host only: it holds cookie values, storage values
+   * and typed text. `summary` and `gap` are safe for a model. Never rejects.
+   * With a `token`, a journal that belongs to another owner is refused.
+   */
+  async captureCheckpoint(token?: string): Promise<CheckpointResult> {
+    return this.runExclusive(async () => {
+      const session = this.journal;
+      if (!session) return { ok: false as const, error: "the journal is not running (call startJournal first)" };
+      if (token !== undefined && token !== session.token) {
+        return { ok: false as const, error: "the journal was restarted by another owner, so this checkpoint is not yours to take" };
+      }
+      const page = this.target.currentPage();
+      // No command that could change the page ran on this tab yet (read-only commands read no marker), or the page moved on
+      // by itself since the last one (a delayed redirect): check it now, bounded, so the base is the page as it is.
+      if (page) await this.journalBounded(session, [page], (canWrite) => this.journalSync(session, page, canWrite));
+      const tab = page ? session.forPage(page) : undefined;
+      if (!tab || !tab.base) return { ok: false as const, error: "the journal has no page to checkpoint (no browser tab is open)" };
+      try {
+        const tabs = (await this.listPagesSafe()).filter((t) => !t.current).map((t) => t.url);
+        return { ok: true as const, ...tab.build(tabs) };
+      } catch (err) {
+        return { ok: false as const, error: redactUrls(`capturing the checkpoint failed: ${toMessage(err)}`) };
+      }
+    });
+  }
+
+  private journal: JournalSession | null = null;
+  private journalSeq = 0;
+
+  /**
+   * Runs a command with the journal on. A command that may change the page
+   * declares it (`withCommandTimeout`'s third argument): only then does the
+   * journal sync before it (inside the command's budget) and settle after it
+   * (bounded by `JOURNAL_SETTLE_BUDGET_MS`). A read-only command does no marker read.
+   */
+  private async runJournaled<T>(fn: () => Promise<T>): Promise<T> {
+    const session = this.journal;
+    if (!session) return fn();
+    const command = session.begin();
+    let result: T | undefined;
+    let error: unknown;
+    let threw = false;
+    try {
+      result = await fn();
+    } catch (err) {
+      threw = true;
+      error = err;
+    }
+    if (command.mutating) await this.journalSettle(session, command, result, threw);
+    else session.end(command);
+    if (threw) throw error;
+    return result as T;
+  }
+
+  /**
+   * Runs the journal's own page work against a budget. On a timeout the late work
+   * may not write (`canWrite` turns false) and the given tabs get a gap: the journal
+   * cannot be sure what the page holds. Never throws. Returns whether the budget ran out.
+   */
+  private async journalBounded(
+    session: JournalSession,
+    pages: (BrowserPageHandle | null | undefined)[],
+    work: (canWrite: () => boolean) => Promise<void>,
+  ): Promise<boolean> {
+    let open = true;
+    const outcome = await boundedCall(
+      () => work(() => open && this.journal === session).then(() => undefined, () => undefined),
+      JOURNAL_SETTLE_BUDGET_MS,
+    );
+    if (outcome.done) return false;
+    open = false;
+    for (const page of pages) if (page) session.forPage(page)?.addGap(CHECKPOINT_GAPS.unknownDocument);
+    return true;
+  }
+
+  /**
+   * Ties a tab to its journal: a tab the journal has not seen gets a fresh base
+   * now; a tab whose document is not the base's resets; a tab whose document
+   * cannot be checked gets a gap. Never throws. `canWrite` false: a late call
+   * must not touch the journal.
+   */
+  private async journalSync(session: JournalSession, page: BrowserPageHandle | null, canWrite: () => boolean = () => true): Promise<void> {
+    try {
+      if (!page) return;
+      const tab = session.forPage(page);
+      if (!tab || !tab.base) {
+        await this.journalReset(session, page, canWrite);
+        return;
+      }
+      const state = await this.journalDocState(page, tab.base);
+      if (!canWrite()) return;
+      if (state === "new") await this.journalReset(session, page, canWrite);
+      else if (state === "unknown") tab.addGap(CHECKPOINT_GAPS.unknownDocument);
+    } catch {
+      // The journal must never fail the command it rides on.
+    }
+  }
+
+  /** The document marker of a page (planted when absent); null when the page cannot be asked. */
+  private async journalReadMarker(page: BrowserPageHandle): Promise<string | null> {
+    try {
+      const found = await withTimeout(this.executeScript(page, "DOC_MARKER_JS", {}), JOURNAL_MARKER_TIMEOUT_MS, "the marker read timed out");
+      return found.ok === true && typeof found.marker === "string" ? found.marker : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** `new`: the page holds another document than the base's (or the base had no marker and one is plantable now). */
+  private async journalDocState(page: BrowserPageHandle, base: JournalBase): Promise<"same" | "new" | "unknown"> {
+    const marker = await this.journalReadMarker(page);
+    if (marker === null) return "unknown";
+    if (base.marker === null) return "new";
+    return marker === base.marker ? "same" : "new";
+  }
+
+  /**
+   * A new document: plants the marker and reads the base (URL, cookies, storage)
+   * of this tab, by the same reader `captureFixture` uses. Never throws.
+   */
+  private async journalReset(session: JournalSession, page: BrowserPageHandle, canWrite: () => boolean = () => true): Promise<void> {
+    let url = "";
+    try {
+      url = page.getURL();
+    } catch {
+      // A page that went away reads as no URL.
+    }
+    const marker = await this.journalReadMarker(page);
+    let readFailed = marker === null;
+    let cookies: FixtureCookie[] = [];
+    let origins: FixtureOrigin[] = [];
+    const origin = httpOrigin(url);
+    if (origin) {
+      try {
+        const list = [...new Set((session.opts.origins ?? [origin]).map((o) => httpOrigin(o) ?? o))];
+        const state = await readBaseState(this.target, page, list, { cookieTimeoutMs: JOURNAL_READ_TIMEOUT_MS });
+        cookies = state.cookies;
+        origins = state.origins;
+        // The current page failing to answer is a gap; another tab doing so is just skipped.
+        if (state.cookieError !== undefined || state.currentReadFailed) readFailed = true;
+      } catch {
+        readFailed = true;
+      }
+    }
+    if (!canWrite()) return;
+    session.ensure(page).reset({ marker, url, cookies, origins }, readFailed);
+  }
+
+  /**
+   * After a command that may change the page, bounded by `JOURNAL_SETTLE_BUDGET_MS`.
+   * On the tab the action ran on: a new document resets its journal (the action that
+   * caused it is not recorded: the new page is the base); a document that cannot be
+   * checked is a gap; a back/forward inside the same document is a gap; otherwise a
+   * timed-out action, a failed command that staged something, or a retargeted `type`
+   * is a gap, and a successful staged action is recorded. A command rejected before
+   * it staged anything (argument validation) leaves no trace. Then the current tab
+   * is synced (it may be another tab now, or have no base yet).
+   */
+  private async journalSettle(session: JournalSession, command: JournalCommand, result: unknown, threw: boolean): Promise<void> {
+    const staged = command.staged;
+    // Ends the command first: a late stage from it (after a timeout) is ignored from here on.
+    session.end(command);
+    const acted = staged?.page ?? command.actedPage;
+    // A timed-out command keeps running: its overrun may still change the page, also a NEW document.
+    const timeoutGap = command.timedOut && (command.expectsAction || command.history || command.successGap !== undefined);
+    await this.journalBounded(session, [acted, this.target.currentPage()], async (canWrite) => {
+      try {
+        if (this.journal !== session) return;
+        const failedResult = threw || (isRecord(result) && "error" in result);
+        // A page script refused before it touched the page (no element, a disabled control, no such option): nothing changed.
+        const untouched = failedResult && isRecord(result) && (result as Record<symbol, unknown>)[NO_EFFECT] === true;
+        if (acted) {
+          const tab = session.forPage(acted);
+          if (tab && tab.base) {
+            const state = await this.journalDocState(acted, tab.base);
+            if (!canWrite()) return;
+            if (state === "new") {
+              await this.journalReset(session, acted, canWrite);
+              // The new base is read now, but the overrun of a timed-out action may still mutate the new page.
+              if (timeoutGap && canWrite()) session.forPage(acted)?.addGap(CHECKPOINT_GAPS.timeout);
+            } else if (state === "unknown") {
+              tab.addGap(CHECKPOINT_GAPS.unknownDocument);
+            } else if (timeoutGap) {
+              tab.addGap(CHECKPOINT_GAPS.timeout);
+            } else if (command.history) {
+              // The same document after a history move: a popstate inside the page. The page state changed, and no step can replay it.
+              // A move the command refused (no history to go to) changed nothing.
+              if (!failedResult) tab.addGap(CHECKPOINT_GAPS.history);
+            } else if (command.successGap !== undefined) {
+              if (!failedResult) tab.addGap(command.successGap);
+            } else if (untouched) {
+              // Nothing was dispatched: no step and no gap, whatever the lookup staged.
+            } else if (staged) {
+              const typed = "steps" in staged.action && staged.action.steps.some((s) => s.action === "type");
+              if (failedResult) tab.addGap(CHECKPOINT_GAPS.failed);
+              else if (typed && isRecord(result) && result.retargeted === true) tab.addGap(CHECKPOINT_GAPS.retargeted);
+              else tab.record(staged.action);
+            } else if (command.expectsAction) {
+              // A declared action succeeded and nothing was staged: never drop a possibly-effective action silently.
+              if (!failedResult) tab.addGap(CHECKPOINT_GAPS.noSelector);
+            } else if (command.navUrlBefore !== undefined && !failedResult && this.pageUrl(acted) !== command.navUrlBefore) {
+              // The URL changed and the document stayed (a hash-only open): no step replays it.
+              tab.addGap(CHECKPOINT_GAPS.sameDocumentNav);
+            }
+          } else if (command.preOverrun) {
+            // The sync before the action ran out and left no base: the base read now comes after the action.
+            await this.journalReset(session, acted, canWrite);
+            if (canWrite()) session.forPage(acted)?.addGap(CHECKPOINT_GAPS.unknownDocument);
+          }
+        }
+        const current = this.target.currentPage();
+        if (current && (current !== acted || !session.forPage(current)?.base)) await this.journalSync(session, current, canWrite);
+      } catch {
+        // The journal must never fail the command it rides on.
+      }
+    });
+  }
+
+  /** The URL of a page; undefined when it went away. */
+  private pageUrl(page: BrowserPageHandle): string | undefined {
+    try {
+      return page.getURL();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The origins to read BEFORE a fixture is applied: the journal's own origins
+   * (default: the current page's origin) plus the fixture's (its start page and
+   * storage origins). `null`: nothing to read (the host asked for no origin at all
+   * with `origins: []`, or there is no http origin).
+   */
+  private journalPreApplyOrigins(session: JournalSession, page: BrowserPageHandle, fixture: PageFixture): string[] | null {
+    const own = session.opts.origins;
+    if (own && own.length === 0) return null;
+    let current: string | undefined;
+    try {
+      current = httpOrigin(page.getURL());
+    } catch {
+      current = undefined;
+    }
+    const list = new Set<string>();
+    for (const o of own ?? (current ? [current] : [])) list.add(httpOrigin(o) ?? o);
+    const start = fixture.url ? httpOrigin(fixture.url) : undefined;
+    if (start) list.add(start);
+    for (const o of fixture.storage?.origins ?? []) list.add(httpOrigin(o.origin) ?? o.origin);
+    return list.size > 0 ? [...list] : null;
+  }
+
+  /**
+   * After `applyFixture` with the journal on: the fixture IS the base of the
+   * current tab. A successful apply gives base URL = `fixture.url`, base steps =
+   * the fixture's steps (not counted toward the cap), complete. The base storage is
+   * the state read BEFORE the apply (the profile's cookies and storage, for the
+   * journal's origins and the fixture's) with the fixture's storage on top (the
+   * fixture wins per cookie and per key): an apply without `fresh` leaves the rest
+   * of the profile in place. A `fresh` fixture ignores the earlier state, and the
+   * checkpoint says `fresh: true`. `network` and `expect` are not copied (the host
+   * owns them). A fixture with steps and no URL cannot be replayed from the page
+   * it ended on: normal reset plus a gap. A failed apply is a normal reset on the
+   * current page plus a gap (it may have run some steps).
+   */
+  private async journalAfterApply(session: JournalSession, command: JournalCommand, fixture: PageFixture, result: unknown, pre: PreApply): Promise<void> {
+    // An abandoned apply that ends late must not touch the journal.
+    if (this.journal !== session || session.current !== command) return;
+    const page = this.target.currentPage();
+    await this.journalBounded(session, [page], async (canWrite) => {
+      try {
+        if (!page) return;
+        const applied = isRecord(result) && result.ok === true && !("error" in result);
+        if (!applied) {
+          await this.journalReset(session, page, canWrite);
+          if (canWrite()) session.forPage(page)?.addGap(CHECKPOINT_GAPS.fixtureFailed);
+          return;
+        }
+        const marker = fixture.url ? await this.journalReadMarker(page) : null;
+        if (!fixture.url || marker === null) {
+          await this.journalReset(session, page, canWrite);
+          if (canWrite() && !fixture.url && (fixture.steps?.length ?? 0) > 0) session.forPage(page)?.addGap(CHECKPOINT_GAPS.fixtureNoUrl);
+          return;
+        }
+        const fresh = fixture.fresh === true;
+        let storage = { cookies: [...(fixture.storage?.cookies ?? [])], origins: [...(fixture.storage?.origins ?? [])] };
+        let readFailed = false;
+        if (!fresh) {
+          const before = pre.state;
+          // The pre-apply read was needed and did not come back clean: the base may lack what the profile held.
+          if (pre.needed && (!before || before.cookieError !== undefined || before.currentReadFailed)) readFailed = true;
+          storage = mergeStorage({ cookies: before?.cookies ?? [], origins: before?.origins ?? [] }, fixture.storage);
+        }
+        if (!canWrite()) return;
+        session.ensure(page).reset(
+          {
+            marker,
+            url: fixture.url,
+            cookies: storage.cookies,
+            origins: storage.origins,
+            ...(fixture.steps ? { steps: [...fixture.steps] } : {}),
+            ...(fresh ? { fresh: true } : {}),
+          },
+          readFailed,
+        );
+      } catch {
+        // The journal must never fail the command it rides on.
+      }
+    });
+  }
+
+  /**
+   * What a command that may change the page does BEFORE its own budget starts
+   * (`withCommandTimeout` calls it): it declares itself to the journal, and the
+   * journal syncs the tab (a new tab gets its base, a new document resets) and, for
+   * an action, stages it. All of it is bounded by `JOURNAL_SETTLE_BUDGET_MS`, a share
+   * of its own: a slow base read (cookies and storage of several tabs) must never make
+   * an action that works with the journal off time out. On overrun the tab gets a
+   * gap and the action runs with its full budget. Never throws.
+   */
+  private async journalPrepare(
+    session: JournalSession,
+    command: JournalCommand,
+    declare: JournalDeclare,
+    page: BrowserPageHandle | null,
+  ): Promise<void> {
+    if (declare.op === "nav") {
+      session.declare(command, "nav", page, page ? this.pageUrl(page) : undefined);
+      return;
+    }
+    const kind = declare.op === "history" ? "history" : declare.op === "hover" ? "hover" : "action";
+    session.declare(command, kind, page);
+    if (!page) return;
+    const action = declare.op === "history" || declare.op === "hover" ? null : declare;
+    const overrun = await this.journalBounded(session, [page], (canWrite) =>
+      action ? this.journalPreAction(session, command, page, action, canWrite) : this.journalSync(session, page, canWrite),
+    );
+    if (overrun) session.markPreOverrun(command);
+  }
+
+  /**
+   * The sync and the staging of an action in ONE page round trip. `SELECTOR_JS` computes
+   * the selector of the element the action is about to act on AND reads the document
+   * marker, so the check "is this still the document the base was read from" costs no
+   * second call. It computes the selector BEFORE the action (a click can remove the
+   * element), by the same resolution the action uses (snapshot stamp + fingerprint, or
+   * text target), and stages the steps (a `waitFor` for the element, then the action).
+   * A key-only press records the focused element (`activeElement`): the replayed
+   * `click` does not focus, so a bare `press` would go to the body. Anything it cannot
+   * record is staged as a GAP: nothing possibly effective is dropped. A stage from a
+   * command that is no longer the current one, or after the budget ran out, is ignored.
+   */
+  private async journalPreAction(
+    session: JournalSession,
+    command: JournalCommand,
+    page: BrowserPageHandle,
+    a: JournalAction,
+    canWrite: () => boolean,
+  ): Promise<void> {
+    if (session.current !== command) return;
+    const hadBase = session.forPage(page)?.base != null;
+    // A tab new to the journal gets its base now, before the action.
+    if (!hadBase) {
+      await this.journalReset(session, page, canWrite);
+      if (!canWrite()) return;
+    }
+    const { index, snapshotId } = a.locate;
+    // The command refuses a stale or foreign snapshot itself, before any page effect.
+    const stale = snapshotId !== undefined && index !== undefined && Boolean(this.checkSnapshotStale(snapshotId, page));
+    // No lookup when it cannot matter: the journal already has a gap (it records nothing more), the element is in a frame, or the command refuses.
+    let lookup: JournalLookup | undefined;
+    if (!stale && a.frameId === null && session.forPage(page)?.complete !== false) lookup = await this.journalLookup(page, a);
+    if (!canWrite()) return;
+    const tab = session.forPage(page);
+    if (!tab?.base) return;
+    if (lookup) {
+      if (lookup.marker === null) tab.addGap(CHECKPOINT_GAPS.unknownDocument);
+      // A base without a marker is re-based as soon as one can be planted.
+      else if (tab.base.marker === null || lookup.marker !== tab.base.marker) await this.journalReset(session, page, canWrite);
+    } else if (hadBase) {
+      await this.journalSync(session, page, canWrite);
+    }
+    if (!canWrite() || stale) return;
+    // A gap (also one the sync just made) records nothing more; a reset clears it.
+    if (session.forPage(page)?.complete === false) return;
+    if (a.frameId !== null) {
+      session.stage(command, page, { gap: CHECKPOINT_GAPS.iframe });
+      return;
+    }
+    // The journal had a gap that the sync cleared by a reset: the lookup is still due.
+    lookup ??= await this.journalLookup(page, a);
+    if (!canWrite()) return;
+    session.stage(command, page, lookup.staged);
+  }
+
+  /** One `SELECTOR_JS` call (bounded): the staged action for the element and the document marker (null: it could not be read). */
+  private async journalLookup(page: BrowserPageHandle, a: JournalAction): Promise<JournalLookup> {
+    const keyOnly = a.op === "press" && a.locate.target === undefined && a.locate.index === undefined;
+    let found: Record<string, unknown> | undefined;
+    try {
+      const outcome = await boundedCall(
+        () => this.executeScript(page, "SELECTOR_JS", { ...a.locate, op: keyOnly ? "active" : a.op, optionText: a.optionText }),
+        JOURNAL_MARKER_TIMEOUT_MS,
+      );
+      if (outcome.done) found = outcome.value;
+    } catch {
+      // Treated like a page that cannot be asked.
+    }
+    if (!found) return { staged: { gap: CHECKPOINT_GAPS.noSelector }, marker: null };
+    const marker = typeof found.marker === "string" ? found.marker : null;
+    let staged: StagedAction;
+    if (found.ok === true && found.none === true && keyOnly) {
+      // Nothing but the body has focus: the key goes to the page, and so does the replayed one.
+      staged = { steps: [{ action: "press", key: a.key ?? "" }] };
+    } else if (found.ok === true && typeof found.selector === "string") {
+      const selector = found.selector;
+      let step: FixtureStep;
+      if (a.op === "click") step = { action: "click", selector };
+      else if (a.op === "type") step = { action: "type", selector, text: a.text ?? "" };
+      else if (a.op === "select") step = { action: "select", selector, value: typeof found.optionValue === "string" ? found.optionValue : "" };
+      else step = { action: "press", key: a.key ?? "", selector };
+      // Async content (an autocomplete list) is not there yet when the replay runs back to back.
+      staged = { steps: [{ action: "waitFor", selector }, step] };
+    } else if (found.reason === "iframe") {
+      staged = { gap: CHECKPOINT_GAPS.iframe };
+    } else if (found.reason === "option-not-unique") {
+      staged = { gap: CHECKPOINT_GAPS.optionNotUnique };
+    } else {
+      // `not-found` too: the action may still find and act on an element this lookup missed. If it fails
+      // before it touched the page, the settle step drops this gap (nothing changed).
+      staged = { gap: found.reason === "unsupported" ? CHECKPOINT_GAPS.unsupported : CHECKPOINT_GAPS.noSelector };
+    }
+    return { staged, marker };
   }
 
   /** Reads the browser state as a `PageFixture` (host use: it holds secrets). Bounded like any command. */
@@ -1713,7 +2263,7 @@ export class BrowserController {
         navWatcher.dispose();
         await this.waitForLoadStop(page, CLICK_LOAD_SETTLE_TIMEOUT_MS);
         return { url: page.getURL(), title: page.getTitle() };
-      });
+      }, undefined, this.journal ? { op: "nav" } : undefined);
     }
 
     if (action === "wait") {
@@ -1752,9 +2302,19 @@ export class BrowserController {
         focusIndex = validated.index;
         focusSnapshotId = validated.snapshotId;
       }
+      const hasIndexTarget = focusIndex !== undefined && focusSnapshotId !== undefined;
       return this.withCommandTimeout(
         () => this.runPress(key, { target: focusTarget, index: focusIndex, snapshotId: focusSnapshotId }),
         this.timeoutMs + this.cursorBudgetMs,
+        // An unparsable key is refused before any page effect: nothing to stage.
+        this.journal && parseKeySpec(key)
+          ? {
+              op: "press",
+              locate: { target: focusTarget, ...(hasIndexTarget ? { index: focusIndex, snapshotId: focusSnapshotId } : {}) },
+              frameId: hasIndexTarget ? this.resolveFrameRoute(focusIndex!).frameId : null,
+              key,
+            }
+          : undefined,
       );
     }
 
@@ -1775,6 +2335,8 @@ export class BrowserController {
       return this.withCommandTimeout(
         () => this.runHover({ target: hoverTarget, index: hoverIndex, snapshotId: hoverSnapshotId }),
         this.timeoutMs + this.cursorBudgetMs,
+        // A hover opens menus and tooltips: state that only the live page holds and no recorded step replays.
+        this.journal ? { op: "hover" } : undefined,
       );
     }
 
@@ -1819,7 +2381,7 @@ export class BrowserController {
           title: page.getTitle(),
           ...this.diffSignatures(before, after, { previousUrl, currentUrl }),
         };
-      });
+      }, undefined, this.journal ? { op: "history" } : undefined);
     }
 
     if (action === "scroll") {
@@ -1893,9 +2455,14 @@ export class BrowserController {
       return this.withCommandTimeout(
         (deadlineAt) => this.runTypeWithEvidence({ target }, text, deadlineAt),
         this.timeoutMs + this.cursorBudgetMs,
+        this.journal ? { op: "type", locate: { target }, frameId: null, text } : undefined,
       );
     }
-    return this.withCommandTimeout((deadlineAt) => this.runClick(target, deadlineAt), this.timeoutMs + this.cursorBudgetMs);
+    return this.withCommandTimeout(
+      (deadlineAt) => this.runClick(target, deadlineAt),
+      this.timeoutMs + this.cursorBudgetMs,
+      this.journal ? { op: "click", locate: { target }, frameId: null } : undefined,
+    );
   }
 
   /** Wave 2 reliability, item 1: performs a click via trusted CDP mouse
@@ -3689,7 +4256,7 @@ export class BrowserController {
       const ok = await this.target.closePage!(tabId!);
       if (!ok) return errorResult(`No browser tab with id ${tabId} to close, or it is not a browser tab.`);
       return this.listTabsResult();
-    }, budgetMs);
+    }, budgetMs, this.journal && action !== "list" ? { op: "nav" } : undefined);
   }
 
   private async listTabsResult(): Promise<BrowserCommandResult> {
@@ -3793,6 +4360,10 @@ export class BrowserController {
     // when the element is frame-routed; the overlay itself is unchanged and
     // still always runs before the action, per the hard constraint.
     const { frameRoute, cursorPoint } = this.resolveFrameRouteWithCursorPoint(index);
+
+    const journalOp = operation === "CLICK" ? "click" : operation === "TYPE_TEXT" ? "type" : operation === "SELECT" ? "select" : undefined;
+    const journalAction: JournalDeclare | undefined =
+      this.journal && journalOp ? { op: journalOp, locate: { index, snapshotId }, frameId: frameRoute.frameId, text, optionText: text } : undefined;
 
     return this.withCommandTimeout(async (deadlineAt) => {
       if (operation === "CLICK") {
@@ -3913,7 +4484,7 @@ export class BrowserController {
       if (selfDisabled) await this.settleWhileTargetBusy(page);
       const after = await this.captureSignature(page, "after");
       return { ...result, ...this.diffSignatures(before, after, { scopedBefore }) };
-    }, this.timeoutMs + this.cursorBudgetMs);
+    }, this.timeoutMs + this.cursorBudgetMs, journalAction);
   }
 
   /** Wraps a page-script call with a before/after page-signature
@@ -4256,7 +4827,7 @@ export class BrowserController {
     const code = SCRIPT_TEMPLATES[script].replace(ARGS_MARKER, () => JSON.stringify(scriptArgs));
     const result = await page.executeJavaScriptInFrame(frameId, code, FRAME_SCRIPT_TIMEOUT_MS);
     if (!isRecord(result)) return errorResult("Unexpected response from the frame script.");
-    return result;
+    return scriptAnswer(result);
   }
 
   /** Wave 3 reliability, item 2: looks a `perform()` caller's global element
@@ -4335,7 +4906,7 @@ export class BrowserController {
     const result = await page.executeJavaScript(code);
     if (!isRecord(result)) return errorResult("Unexpected response from the page script.");
     if (result.relocated === true) this.relocatedThisCommand = true;
-    return result;
+    return scriptAnswer(result);
   }
 
   /** Per page: the capture id of the "before" SIGNATURE_JS state that an
@@ -4690,12 +5261,17 @@ export class BrowserController {
   private async withCommandTimeout(
     fn: (deadlineAt: number) => Promise<BrowserCommandResult>,
     budgetMs?: number,
+    journalAction?: JournalDeclare,
   ): Promise<BrowserCommandResult> {
     const ms = budgetMs ?? this.timeoutMs;
+    // Taken in this tick, before any await: an abandoned command's late work keeps ITS OWN command,
+    // which the journal ignores once it has ended (see JournalCommand).
+    const journalSession = this.journal;
+    const journalCommand = journalSession?.current ?? null;
     // Handed to `fn` (not stored on the controller): an abandoned command's
     // work keeps running after the next command starts, and must only ever
     // see ITS OWN deadline.
-    const deadlineAt = Date.now() + ms;
+    let deadlineAt = Date.now() + ms;
     // Review finding 6: both captured *before* fn() runs, not after — a
     // command can itself close the tab it acted on (`tabs({action:"close"})`,
     // or a click whose handler navigates the whole window away and it gets
@@ -4706,10 +5282,19 @@ export class BrowserController {
     const actedPage = this.target.currentPage();
     const pageHandles = await this.listPageHandlesSafe();
     let result: BrowserCommandResult;
+    // A command that declares it may change the page gets the journal's sync (and, for an action, its staging) BEFORE
+    // its own budget starts, in a budget of the journal's own: a slow base read must not time out an action that works
+    // with the journal off. With the journal off, or for a read-only command, it starts exactly as before.
+    if (journalAction && journalSession && journalCommand) {
+      await this.journalPrepare(journalSession, journalCommand, journalAction, actedPage);
+      deadlineAt = Date.now() + ms;
+    }
     const work = fn(deadlineAt);
+    const timeoutMessage = `Browser command timed out after ${ms}ms.`;
     try {
-      result = await withTimeout(work, ms, `Browser command timed out after ${ms}ms.`);
+      result = await withTimeout(work, ms, timeoutMessage);
     } catch (err) {
+      if (journalSession && journalCommand && toMessage(err) === timeoutMessage) journalSession.markTimedOut(journalCommand);
       result = errorResult(toMessage(err));
       // See `overrun`'s doc comment: keep the next queued command from
       // starting while this one's abandoned work is still running.
@@ -4717,10 +5302,7 @@ export class BrowserController {
         () => undefined,
         () => undefined,
       );
-      const next = Promise.race([
-        settled,
-        new Promise<void>((resolve) => setTimeout(resolve, OVERRUN_GRACE_MS)),
-      ]);
+      const next = boundedCall(() => settled, OVERRUN_GRACE_MS).then(() => undefined);
       // Merged, not replaced: a command nested in another one (a fixture's
       // navigation) must not drop the outer command's pending overrun.
       this.overrun = this.overrun ? Promise.all([this.overrun, next]).then(() => undefined) : next;
