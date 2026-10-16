@@ -18,7 +18,7 @@ import {
   type BuildBrowseAgentPromptOptions,
 } from "./prompt.js";
 import { boundedCall } from "../fixture/util.js";
-import { createCheckpointRecorder } from "./checkpoint.js";
+import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
 import { type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
 import {
@@ -43,8 +43,6 @@ export interface BrowseAgentExtraTool extends BrowseAgentExtraToolHooks {
 
 /** The host's `onCapture` may take this long before the result is returned without it. */
 const CHECKPOINT_CALLBACK_MS = 15_000;
-/** The result waits at most this long for the journal to stop (the stop goes on in the background, bounded by the recorder). */
-const CHECKPOINT_STOP_WAIT_MS = 2_000;
 
 export interface RunBrowseAgentOptions {
   /** The chat model. Use a non-reasoning model, or switch reasoning off in `providerOptions`. */
@@ -221,13 +219,17 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       })
     : undefined;
 
-  const recorder = opts.checkpoint
-    ? createCheckpointRecorder(opts.browser, opts.checkpoint.origins ? { origins: opts.checkpoint.origins } : {})
-    : undefined;
+  const checkpoint = createRunCheckpoint(opts.browser, {
+    enabled: !!opts.checkpoint,
+    signal: opts.signal,
+    ...(opts.checkpoint?.origins ? { origins: opts.checkpoint.origins } : {}),
+  });
+  const onCapture = opts.checkpoint?.onCapture;
+  let finalStatus: { status: string; steps: number } = { status: "error", steps: 0 };
 
   try {
     // Before the setup or the start URL: the journal must see the page the run starts on.
-    await recorder?.start();
+    await checkpoint.begin();
     const result = await session.run(
       goal,
       {
@@ -261,19 +263,17 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         ...(fixtureSetup ? { setup: fixtureSetup.setup } : {}),
       },
     );
-    // No checkpoint when: the setup failed (no task state to keep), the run was aborted (the host walked away; a
-    // capture would only hold the result), or no browser command ran (a call without a goal): nothing to keep.
-    if (recorder && opts.checkpoint && result.status !== "setup_failed" && result.status !== "aborted" && result.steps > 0) {
-      const captured = await recorder.capture();
-      // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
-      const onCapture = opts.checkpoint.onCapture;
-      await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
-    }
+    finalStatus = result;
     return result;
   } finally {
-    // The mocks live until the task ends, whatever the outcome.
-    await fixtureSetup?.release();
-    // The stop is bounded by the recorder, and the RESULT waits for it only a moment: a hung browser must not hold a finished run.
-    if (recorder) await boundedCall(() => recorder.stop(), CHECKPOINT_STOP_WAIT_MS).catch(() => undefined);
+    // Capture conditions live in the helper. The order is capture, host callback, fixture release (the mocks live
+    // until the task ends, whatever the outcome), stop. The stop wait is bounded, so a hung browser cannot hold a finished run.
+    await checkpoint.finish(finalStatus, {
+      async beforeStop(captured) {
+        // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
+        if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
+        await fixtureSetup?.release();
+      },
+    });
   }
 }

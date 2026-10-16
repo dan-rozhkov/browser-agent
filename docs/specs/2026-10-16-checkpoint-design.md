@@ -269,3 +269,15 @@ Real deviations and additions, with the reason:
 - **One owner of the command flags.** Only `JournalSession` writes `mutating`, `expectsAction`, `actedPage`, `history`,
   `successGap`, `navUrlBefore`, `timedOut` and `preOverrun` (`declare`, `skipSettle`, `markTimedOut`, `markPreOverrun`).
   `stage` no longer sets `mutating`. A command must declare first.
+- **Run helper.** `createRunCheckpoint` (`src/agent/checkpoint.ts`, exported from `agent/session`) holds the run-end lifecycle
+  that `runBrowseAgent` and session hosts shared by copy. `begin()` is true only when the recorder's start really succeeded (`recorder.started()`). The recorder
+  bounds the start once, by `min(timeoutMs, CHECKPOINT_START_WAIT_MS)` (`startTimeoutMs`); `begin()` only races the abort signal. An already
+  aborted signal, a `finish()` that came first or `enabled: false` never calls the browser (disabled builds no recorder and no timer); a late start is stopped by its token. `finish()` returns
+  `undefined` only for a deliberate skip (disabled, `setup_failed`, `aborted`, steps not above 0; the statuses are typed on
+  `BrowseAgentStatus`); a journal that did not start gives `{ ok: false, error }` with the recorder's own error, or
+  `"the checkpoint journal did not start"` after a begin abort, so `onCapture` always hears it. It does
+  not check the signal after the capture (as `runBrowseAgent` never did): a host checks its own. It runs `beforeStop(captured)`,
+  then stops in a `finally` and waits for the stop at most `CHECKPOINT_STOP_WAIT_MS` (2 s). `settled` is one deferred, resolved once
+  when the recorder's tracked journal calls (start, late-start stop, stop; `recorder.idle()`) have really settled, or at the latest
+  `CHECKPOINT_SETTLE_CAP_MS` (2 x the default call bound) when the browser does not answer (best effort). `runBrowseAgent` always creates the helper (`enabled = !!checkpoint`) and has one cleanup
+  path; its order stays: capture, `onCapture`, fixture release, stop.

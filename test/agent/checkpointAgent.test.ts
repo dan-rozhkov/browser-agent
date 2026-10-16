@@ -150,7 +150,22 @@ describe("runBrowseAgent({ checkpoint: { onCapture } })", () => {
     const { result, captured } = await runWith(bridge(log), model, { signal: controller.signal });
     expect(result.status).toBe("aborted");
     expect(captured).toEqual([]);
-    expect(log).toEqual(["startJournal", "stopJournal"]);
+    // A signal aborted before the run starts nothing: the browser is not called.
+    expect(log).toEqual([]);
+  });
+
+  it("an abort DURING the run takes no capture, but the journal is stopped", async () => {
+    const log: string[] = [];
+    const { model } = recordingModel();
+    const controller = new AbortController();
+    const { result, captured } = await runWith(
+      bridge(log, { open: async (a) => { log.push("open"); controller.abort(); return { url: a.url }; } }),
+      model,
+      { signal: controller.signal, url: "https://shop.test/cart" },
+    );
+    expect(result.status).toBe("aborted");
+    expect(captured).toEqual([]);
+    expect(log).toEqual(["startJournal", "open", "stopJournal"]);
   });
 
   it("is NOT taken when no browser command ran (a call without a goal): the journal is still stopped", async () => {
@@ -170,9 +185,8 @@ describe("runBrowseAgent({ checkpoint: { onCapture } })", () => {
       const log: string[] = [];
       const hang = () => new Promise<never>(() => {});
       const controller = new AbortController();
-      controller.abort();
       let done = false;
-      const run = runWith(bridge(log, { stopJournal: hang }), model, { signal: controller.signal }).then((r) => { done = true; return r; });
+      const run = runWith(bridge(log, { stopJournal: hang, open: async (a) => { controller.abort(); return { url: a.url }; } }), model, { signal: controller.signal, url: "https://shop.test/cart" }).then((r) => { done = true; return r; });
       await vi.advanceTimersByTimeAsync(1_000);
       expect(done).toBe(false);
       await vi.advanceTimersByTimeAsync(1_500);
@@ -241,6 +255,53 @@ describe("runBrowseAgent({ checkpoint: { onCapture } })", () => {
     const { result, captured } = await runWith(bridge([], { captureCheckpoint: async () => { throw new Error("browser gone"); } }), model, { url: "https://shop.test/cart" });
     expect(result.status).toBe("done");
     expect(captured[0]).toEqual({ ok: false, error: "Taking the checkpoint failed: browser gone" });
+  });
+
+  it("a start slower than the wait still reaches onCapture as { ok: false }", async () => {
+    vi.useFakeTimers();
+    try {
+      const { model } = recordingModel();
+      const captured: CheckpointResult[] = [];
+      const p = runBrowseAgent("buy it", {
+        model,
+        browser: bridge([], { startJournal: () => new Promise<string>(() => undefined) }),
+        url: "https://shop.test/cart",
+        checkpoint: { onCapture: (r) => { captured.push(r); } },
+      });
+      await vi.advanceTimersByTimeAsync(6_000);
+      await p;
+      expect(captured).toEqual([{ ok: false, error: "Starting the checkpoint journal timed out." }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe("fixture release", () => {
+    const fixture: PageFixture = { version: 1, url: "https://shop.test/cart" };
+    const withRelease = (log: string[]) => bridge(log, {
+      applyFixture: async () => ({ ok: true, summary: "s", fixtureToken: "ft" }),
+      releaseFixture: async () => { log.push("release"); },
+    });
+
+    it("without checkpoint the fixture is released exactly once", async () => {
+      const log: string[] = [];
+      const { model } = recordingModel();
+      await runBrowseAgent("buy it", { model, browser: withRelease(log), fixture });
+      expect(log.filter((l) => l === "release")).toHaveLength(1);
+      expect(log).not.toContain("startJournal");
+    });
+
+    it("with checkpoint the order is capture, onCapture, release, stop", async () => {
+      const log: string[] = [];
+      const { model } = recordingModel();
+      await runBrowseAgent("buy it", {
+        model,
+        browser: withRelease(log),
+        fixture,
+        checkpoint: { onCapture: () => { log.push("onCapture"); } },
+      });
+      expect(log.filter((l) => l !== "apply" && l !== "open")).toEqual(["startJournal", "captureCheckpoint", "onCapture", "release", "stopJournal"]);
+    });
   });
 
   it("without the option nothing about the journal runs and the result has no checkpoint field", async () => {

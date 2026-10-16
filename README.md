@@ -617,6 +617,21 @@ cost the journal anything; a snapshot, read or screenshot reads no marker.
   waits for that at most 2 s.
 - A host that drives `createBrowseAgentSession` itself uses `createCheckpointRecorder(browser, { origins? })`
   (`start()`, `capture()` returns the `CheckpointResult`, `stop()`; zod-free, from `agent/session`).
+- `createRunCheckpoint(browser, { enabled?, origins?, signal?, startWaitMs?, stopWaitMs? })` is the whole run-end lifecycle in
+  one helper (also from `agent/session`; `runBrowseAgent` always uses it): `await cp.begin()` before the run touches the
+  browser. It is true only when the journal runs; it is false after `startWaitMs` = 5 s (the start bound is the smaller of
+  `startWaitMs` and `timeoutMs`), an abort, a failed or timed-out start, an already aborted signal or a `finish()` that
+  came first (the browser is not called) or `enabled: false` (no recorder and no timer exist). At the end
+  `await cp.finish({ status, steps }, { beforeStop })` returns `undefined` ONLY for a deliberate skip (disabled, status
+  `setup_failed` or `aborted`, `steps` not above 0). Otherwise it returns the capture, or `{ ok: false, error }`; when the journal did not
+  start the error is the recorder's own (unsupported browser, failed or timed-out start), or the fixed text
+  "the checkpoint journal did not start" after a begin abort. `beforeStop(captured)` runs next (put the host
+  callback and the fixture release there: capture, callback, release, stop). The journal is always stopped, and the stop
+  wait is `stopWaitMs` = 2 s. A capture already taken is returned even if the signal aborted meanwhile: a host that must not
+  keep a checkpoint after an abort checks its signal after `finish()`. Never throws, idempotent.
+  `cp.settled` is one promise, readable at any time; it resolves once when the journal's calls (start, the stop of a late
+  start, stop) have settled, or at the latest `CHECKPOINT_SETTLE_CAP_MS` (30 s, option `settleCapMs`) after the stop was requested
+  when the browser does not answer (best effort). The recorder has `idle()` for the unbounded wait.
 - Pen Editor does not use this yet (its browser lives on between `browse_agent` calls).
 
 ## Isomorphism
