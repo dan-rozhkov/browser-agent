@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.16](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.15...v0.2.16) (2026-10-16)
+
+
+### Features
+
+* **fixture:** mid-task checkpoint journal ([f26532c](https://github.com/dan-rozhkov/browser-agent/commit/f26532c302a57de24e53da715f01c15026087197))
+
 ## [0.2.15](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.14...v0.2.15) (2026-10-15)
 
 
