@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.17](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.16...v0.2.17) (2026-10-16)
+
+
+### Features
+
+* **agent:** createRunCheckpoint, the run-end checkpoint lifecycle ([1a7c13b](https://github.com/dan-rozhkov/browser-agent/commit/1a7c13b7399e9cee1c6f7b9a638f1a6c345a86d1))
+
 ## [0.2.16](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.15...v0.2.16) (2026-10-16)
 
 
