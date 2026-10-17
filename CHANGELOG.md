@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.18](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.17...v0.2.18) (2026-10-17)
+
+
+### Features
+
+* **agent:** QA mode in runBrowseAgent, replaces runQaSuite ([d50018b](https://github.com/dan-rozhkov/browser-agent/commit/d50018b52b0a8be0d48ceb422bae2b6f32eccffe))
+
 ## [0.2.17](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.16...v0.2.17) (2026-10-16)
 
 
