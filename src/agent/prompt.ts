@@ -2,6 +2,7 @@
 // (src/ai/system-prompt.ts). The lines that name host features (the canvas,
 // browse_capture, "a design assistant") are parameters. With Pen Editor's
 // values the built strings are byte-identical to the old constants.
+import { QA_AGENT_CLOSING, QA_IRREVERSIBLE_LINE, QA_PRINCIPAL, QA_PROMPT_SECTION } from "./qaCore.js";
 
 /** The header and the four bullets every host keeps. */
 export const BROWSE_GUIDANCE_CORE = `Drive the built-in browser yourself with the browse tools: \`browse_open\`, \`browse_snapshot\`, \`browse_act\`, \`browse_read\`, \`browse_tabs\`, \`browse_find_images\`, and \`browse_screenshot\` when it is available.
@@ -36,6 +37,13 @@ export interface BuildBrowseAgentPromptOptions {
   guidanceBullets?: readonly string[];
   /** Extra paragraphs between the guidance and the closing paragraph. */
   sections?: readonly string[];
+  /**
+   * QA mode (docs/specs/2026-10-17-qa-suite-design.md). The principal defaults to
+   * `QA_PRINCIPAL` (a host `principal` wins), the irreversible-step rule is
+   * `QA_IRREVERSIBLE_LINE`, `QA_PROMPT_SECTION` follows the host sections, and the
+   * closing paragraph is `QA_AGENT_CLOSING` (it names `qa_verdict`).
+   */
+  qa?: boolean;
 }
 
 /** The closing paragraph: when to stop and how to write the answer. */
@@ -43,11 +51,16 @@ export const BROWSE_AGENT_CLOSING = `When the task is done, or when you are bloc
 
 /** The system prompt of the browse subagent. */
 export function buildBrowseAgentPrompt(opts: BuildBrowseAgentPromptOptions = {}): string {
-  const principal = opts.principal ?? "an assistant";
+  const qa = opts.qa === true;
+  const principal = opts.principal ?? (qa ? QA_PRINCIPAL : "an assistant");
+  const guidance = qa
+    ? [BROWSE_GUIDANCE_CORE, QA_IRREVERSIBLE_LINE, ...(opts.guidanceBullets ?? [])].join("\n")
+    : buildSubagentBrowserGuidance({ extraBullets: opts.guidanceBullets });
   return [
     `You are a browsing subagent working for ${principal}. The user message is your whole task. You do not see any earlier conversation. Work only in the browser with the browse tools. Do not ask questions: if the task is unclear, make the most reasonable choice and say so in your answer.`,
-    buildSubagentBrowserGuidance({ extraBullets: opts.guidanceBullets }),
+    guidance,
     ...(opts.sections ?? []),
-    BROWSE_AGENT_CLOSING,
+    ...(qa ? [QA_PROMPT_SECTION] : []),
+    qa ? QA_AGENT_CLOSING : BROWSE_AGENT_CLOSING,
   ].join("\n\n");
 }

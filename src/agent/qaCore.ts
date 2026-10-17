@@ -48,6 +48,13 @@ export function parseQaVerdict(input: unknown): { ok: true; value: QaVerdict } |
   return { ok: true, value: { verdict, reason } };
 }
 
+/** QA variant of the irreversible-step rule: the scenario asks for submits and test data, so the subagent rule ("stop") does not apply. */
+export const QA_IRREVERSIBLE_LINE =
+  "- Do the steps the scenario asks for, including submitting forms and creating or deleting test data on the app under test. Never pay with a real payment method, never send messages to real people outside the app, and never enter real personal data: use the test data the scenario gives or obvious fake data.";
+
+/** The closing paragraph of a QA prompt. It names `qa_verdict`, so it is the last thing the model reads. */
+export const QA_AGENT_CLOSING = `When you have checked the expected result, call \`${QA_VERDICT_TOOL}\` once, unless a blocked step (a CAPTCHA, a login or anti-bot wall, a missing page) stopped you. Then give a short final answer in plain text: what you checked, what you saw, and the final URL. Do not add facts you did not see. Do not open other pages after the verdict.`;
+
 /** The result field the verdict tool hooks fill (`qaResultOf` folds it into `qa`). */
 export const QA_VERDICT_FIELD = "qaVerdict";
 

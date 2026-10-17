@@ -11,6 +11,8 @@ import {
   type QaStep,
 } from "../../src/agent/qa.js";
 import { BROWSE_AGENT_ERROR_MAX_CHARS } from "../../src/agent/limits.js";
+import { buildBrowseAgentPrompt, BROWSE_AGENT_CLOSING, SUBAGENT_IRREVERSIBLE_LINE } from "../../src/agent/prompt.js";
+import { QA_AGENT_CLOSING, QA_IRREVERSIBLE_LINE } from "../../src/agent/qaCore.js";
 import { createBrowseAgentSession } from "../../src/agent/session.js";
 
 const call = (toolName: string, input: unknown, toolCallId = "c1", preOpen?: true) => ({ toolName, input, toolCallId, ...(preOpen ? { preOpen } : {}) });
@@ -148,5 +150,32 @@ describe("createStepRecorder", () => {
     rec.onToolCall(call("browse_read", {}))({ output: "{}" });
     expect(rec.steps()).toHaveLength(1);
     expect(rec.steps()[0]).toMatchObject({ index: 1, ms: 7 });
+  });
+});
+
+describe("buildBrowseAgentPrompt({ qa })", () => {
+  const text = buildBrowseAgentPrompt({ qa: true, sections: ["Host section."] });
+
+  it("uses the QA irreversible line, not the subagent one", () => {
+    expect(text).toContain(QA_IRREVERSIBLE_LINE);
+    expect(text).not.toContain(SUBAGENT_IRREVERSIBLE_LINE);
+  });
+
+  it("puts the QA section after the host sections and ends with the QA closing, which names qa_verdict", () => {
+    expect(text.indexOf("Host section.")).toBeLessThan(text.indexOf(QA_PROMPT_SECTION));
+    expect(text.endsWith(QA_AGENT_CLOSING)).toBe(true);
+    expect(QA_AGENT_CLOSING).toContain("qa_verdict");
+    expect(text).not.toContain(BROWSE_AGENT_CLOSING);
+  });
+
+  it("the principal defaults to the QA engineer; a host principal wins", () => {
+    expect(text).toContain("working for a QA engineer.");
+    expect(buildBrowseAgentPrompt({ qa: true, principal: "Acme CI" })).toContain("working for Acme CI.");
+  });
+
+  it("without qa the prompt is the subagent one", () => {
+    const plain = buildBrowseAgentPrompt();
+    expect(plain).toContain(SUBAGENT_IRREVERSIBLE_LINE);
+    expect(plain.endsWith(BROWSE_AGENT_CLOSING)).toBe(true);
   });
 });

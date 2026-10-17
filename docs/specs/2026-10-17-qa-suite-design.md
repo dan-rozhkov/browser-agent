@@ -30,10 +30,16 @@ When on:
   (reason trimmed, 1 to 500 chars). It is a `singleUseTool`: a second call is refused
   by the guard before it runs (not a step), and the first verdict stays. A call with bad
   input is an error and does not use up the verdict.
-- Prompt: with `prompt` unset or an options object, the principal is "a QA engineer"
-  (unless the host set one) and the QA section is added after the host's sections.
-  With `prompt` as a string the text is the host's and is not touched: the host must
-  include the exported `QA_PROMPT_SECTION`. Without `qa` the prompt is unchanged.
+- Prompt: with `prompt` unset or an options object, `runBrowseAgent` calls
+  `buildBrowseAgentPrompt({ ...prompt, qa: true })`. With `qa`: the principal defaults to
+  "a QA engineer" (a host principal wins); the irreversible-step rule is `QA_IRREVERSIBLE_LINE`
+  (do the steps the scenario asks for, including form submits and test data; never real
+  payment, real people or real personal data) instead of the subagent "stop" rule, which
+  would stop a signup scenario before the submit; `QA_PROMPT_SECTION` follows the host
+  sections; and the closing paragraph is `QA_AGENT_CLOSING`, which names `qa_verdict`, so the
+  last words the model reads are not "give your final answer" alone. With `prompt` as a string
+  the text is the host's and is not touched: the host includes `QA_PROMPT_SECTION` and ends
+  with `QA_AGENT_CLOSING`. Without `qa` the prompt is unchanged.
   The section: you test a web app; do the scenario; check the expected result on the
   page; call `qa_verdict` exactly once at the end, `fail` when the app does not behave
   as the scenario expects; a blocked step (CAPTCHA, login wall, missing page) is not a
@@ -103,7 +109,7 @@ so is a throw or rejection in the callback; an async callback is awaited for at 
 ## Parts for a host on the session core
 
 `src/agent/qaCore.ts` (zod-free; no `ai`, no `node:*`) is exported from BOTH
-`@sideform/browser-agent/agent/session` and `.../agent`: `QA_PROMPT_SECTION`, `QA_PRINCIPAL`,
+`@sideform/browser-agent/agent/session` and `.../agent`: `QA_PROMPT_SECTION`, `QA_IRREVERSIBLE_LINE`, `QA_AGENT_CLOSING`, `QA_PRINCIPAL`,
 `QA_VERDICT_TOOL`, `QA_VERDICT_FIELD`, the limits, `qaVerdictHooks()`, `executeQaVerdict(input)`
 (hand validation with the rules of the schema), `parseQaVerdict`, `qaOutcome(status, verdict)`,
 `qaResultOf(result, steps)`, `createStepRecorder()` and the types `QaVerdict`, `QaOutcome`,

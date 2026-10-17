@@ -456,7 +456,7 @@ try {
 
 With `qa` on, the model gets `qa_verdict({ verdict: "pass" | "fail", reason })` (once; a
 repeat is refused), the prompt gets a QA section (principal "a QA engineer" unless you
-set one; with `prompt` as a string, include the exported `QA_PROMPT_SECTION` yourself), and
+set one; with `prompt` as a string, include the exported `QA_PROMPT_SECTION` and end with `QA_AGENT_CLOSING` yourself; QA also swaps the "stop before submitting a form" rule for `QA_IRREVERSIBLE_LINE`), and
 the result gets an extra `qa` field before `error`. Outcome: `passed` / `failed` (the
 verdict), `inconclusive` (the run ended without a verdict), `error` (model error, timeout or
 step limit without a verdict; `reason` says why when the result has no `error` of its own), `setup_failed` (the fixture broke; `error` and
@@ -490,7 +490,9 @@ const session = createBrowseAgentSession({
     }
   },
 });
-// Your prompt: principal QA_PRINCIPAL and the section QA_PROMPT_SECTION.
+// Your prompt (the same as buildBrowseAgentPrompt({ qa: true }) from `/agent`): principal QA_PRINCIPAL,
+// QA_IRREVERSIBLE_LINE instead of the subagent stop rule, QA_PROMPT_SECTION after your sections,
+// and QA_AGENT_CLOSING (names qa_verdict) as the last paragraph.
 // The session core only executes. The tool schema reaches the model from the host's server:
 // declare qa_verdict there with `qaVerdictDefinition` from `@sideform/browser-agent/agent`
 // (verdict "pass" | "fail", reason 1..500 chars).

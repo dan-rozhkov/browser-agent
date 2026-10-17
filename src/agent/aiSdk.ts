@@ -20,8 +20,6 @@ import {
 import { boundedCall } from "../fixture/util.js";
 import { normalizeScreenshot } from "../policy/schemas.js";
 import {
-  QA_PRINCIPAL,
-  QA_PROMPT_SECTION,
   QA_VERDICT_FIELD,
   QA_VERDICT_TOOL,
   createStepRecorder,
@@ -142,9 +140,11 @@ export interface RunBrowseAgentOptions {
    * comes before `error` in `JSON.stringify(result)`). `steps` is the model's tool
    * calls (the last 30), taken from the `onToolCall` mechanism; your own
    * `onToolCall` is still called. The prompt: with `prompt` unset or an options
-   * object, the principal is "a QA engineer" (unless you set one) and the QA
-   * section is added. With `prompt` as a string the text is yours and is NOT
-   * touched: include `QA_PROMPT_SECTION` in it. Use `qa: true` or `qa: { onScreenshot }`.
+   * object, `buildBrowseAgentPrompt({ ...prompt, qa: true })` builds it: principal "a QA
+   * engineer" (unless you set one), a QA irreversible-step rule, the QA section after
+   * your sections, and a closing that names `qa_verdict`. With `prompt` as a string
+   * the text is yours and is NOT touched: include `QA_PROMPT_SECTION` and end with
+   * `QA_AGENT_CLOSING`. Use `qa: true` or `qa: { onScreenshot }`.
    * `onScreenshot` gets the final screenshot (jpeg, png or webp). It is TAKEN once at
    * the end, before the fixture release, bounded to 10 s; the callback runs after the release
    * and the journal stop, so a slow callback holds neither the mocks nor the browser. It is never put into
@@ -333,7 +333,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     typeof opts.prompt === "string"
       ? opts.prompt
       : buildBrowseAgentPrompt(
-          qaOn ? { ...opts.prompt, principal: opts.prompt?.principal ?? QA_PRINCIPAL, sections: [...(opts.prompt?.sections ?? []), QA_PROMPT_SECTION] } : opts.prompt,
+          qaOn ? { ...opts.prompt, qa: true } : opts.prompt,
         );
   // One assistant message, like the UI message the tool loop builds in a chat.
   const parts: BrowseAgentMessagePart[] = [];
