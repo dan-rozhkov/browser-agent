@@ -18,6 +18,18 @@ import {
   type BuildBrowseAgentPromptOptions,
 } from "./prompt.js";
 import { boundedCall } from "../fixture/util.js";
+import { normalizeScreenshot } from "../policy/schemas.js";
+import {
+  QA_PRINCIPAL,
+  QA_PROMPT_SECTION,
+  QA_VERDICT_FIELD,
+  QA_VERDICT_TOOL,
+  createStepRecorder,
+  executeQaVerdict,
+  qaResultOf,
+  qaVerdictDefinition,
+  qaVerdictHooks,
+} from "./qa.js";
 import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
 import { type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
@@ -41,6 +53,11 @@ export interface BrowseAgentExtraTool extends BrowseAgentExtraToolHooks {
   /** Runs the call. Returns the result string (JSON by convention). */
   execute(input: unknown, ctx: { toolCallId: string; signal: AbortSignal }): Promise<string>;
 }
+
+/** The final QA screenshot may take this long. */
+const QA_SCREENSHOT_MS = 10_000;
+/** The host's `onScreenshot` may take this long. */
+const QA_SCREENSHOT_CALLBACK_MS = 15_000;
 
 /** The host's `onCapture` may take this long before the result is returned without it. */
 const CHECKPOINT_CALLBACK_MS = 15_000;
@@ -119,6 +136,29 @@ export interface RunBrowseAgentOptions {
   /** Max output tokens per request. */
   maxOutputTokens?: number;
   /**
+   * QA mode (docs/specs/2026-10-17-qa-suite-design.md). The model gets the
+   * `qa_verdict` tool, and the result gets a `qa` field:
+   * `{ outcome, verdict?, reason?, steps, stepsDropped? }` (an extra field, so it
+   * comes before `error` in `JSON.stringify(result)`). `steps` is the model's tool
+   * calls (the last 30), taken from the `onToolCall` mechanism; your own
+   * `onToolCall` is still called. The prompt: with `prompt` unset or an options
+   * object, the principal is "a QA engineer" (unless you set one) and the QA
+   * section is added. With `prompt` as a string the text is yours and is NOT
+   * touched: include `QA_PROMPT_SECTION` in it. Use `qa: true` or `qa: { onScreenshot }`.
+   * `onScreenshot` gets the final screenshot (jpeg, png or webp). It is TAKEN once at
+   * the end, before the fixture release, bounded to 10 s; the callback runs after the release
+   * and the journal stop, so a slow callback holds neither the mocks nor the browser. It is never put into
+   * the result. Not taken for `setup_failed`, `aborted` or `timeout`. A throw or
+   * a rejection in it is ignored; an async callback is awaited for at most 15 s.
+   * The run ends right after a successful `qa_verdict` (no more model request), so the final
+   * answer text can be empty; the verdict reason is in `qa`. With `qa` on, a host extra tool
+   * named `qa_verdict` makes the call throw (before any browser command), and result fields
+   * named `qa` or `qaVerdict` from a host tool's `end` hook are dropped.
+   * To run several scenarios in parallel, call `runBrowseAgent` several times,
+   * each with its own browser: the package does not orchestrate.
+   */
+  qa?: boolean | { onScreenshot?(img: { mediaType: string; base64: string }): void | Promise<void> };
+  /**
    * Observe every tool execution: the browse tools and the host tools, also the
    * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
    * execution STARTS with the model's tool name and input; the function it
@@ -171,6 +211,7 @@ function buildTools(
   opts: RunBrowseAgentOptions,
   defs: BrowseToolDefinitions,
   names: readonly string[],
+  extras: Record<string, BrowseAgentExtraTool>,
 ): ToolSet {
   const tools: ToolSet = {};
   for (const name of names) {
@@ -182,7 +223,7 @@ function buildTools(
       ...(name === "browse_screenshot" ? { toModelOutput: ({ output }: { output: unknown }) => screenshotToModelOutput(output, { attachImage: opts.toolResultImages === true }) } : {}),
     } as never);
   }
-  for (const [name, extra] of Object.entries(opts.extraTools ?? {})) {
+  for (const [name, extra] of Object.entries(extras)) {
     tools[name] = tool({
       description: extra.description,
       inputSchema: extra.inputSchema as never,
@@ -190,6 +231,31 @@ function buildTools(
     } as never);
   }
   return tools;
+}
+
+/** The result fields QA mode owns. A host tool's `end` cannot set them. */
+const QA_RESERVED_FIELDS: readonly string[] = ["qa", QA_VERDICT_FIELD];
+
+function reservedFieldsDropped(end: BrowseAgentExtraToolHooks["end"]): BrowseAgentExtraToolHooks["end"] {
+  if (!end) return undefined;
+  return (output) => {
+    const fields = end(output);
+    return fields ? Object.fromEntries(Object.entries(fields).filter(([k]) => !QA_RESERVED_FIELDS.includes(k))) : fields;
+  };
+}
+
+/** The final QA image. Never throws; bounded; undefined for statuses where it would not help or when the image is not jpeg, png or webp. */
+async function captureQaScreenshot(browser: BrowserBridge, status: string): Promise<{ mediaType: string; base64: string } | undefined> {
+  // After a timeout the controller may still hold its lock.
+  if (status === "setup_failed" || status === "aborted" || status === "timeout" || !browser.screenshot) return undefined;
+  try {
+    const out = await boundedCall(() => browser.screenshot!({}), QA_SCREENSHOT_MS);
+    if (!out.done) return undefined;
+    const match = IMAGE_DATA_URL.exec(normalizeScreenshot((out.value as { imageData?: unknown } | null | undefined)?.imageData as string | undefined) ?? "");
+    return match ? { mediaType: match[1]!, base64: match[2]! } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -204,19 +270,34 @@ function buildTools(
 export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions): Promise<BrowseAgentResult> {
   const defs = opts.toolDefinitions ?? browseToolDefinitions;
   const baseTools = BROWSE_AGENT_TOOL_NAMES.filter((n) => opts.screenshots !== false || n !== "browse_screenshot");
-  const extras = opts.extraTools ?? {};
+  const qaOn = opts.qa !== undefined && opts.qa !== false;
+  const onScreenshot = typeof opts.qa === "object" ? opts.qa.onScreenshot : undefined;
+  if (qaOn && opts.extraTools?.[QA_VERDICT_TOOL]) throw new Error(`runBrowseAgent: qa mode owns the tool name ${QA_VERDICT_TOOL}; rename your extra tool.`);
+  // The verdict is set once qa_verdict succeeded; the tool loop ends then (the verdict is the last step).
+  let verdictSet = false;
+  const extras: Record<string, BrowseAgentExtraTool> = {
+    ...opts.extraTools,
+    ...(qaOn ? { [QA_VERDICT_TOOL]: { ...qaVerdictHooks(), ...qaVerdictDefinition, execute: async (input: unknown) => { const out = executeQaVerdict(input); if (parseJsonObject(out).ok === true) verdictSet = true; return out; } } } : {}),
+  };
+  const trail = qaOn ? createStepRecorder() : undefined;
   const executeTool = async (call: BrowseAgentToolCall, ctx: { signal: AbortSignal }) => {
-    let finish: ReturnType<NonNullable<RunBrowseAgentOptions["onToolCall"]>>;
-    try {
-      finish = opts.onToolCall?.(call);
-    } catch {
-      // An observer must not change the run.
+    // Observers must not change the run: a throw in one is ignored.
+    const finishers: ((result: { output?: string; error?: unknown }) => void)[] = [];
+    for (const observe of [trail?.onToolCall, opts.onToolCall]) {
+      try {
+        const f = observe?.(call);
+        if (typeof f === "function") finishers.push(f);
+      } catch {
+        // Ignored.
+      }
     }
     const ended = (result: { output?: string; error?: unknown }) => {
-      try {
-        finish?.(result);
-      } catch {
-        // Same.
+      for (const f of finishers) {
+        try {
+          f(result);
+        } catch {
+          // Ignored.
+        }
       }
     };
     try {
@@ -236,11 +317,16 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     deadlineMs: opts.deadlineMs,
     maxRequests: opts.maxRequests,
     baseTools,
-    extraTools: Object.fromEntries(Object.entries(extras).map(([n, e]) => [n, { guard: e.guard?.bind(e), begin: e.begin?.bind(e), end: e.end?.bind(e), fork: e.fork?.bind(e) }])),
+    extraTools: Object.fromEntries(Object.entries(extras).map(([n, e]) => [n, { guard: e.guard?.bind(e), begin: e.begin?.bind(e), end: qaOn && n !== QA_VERDICT_TOOL ? reservedFieldsDropped(e.end?.bind(e)) : e.end?.bind(e), fork: e.fork?.bind(e) }])),
     executeTool,
   });
 
-  const system = typeof opts.prompt === "string" ? opts.prompt : buildBrowseAgentPrompt(opts.prompt);
+  const system =
+    typeof opts.prompt === "string"
+      ? opts.prompt
+      : buildBrowseAgentPrompt(
+          qaOn ? { ...opts.prompt, principal: opts.prompt?.principal ?? QA_PRINCIPAL, sections: [...(opts.prompt?.sections ?? []), QA_PROMPT_SECTION] } : opts.prompt,
+        );
   // One assistant message, like the UI message the tool loop builds in a chat.
   const parts: BrowseAgentMessagePart[] = [];
   const messages: BrowseAgentMessage[] = [{ role: "assistant", parts }];
@@ -259,6 +345,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   });
   const onCapture = opts.checkpoint?.onCapture;
   let finalStatus: { status: string; steps: number } = { status: "error", steps: 0 };
+  let shot: { mediaType: string; base64: string } | undefined;
 
   try {
     // Before the setup or the start URL: the journal must see the page the run starts on.
@@ -271,9 +358,9 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
             model: opts.model,
             system,
             prompt: text,
-            tools: buildTools(session, opts, defs, [...baseTools]),
+            tools: buildTools(session, opts, defs, [...baseTools], extras),
             // Called after a step that ended with tool results. False ends the loop.
-            stopWhen: () => !session.continueRequest(),
+            stopWhen: () => verdictSet || !session.continueRequest(),
             abortSignal: session.signal,
             providerOptions: opts.providerOptions as never,
             maxOutputTokens: opts.maxOutputTokens,
@@ -297,16 +384,32 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       },
     );
     finalStatus = result;
-    return result;
+    if (!trail) return result;
+    // `qa` is an extra field: it goes before `error` and `setupStage`, and the verdict field is folded into it.
+    const { error, setupStage, [QA_VERDICT_FIELD]: _verdict, ...rest } = result;
+    return {
+      ...rest,
+      qa: qaResultOf(result, trail.steps()),
+      ...(error !== undefined ? { error } : {}),
+      ...(setupStage !== undefined ? { setupStage } : {}),
+    } as BrowseAgentResult;
   } finally {
     // Capture conditions live in the helper. The order is capture, host callback, fixture release (the mocks live
     // until the task ends, whatever the outcome), stop. The stop wait is bounded, so a hung browser cannot hold a finished run.
     await checkpoint.finish(finalStatus, {
       async beforeStop(captured) {
+        // The final image first: the fixture's mocks are still live, and the page is as the run left it.
+        // The host callback waits until the release and the stop are done.
+        if (onScreenshot) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
         // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
         if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
         await fixtureSetup?.release();
       },
     });
+    if (shot && onScreenshot) {
+      const img = shot;
+      // A throw or a rejection is ignored; a slow callback is awaited for a bounded time only.
+      await boundedCall(() => onScreenshot(img), QA_SCREENSHOT_CALLBACK_MS).catch(() => undefined);
+    }
   }
 }

@@ -1,3 +1,4 @@
+import type { QaResult } from "./qaTypes.js";
 import { BROWSE_AGENT_ANSWER_MAX_CHARS, BROWSE_AGENT_ERROR_MAX_CHARS } from "./limits.js";
 
 export type BrowseAgentStatus = "done" | "error" | "aborted" | "step_limit" | "timeout" | "setup_failed";
@@ -5,7 +6,7 @@ export type BrowseAgentStatus = "done" | "error" | "aborted" | "step_limit" | "t
 /**
  * The result of one run. Serialize it with `JSON.stringify` to get the string
  * Pen Editor returns to its main model: the key order is `status`, `answer`,
- * `steps`, the extra fields of host tools (for example `captured`), then `error`.
+ * `steps`, the extra fields of host tools (for example `captured`, and `qa` in QA mode), then `error`.
  */
 export interface BrowseAgentResult {
   status: BrowseAgentStatus;
@@ -17,6 +18,8 @@ export interface BrowseAgentResult {
   error?: string;
   /** Set for status `setup_failed` when the setup knows which part broke (for a fixture: the apply stage). */
   setupStage?: string;
+  /** QA mode (`runBrowseAgent({ qa })`): outcome, verdict and the model's steps. */
+  qa?: QaResult;
   /** Extra fields from host tools. */
   [extra: string]: unknown;
 }

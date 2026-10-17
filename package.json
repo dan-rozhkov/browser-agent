@@ -73,10 +73,6 @@
     "./agent/ai-sdk": {
       "types": "./dist/agent/aiSdk.d.ts",
       "default": "./dist/agent/aiSdk.js"
-    },
-    "./qa": {
-      "types": "./dist/qa/index.d.ts",
-      "default": "./dist/qa/index.js"
     }
   },
   "scripts": {
@@ -162,9 +158,6 @@
       ],
       "agent/ai-sdk": [
         "dist/agent/aiSdk.d.ts"
-      ],
-      "qa": [
-        "dist/qa/index.d.ts"
       ]
     }
   },

@@ -1,140 +1,120 @@
-# QA suite — design (2026-10-17)
+# QA mode - design (2026-10-17)
 
-Sub-project on top of `runBrowseAgent` and the QA start (`2026-10-15-qa-start-design.md`).
-A QA host gives a list of scenarios. The suite runs N browse agents in parallel,
-each in its OWN browser (a new Playwright `BrowserContext`, or what the host's
-factory gives), each with its own `PageFixture` and one scenario. At the end it
-gives one report object: scenario → outcome → steps → final screenshot.
+A mode of `runBrowseAgent` for testing a web app. One scenario is one ordinary
+browse-agent run. The package does not orchestrate: no suite, no pool, no
+concurrency. The consumer decides how many runs go in parallel (in Pen Editor the
+main agent calls `browse_agent` N times), and what to do with each result. Builds
+on the QA start (`2026-10-15-qa-start-design.md`): the scenario's browser state
+comes from a `PageFixture`.
 
-Not in scope: several agents (cursors) on one page. One page has one focus and one
-input queue; agents would read each other's stale snapshots, and a failure could not
-be attributed. Isolation is the point.
+Isolation is the consumer's: each parallel run needs its OWN browser. Several agents
+on one page are not supported (one page has one focus and one input queue; a failure
+could not be attributed). `playwrightContexts(browser)` in `adapters/playwright` is a
+helper for it: it returns a function that makes a new `BrowserContext` per call
+(`PlaywrightTarget` -> `BrowserController` -> `controllerBridge`) and gives
+`{ browser, close }`. Cookies, storage and network mocks (`context.route`) are per
+context.
 
-## API — subpath `@sideform/browser-agent/qa`
-
-Imports `ai` (through `runBrowseAgent`), no `node:*`. The suite writes nothing to disk.
-Not in the `agent` light import graph.
+## API
 
 ```ts
-interface QaScenario {
-  id: string;                 // unique in the suite; [A-Za-z0-9_-]{1,64} (short, easy to name)
-  title?: string;
-  goal: string;               // what to do and what to check ("Add 2 items, check the cart badge says 2")
-  url?: string;               // start URL; `url` and `fixture` together are an error (runBrowseAgent rule)
-  fixture?: PageFixture;      // state of THIS scenario's browser
-  allowNetworkMocks?: boolean;
-}
-
-interface QaBrowser { browser: BrowserBridge; close(): Promise<void> }
-
-interface RunQaSuiteOptions {
-  model: LanguageModel;
-  /** A fresh isolated browser per scenario. Called once per scenario; `close` is called in every outcome. */
-  openBrowser(scenario: QaScenario, ctx: { signal?: AbortSignal }): Promise<QaBrowser>;
-  concurrency?: number;       // default 3; < 1 or NaN throws; Infinity = all at once; clamped to the scenario count
-  signal?: AbortSignal;       // aborts all running scenarios; not-started ones get outcome "aborted"
-  providerOptions?: Record<string, Record<string, unknown>>;
-  /** Passed to every runBrowseAgent call. */
-  agent?: Pick<RunBrowseAgentOptions, "maxRequests" | "deadlineMs" | "toolResultImages" | "screenshots" | "maxOutputTokens" | "toolDefinitions">;
-  /** Called when a scenario ends (progress). A throw is ignored. */
-  onScenarioDone?(report: QaScenarioReport): void;
-  now?(): number;             // test seam, default Date.now
-}
-
-function runQaSuite(scenarios: QaScenario[], opts: RunQaSuiteOptions): Promise<QaSuiteReport>;
+const r = await runBrowseAgent(goal, { model, browser, fixture, qa: true });
+// or qa: { onScreenshot(img) { ... } }
+// r.qa = { outcome, verdict?, reason?, steps, stepsDropped? }
 ```
 
-Validation before anything runs (throws `Error`): empty list, duplicate or invalid
-`id`, empty `goal`, `url` + `fixture`, `concurrency` below 1 or NaN, `agent.maxRequests`
-or `agent.deadlineMs` that is not a positive number (the session rule). A failure inside one scenario (also a bug) gives
-that scenario outcome `error`; `runQaSuite` itself does not reject after validation.
+`RunBrowseAgentOptions.qa?: boolean | { onScreenshot?(img: { mediaType, base64 }): void | Promise<void> }`.
+When on:
 
-## Verdict
+- The model gets one extra tool, `qa_verdict({ verdict: "pass" | "fail", reason })`
+  (reason trimmed, 1 to 500 chars). It is a `singleUseTool`: a second call is refused
+  by the guard before it runs (not a step), and the first verdict stays. A call with bad
+  input is an error and does not use up the verdict.
+- Prompt: with `prompt` unset or an options object, the principal is "a QA engineer"
+  (unless the host set one) and the QA section is added after the host's sections.
+  With `prompt` as a string the text is the host's and is not touched: the host must
+  include the exported `QA_PROMPT_SECTION`. Without `qa` the prompt is unchanged.
+  The section: you test a web app; do the scenario; check the expected result on the
+  page; call `qa_verdict` exactly once at the end, `fail` when the app does not behave
+  as the scenario expects; a blocked step (CAPTCHA, login wall, missing page) is not a
+  fail, so do not call it and explain in the answer.
+- The run ends right after a successful `qa_verdict` (no more model request), so the final
+  answer text can be empty; the reason is in `qa`.
+- Reserved names: a host extra tool named `qa_verdict` makes the call throw (before any
+  browser command); result fields `qa` and `qaVerdict` from a host tool's `end` hook are dropped.
+- The steps come from the general `onToolCall` hook (see below). The host's own
+  `onToolCall` is still called.
 
-The model gets one extra tool, `qa_verdict({ verdict: "pass" | "fail", reason: string })`
-(reason ≤ 500 chars, trimmed). The suite's prompt is `buildBrowseAgentPrompt` with
-principal `"a QA engineer"` and a section: you test a web app; do the scenario; check
-the expected result on the page; call `qa_verdict` exactly once at the end, with `fail`
-when the app does not behave as the scenario expects; a blocked step (CAPTCHA, login
-wall, missing page) is not a fail — do not call `qa_verdict`, explain in the answer.
-A second `qa_verdict` call returns an error string and does not change the first verdict.
+## Result
 
-Outcome of a scenario (`QaOutcome`):
+`qa` is an extra field of the run result, so `JSON.stringify(result)` has the key order
+`status, answer, steps, qa, error, setupStage`. It is the string a host gives its main
+model, so it holds no screenshot, no base64 and no times.
+
+```ts
+interface QaResult {
+  outcome: QaOutcome;
+  verdict?: "pass" | "fail";
+  reason?: string;     // the verdict reason; for outcome "error" with no verdict and no run `error`: why the run ended
+  steps: { index, tool, args, ok, error? }[];   // the last 30
+  stepsDropped?: number;
+}
+```
 
 | run status | verdict | outcome |
 |---|---|---|
-| `setup_failed` | — | `setup_failed` (fixture broke; `setupStage` kept) |
-| `aborted` | — | `aborted` |
+| `setup_failed` | - | `setup_failed` (fixture broke; `setupStage` and `error` stay on the result) |
+| `aborted` | - | `aborted` |
 | any | `pass` | `passed` |
 | any | `fail` | `failed` |
 | `done` | none | `inconclusive` |
-| `error`/`timeout`/`step_limit` | none | `error` (`error` text from the run, else "request limit reached" / "deadline reached") |
-| `openBrowser` threw, or returned no browser | — | `error` (no run) |
+| `error`/`timeout`/`step_limit` | none | `error` |
+
+`reason` for an `error` outcome without a verdict: only when the result has no top-level
+`error` (it is not copied): "request limit reached" (`step_limit`), "deadline reached"
+(`timeout`), else "the run ended with status X". Key order of `qa`: `outcome, verdict, reason,
+steps, stepsDropped`.
 
 ## Steps
 
-The suite records the tool calls of the MODEL, not the bridge calls the tools make.
-`runBrowseAgent` has a general `onToolCall` hook (start with the tool name and input,
-and a function that gets the result string or the error). A step is taken when the
-call STARTS, so its index and its place in the list follow the call order, also for
-parallel calls. All tools are steps: the seven browse tools and `qa_verdict`. The
-pre-open of `url` (the hook marks it `preOpen: true`) and the fixture setup are not model calls, so they are not steps,
-and fixture data (secret) cannot reach the report. Each step:
-`{ index, tool, args, ok, error?, ms }`. `args` is the input the model gave, with
-`text` values longer than 200 chars cut (also inside a `browse_act` batch). `ok` is
-false when the result string is an object with a string `error`, or the tool threw,
-or the call did not end (abort).
+One step per tool call of the MODEL (the seven browse tools and `qa_verdict`), not the
+bridge calls a tool made. `runBrowseAgent` has a general `onToolCall` hook: it is called
+when an execution starts with `{ toolName, input, toolCallId, preOpen? }` and returns a
+function that gets `{ output }` or `{ error }` when it ends. The step slot and index are
+taken at the start, so parallel calls keep their order. The pre-open of `url` is the
+session's own call (`preOpen: true`) and is not a step; the fixture setup is not a model
+call either, so fixture data (secret) cannot reach the result. A step is
+`{ index, tool, args, ok, error?, ms }`; `args` is the model's input with `text` values
+over 200 chars cut (also inside a `browse_act` batch); `error` is capped like the run's `error` (300 chars). `ok` is false when the result
+string is an object with a string `error`, when the tool threw, or when the call did not
+end. In the result `ms` is left out and only the last 30 steps stay.
 
 ## Final screenshot
 
-After the run, before `close`, the suite calls `browser.screenshot?.({})` once
-(bounded to 10 s, failures ignored) and keeps `{ mediaType, base64 }` from the
-`imageData` data URL. Not taken for `setup_failed`, `aborted` and `timeout` (the controller may still hold its lock). Only jpeg, png and webp count (`normalizeScreenshot`); anything else gives no screenshot.
+Only when `qa: { onScreenshot }` is given. After the run, before the fixture release (the
+mocks are still live), the run calls `browser.screenshot({})` once, bounded to 10 s. The
+callback gets `{ mediaType, base64 }` AFTER the release and the journal stop, so a slow
+host callback holds neither the mocks nor the browser. It is never put into the result. Only
+jpeg, png and webp count (`normalizeScreenshot`); bare base64 (what `PlaywrightTarget`
+gives) and data URLs are both accepted. Not taken for `setup_failed`, `aborted` and
+`timeout` (the controller may still hold its lock). A failed screenshot is ignored, and
+so is a throw or rejection in the callback; an async callback is awaited for at most 15 s.
 
-## Report
+## Parts for a host on the session core
 
-```ts
-interface QaScenarioReport {
-  id: string; title?: string; goal: string;
-  outcome: QaOutcome;
-  verdictReason?: string;
-  answer: string;             // the agent's final answer
-  status?: BrowseAgentStatus; // absent when openBrowser threw
-  error?: string; setupStage?: string;
-  steps: QaStep[];
-  screenshot?: { mediaType: string; base64: string };
-  startedAt: string; durationMs: number;   // ISO
-}
-interface QaSuiteReport {
-  startedAt: string; durationMs: number; concurrency: number;
-  summary: { total: number } & Record<QaOutcome, number>;
-  scenarios: QaScenarioReport[];   // in input order, not finish order
-}
-```
-
-The result is this object, nothing else. The suite writes no files and builds no
-text for a model; what to do with the report (store it, format it for a model, show
-the screenshot on a canvas) is the consumer's decision. The screenshot data stays in it
-for that reason.
-
-## Playwright helper
-
-`playwrightContexts(browser: Browser, contextOptions?, controllerOptions?)` in `adapters/playwright`
-returns an `openBrowser` that makes a new `BrowserContext` per scenario
-(`PlaywrightTarget` → `BrowserController` → `controllerBridge`); `close` closes the
-context. Full isolation: cookies, storage, network mocks (`context.route`) are per context.
+`src/agent/qa.ts` (zod only; no `ai`, no `node:*`) is exported from `@sideform/browser-agent/agent`:
+`QA_PROMPT_SECTION`, `QA_VERDICT_TOOL`, `qaVerdictDefinition`, `qaVerdictHooks()`,
+`executeQaVerdict`, `qaOutcome(status, verdict)`, `qaResultOf(result, steps)`,
+`createStepRecorder()` and the types `QaOutcome`, `QaStep`, `QaResult`. A host that drives
+the session itself (Pen Editor's frontend) assembles the same thing from them.
 
 ## Example and smoke
 
-- `examples/qa-suite.ts <scenarios.json>` prints one summary line per scenario — real model (OpenRouter, like `run-agent.ts`).
-- `npm run qa-smoke` (`examples/qa-smoke.ts`): no keys. Real Chromium, a local HTTP
-  server, a scripted mock model, 3 scenarios with concurrency 3: each sets its own
-  cookie through its fixture and must not see the others' (isolation), one passes,
-  one fails, one has a fixture that fails `expect` (`setup_failed`). Checks the returned object.
-
-## Later review decisions
-
-- `openBrowser` gets the suite signal and the suite races it: an abort ends the wait
-  (outcome `aborted`), and a browser that arrives late is closed, close errors ignored.
-- `qa_verdict` uses `singleUseTool`: a repeat is refused by the guard (not a step), the
-  verdict reaches the suite as a result field. The reason is trimmed and must not be empty.
+- `examples/qa-suite.ts <scenarios.json>`: a real model (OpenRouter), a small pool written in
+  the example (consumer code), one `runBrowseAgent({ qa: true })` per scenario in its own
+  context, one summary line per scenario.
+- `npm run qa-smoke` (`examples/qa-smoke.ts`): no keys. Real Chromium, a local HTTP server, a
+  scripted mock model, `Promise.all` over 3 runs: each sets its own cookie through its
+  fixture and must not see the others' (isolation); one passes, one fails, one has a fixture
+  that fails `expect` (`setup_failed`). Checks the results, the steps, the screenshots
+  from the callback, and that the results hold no base64 and no fixture data.

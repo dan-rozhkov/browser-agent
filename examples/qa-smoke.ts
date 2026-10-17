@@ -1,7 +1,7 @@
 /**
- * Live smoke test of the QA suite in a real Chromium. No API keys, no network:
+ * Live smoke test of the QA mode (`runBrowseAgent({ qa })`) in a real Chromium. No API keys, no network:
  * a local HTTP server, a real browser, and a model scripted per scenario.
- * Three scenarios run in parallel, each in its own browser context:
+ * The parallelism is this script's own: Promise.all over three runs, each in its own browser context:
  *   alpha  passes, beta fails, gamma has a fixture whose `expect` fails (setup_failed).
  * Each one sets its own cookie through its fixture and must never see another's.
  *
@@ -12,7 +12,8 @@ import type { AddressInfo } from "node:net";
 import { chromium } from "playwright-core";
 import { MockLanguageModelV3 } from "ai/test";
 import { playwrightContexts } from "../src/adapters/playwright.js";
-import { runQaSuite, type QaScenario } from "../src/qa/index.js";
+import { runBrowseAgent } from "../src/agent/aiSdk.js";
+import type { PageFixture } from "../src/fixture/index.js";
 
 // The server prints the cookie header it got, and logs every one.
 const cookieLog: string[] = [];
@@ -72,10 +73,15 @@ const model = new MockLanguageModelV3({
 });
 
 const cookieFixture = (id: string) => ({ version: 1 as const, fresh: true, storage: { cookies: [{ name: "who", value: id, url: base }] }, url: `${base}/whoami` });
-const scenarios: QaScenario[] = [
-  { id: "alpha", title: "Settings is visible", goal: "[scenario alpha] Open the account page and check the Settings button.", fixture: { ...cookieFixture("alpha"), expect: { selector: "#who" } } },
-  { id: "beta", title: "Checkout is visible", goal: "[scenario beta] Open the account page and check the Checkout button.", fixture: { ...cookieFixture("beta"), expect: { selector: "#who" } } },
-  { id: "gamma", title: "Broken fixture", goal: "[scenario gamma] This never runs.", fixture: { ...cookieFixture("gamma"), expect: { selector: "#no-such-element", timeoutMs: 1000 } } },
+interface Scenario {
+  id: string;
+  goal: string;
+  fixture: PageFixture;
+}
+const scenarios: Scenario[] = [
+  { id: "alpha", goal: "[scenario alpha] Open the account page and check the Settings button.", fixture: { ...cookieFixture("alpha"), expect: { selector: "#who" } } },
+  { id: "beta", goal: "[scenario beta] Open the account page and check the Checkout button.", fixture: { ...cookieFixture("beta"), expect: { selector: "#who" } } },
+  { id: "gamma", goal: "[scenario gamma] This never runs.", fixture: { ...cookieFixture("gamma"), expect: { selector: "#no-such-element", timeoutMs: 1000 } } },
 ];
 
 let failed = 0;
@@ -87,16 +93,38 @@ function check(name: string, ok: boolean, detail?: unknown) {
 const browser = await chromium.launch();
 try {
   const open = playwrightContexts(browser);
-  const report = await runQaSuite(scenarios, { model, openBrowser: open, concurrency: 3 });
-  const byId = Object.fromEntries(report.scenarios.map((s) => [s.id, s]));
+  const shots = new Map<string, { mediaType: string; base64: string }>();
+  let maxOpen = 0;
+  let nowOpen = 0;
+  // One run per scenario, each in a new isolated context. The consumer decides how many run at once.
+  const results = await Promise.all(
+    scenarios.map(async (sc) => {
+      const opened = await open();
+      nowOpen++;
+      maxOpen = Math.max(maxOpen, nowOpen);
+      try {
+        return await runBrowseAgent(sc.goal, {
+          model,
+          browser: opened.browser,
+          fixture: sc.fixture,
+          runId: sc.id,
+          qa: { onScreenshot: (img) => { shots.set(sc.id, img); } },
+        });
+      } finally {
+        nowOpen--;
+        await opened.close();
+      }
+    }),
+  );
+  const byId = Object.fromEntries(scenarios.map((sc, i) => [sc.id, results[i]!]));
+  const qa = (id: string) => byId[id]!.qa!;
 
-  check("three scenarios in input order", report.scenarios.map((s) => s.id).join() === "alpha,beta,gamma", report.scenarios.map((s) => s.id));
-  check("alpha passed", byId.alpha?.outcome === "passed", byId.alpha);
-  check("beta failed with a reason", byId.beta?.outcome === "failed" && !!byId.beta.verdictReason, byId.beta);
-  check("gamma setup_failed at stage expect", byId.gamma?.outcome === "setup_failed" && byId.gamma.setupStage === "expect", byId.gamma);
-  check("summary counts", report.summary.total === 3 && report.summary.passed === 1 && report.summary.failed === 1 && report.summary.setup_failed === 1, report.summary);
-  check("concurrency 3", report.concurrency === 3, report.concurrency);
+  check("three runs, three results", results.length === 3);
+  check("alpha passed", qa("alpha").outcome === "passed", byId.alpha);
+  check("beta failed with a reason", qa("beta").outcome === "failed" && !!qa("beta").reason, byId.beta);
+  check("gamma setup_failed at stage expect", qa("gamma").outcome === "setup_failed" && byId.gamma!.setupStage === "expect", byId.gamma);
   check("alpha and beta ran at the same time", bothArrived);
+  check("three contexts were open at once or overlapped", maxOpen >= 2, maxOpen);
 
   // Isolation: each model saw only its own cookie, and the server never got a mixed cookie header.
   const alphaSeen = seenByModel.get("alpha") ?? "";
@@ -106,13 +134,11 @@ try {
   const sorted = [...new Set(cookieLog)].sort();
   check("server got exactly three separate cookies", sorted.join("|") === "who=alpha|who=beta|who=gamma", sorted);
 
-  check("alpha steps recorded (read, no fixture data)", byId.alpha!.steps.some((s) => s.tool === "browse_read") && !JSON.stringify(byId.alpha!.steps).includes("who"), byId.alpha!.steps);
-  check("alpha has a final screenshot", !!byId.alpha?.screenshot && byId.alpha.screenshot.base64.length > 100, byId.alpha?.screenshot?.mediaType);
-  check("gamma has no screenshot", !byId.gamma?.screenshot);
-
-  check("beta has a final screenshot", !!byId.beta?.screenshot);
-  check("the report holds no fixture data (cookie name and value)", !JSON.stringify(report).includes("who=") && !JSON.stringify(report).includes('"who"'));
-  check("steps are tool calls of the model", byId.alpha!.steps.map((s) => s.tool).join() === "browse_read,qa_verdict", byId.alpha!.steps.map((s) => s.tool));
+  check("alpha steps are the model's tool calls", qa("alpha").steps.map((s) => s.tool).join() === "browse_read,qa_verdict", qa("alpha").steps);
+  check("screenshots came through the callback for alpha and beta, not gamma", shots.has("alpha") && shots.has("beta") && !shots.has("gamma") && shots.get("alpha")!.base64.length > 100, [...shots.keys()]);
+  const text = JSON.stringify(results);
+  check("the results hold no base64 and no fixture data", !text.includes("base64") && !text.includes(shots.get("alpha")!.base64.slice(0, 40)) && !text.includes("who=") && !text.includes('"who"'));
+  check("a result is JSON with qa before error", Object.keys(byId.gamma!).join() === "status,answer,steps,qa,error,setupStage", Object.keys(byId.gamma!));
 } finally {
   await browser.close();
   server.close();

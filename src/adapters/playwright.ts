@@ -630,8 +630,8 @@ export async function connectOverCdp(
 }
 
 /**
- * An `openBrowser` for `runQaSuite`: a new `BrowserContext` per scenario, so
- * cookies, storage and network mocks (`context.route`) are per scenario.
+ * A factory of isolated browsers: each call makes a new `BrowserContext`, so
+ * cookies, storage and network mocks (`context.route`) are per run (for parallel QA runs).
  * `close` closes the context, not the browser: the host owns the browser.
  * `controllerOptions` go to each `BrowserController` (default: its defaults, cursor on).
  */
