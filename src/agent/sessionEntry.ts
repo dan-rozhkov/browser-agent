@@ -6,6 +6,7 @@
 export * from "./checkpoint.js";
 export * from "./fixtureSetup.js";
 export * from "./limits.js";
+export * from "./qaCore.js";
 export * from "./result.js";
 export * from "./session.js";
 export { BROWSE_AGENT_TOOL_NAMES, type BrowseAgentToolName } from "./toolNames.js";

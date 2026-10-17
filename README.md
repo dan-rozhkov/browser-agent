@@ -465,9 +465,45 @@ model (the last 30, `stepsDropped` counts the rest), built from the `onToolCall`
 fixture data cannot reach it. `JSON.stringify(result)` stays the string for a main model: no
 screenshot and no base64. The final screenshot goes only to `qa.onScreenshot` (jpeg, png or webp; taken within 10 s before the fixture release, the callback runs after the release; not for `setup_failed`, `aborted` or `timeout`). The run ends right after the verdict, so `answer` can be empty. A host tool named `qa_verdict` throws; host result fields `qa` and `qaVerdict` are dropped.
 
-A host on the session core assembles the same from `@sideform/browser-agent/agent`:
-`QA_PROMPT_SECTION`, `qaVerdictDefinition`, `qaVerdictHooks()`, `executeQaVerdict`,
-`qaOutcome`, `qaResultOf`, `createStepRecorder`.
+A host on the session core (no zod) assembles the same from `@sideform/browser-agent/agent/session`
+(the zod-free QA core `qaCore.ts`; `agent` exports it too, plus `qaVerdictSchema` and
+`qaVerdictDefinition` for hosts that want the zod schema):
+
+```ts
+import { createBrowseAgentSession, createStepRecorder, executeQaVerdict, qaResultOf,
+  qaVerdictHooks, QA_PRINCIPAL, QA_PROMPT_SECTION, QA_VERDICT_TOOL } from "@sideform/browser-agent/agent/session";
+
+const trail = createStepRecorder();
+const session = createBrowseAgentSession({
+  extraTools: { [QA_VERDICT_TOOL]: qaVerdictHooks() },   // a successful verdict ends the run
+  executeTool: async (call, ctx) => {
+    // The recorder wraps the host's executeTool (as runBrowseAgent does), so calls the guard
+    // refuses and unknown tools are not steps.
+    const done = trail.onToolCall(call);
+    try {
+      const output = call.toolName === QA_VERDICT_TOOL ? executeQaVerdict(call.input) : await myExecute(call, ctx);
+      done({ output });
+      return output;
+    } catch (error) {
+      done({ error });
+      throw error;
+    }
+  },
+});
+// Your prompt: principal QA_PRINCIPAL and the section QA_PROMPT_SECTION.
+// The session core only executes. The tool schema reaches the model from the host's server:
+// declare qa_verdict there with `qaVerdictDefinition` from `@sideform/browser-agent/agent`
+// (verdict "pass" | "fail", reason 1..500 chars).
+// Run every tool call through session.runTool. Stop the model loop when
+// session.continueRequest() is false (also after the verdict).
+const result = await session.run(goal, driver);
+const qa = qaResultOf(result, trail.steps());            // the `qa` field
+```
+
+`qaVerdictHooks()` sets `endsRun`: after a successful call `session.continueRequest()`
+returns false, so the host makes no extra model request. A verdict with bad input is an error
+and does not end the run. `executeQaVerdict(input)` checks the input by hand with the rules
+of `qaVerdictSchema`.
 
 `examples/qa-suite.ts <scenarios.json>` runs a list with OpenRouter and a small pool of its own;
 `npm run qa-smoke` runs three parallel runs with a scripted model in a real Chromium, no keys.

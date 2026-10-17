@@ -55,6 +55,12 @@ export interface BrowseAgentExtraToolHooks {
    * the error JSON). The returned fields are merged into the run result. */
   end?(output: string): Record<string, unknown> | void;
   /**
+   * Called after `end`. True ends the run: after this call the session's
+   * `continueRequest()` returns false, so the host asks the model no more.
+   * Use it for a tool whose success is the last step (QA `qa_verdict`).
+   */
+  endsRun?(output: string): boolean;
+  /**
    * Make a fresh copy of these hooks with their own state. A session calls it
    * once, at creation, so a host that reuses one hooks object across runs
    * (or runs two sessions at once) does not share state between them. Hooks
@@ -173,6 +179,7 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
   let stopped = false;
   let timedOut = false;
   let stepLimit = false;
+  let runEnded = false;
   let streamError: unknown;
   let hasError = false;
   const fields: Record<string, unknown> = {};
@@ -202,6 +209,7 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
         steps += 1;
         output = await execute(call);
         const extra = hooks?.end?.(output);
+        if (hooks?.endsRun?.(output)) runEnded = true;
         if (extra) {
           for (const [key, value] of Object.entries(extra)) if (!CORE_KEYS.has(key)) fields[key] = value;
         }
@@ -327,7 +335,7 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
       return stopped;
     },
     continueRequest() {
-      if (stopped) return false;
+      if (stopped || runEnded) return false;
       if (requests >= maxRequests) {
         stepLimit = true;
         return false;
@@ -362,6 +370,8 @@ export function singleUseTool(opts: {
   fields?(parsed: Record<string, unknown>): Record<string, unknown>;
   /** Message while the first call still runs. */
   inFlightMessage?: string;
+  /** True: the first success ends the run (`continueRequest()` returns false after it). */
+  endsRun?: boolean;
   /** Message after the first success. */
   doneMessage?(parsed: Record<string, unknown>): string;
 }): BrowseAgentExtraToolHooks {
@@ -369,6 +379,7 @@ export function singleUseTool(opts: {
     let state: "idle" | "in-flight" | "done" = "idle";
     let doneParsed: Record<string, unknown> = {};
     return {
+      ...(opts.endsRun ? { endsRun: () => state === "done" } : {}),
       guard() {
         if (state === "in-flight") {
           return opts.inFlightMessage ?? `${opts.name} is already running in this task; wait for its result.`;

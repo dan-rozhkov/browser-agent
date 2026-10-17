@@ -25,7 +25,7 @@ src/controller/   BrowserController, page scripts, keys, navigation (BrowserTarg
 src/policy/       decideStep / planGoal / locateTarget, step policies, schemas, DecisionClient, TextModel
 src/loop/         runBrowseTask, action cache, loop guard, BrowserBridge, BrowseBackend, KeyValueStorage
 src/adapters/     playwright, systemoneHttp, aiSdk, httpBackend, localBackend, controllerBridge
-src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; execute.ts + executeEntry.ts = the one executor of the seven browse tools, zod-free `agent/execute`; aiSdk.ts = runBrowseAgent (peer ai); qa.ts = QA mode parts (qa_verdict hooks, outcome, step recorder, prompt section; zod, `ai`-free, exported from `agent`)
+src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; execute.ts + executeEntry.ts = the one executor of the seven browse tools, zod-free `agent/execute`; aiSdk.ts = runBrowseAgent (peer ai); qaCore.ts = QA mode parts (qa_verdict hooks, executeQaVerdict, outcome, step recorder, prompt section; zod-free, exported from `agent/session` and `agent`); qa.ts = the zod schema of qa_verdict, re-exports qaCore
 src/fixture/      PageFixture: types, parsePageFixture, applyFixture, captureFixture, network rule matcher (isomorphic, zod-free; subpath `fixture`)
 src/index.ts      root barrel: controller + policy + loop + fixture (NOT adapters)
 test/<layer>/     mirrors src; examples/ is type-checked by lint

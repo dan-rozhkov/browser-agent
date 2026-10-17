@@ -102,11 +102,22 @@ so is a throw or rejection in the callback; an async callback is awaited for at 
 
 ## Parts for a host on the session core
 
-`src/agent/qa.ts` (zod only; no `ai`, no `node:*`) is exported from `@sideform/browser-agent/agent`:
-`QA_PROMPT_SECTION`, `QA_VERDICT_TOOL`, `qaVerdictDefinition`, `qaVerdictHooks()`,
-`executeQaVerdict`, `qaOutcome(status, verdict)`, `qaResultOf(result, steps)`,
-`createStepRecorder()` and the types `QaOutcome`, `QaStep`, `QaResult`. A host that drives
-the session itself (Pen Editor's frontend) assembles the same thing from them.
+`src/agent/qaCore.ts` (zod-free; no `ai`, no `node:*`) is exported from BOTH
+`@sideform/browser-agent/agent/session` and `.../agent`: `QA_PROMPT_SECTION`, `QA_PRINCIPAL`,
+`QA_VERDICT_TOOL`, `QA_VERDICT_FIELD`, the limits, `qaVerdictHooks()`, `executeQaVerdict(input)`
+(hand validation with the rules of the schema), `parseQaVerdict`, `qaOutcome(status, verdict)`,
+`qaResultOf(result, steps)`, `createStepRecorder()` and the types `QaVerdict`, `QaOutcome`,
+`QaStep`, `QaResult`. `src/agent/qa.ts` keeps only the zod part (`qaVerdictSchema`,
+`qaVerdictDefinition`) and re-exports the core, so the `/agent` surface is unchanged. The
+import-graph test of `agent/session` covers `qaCore.ts`, and a parity test pins the hand check
+to the schema.
+
+The run ends right after a successful verdict in the session, not in the loop: `qaVerdictHooks()`
+sets `endsRun` (`singleUseTool({ endsRun: true })`, a hook on `BrowseAgentExtraToolHooks`), and
+after that call `session.continueRequest()` returns false. `runBrowseAgent` has no own flag; its
+`stopWhen` uses `continueRequest`. A host assembles QA with
+`extraTools: { qa_verdict: { ...qaVerdictHooks() } }` (plus its own `execute: executeQaVerdict`),
+the prompt section, a `createStepRecorder()` around `session.runTool`, and `qaResultOf` for `qa`.
 
 ## Example and smoke
 

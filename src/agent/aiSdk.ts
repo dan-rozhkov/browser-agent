@@ -27,9 +27,9 @@ import {
   createStepRecorder,
   executeQaVerdict,
   qaResultOf,
-  qaVerdictDefinition,
   qaVerdictHooks,
-} from "./qa.js";
+} from "./qaCore.js";
+import { qaVerdictDefinition } from "./qa.js";
 import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
 import { type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
@@ -236,11 +236,21 @@ function buildTools(
 /** The result fields QA mode owns. A host tool's `end` cannot set them. */
 const QA_RESERVED_FIELDS: readonly string[] = ["qa", QA_VERDICT_FIELD];
 
-function reservedFieldsDropped(end: BrowseAgentExtraToolHooks["end"]): BrowseAgentExtraToolHooks["end"] {
-  if (!end) return undefined;
-  return (output) => {
-    const fields = end(output);
-    return fields ? Object.fromEntries(Object.entries(fields).filter(([k]) => !QA_RESERVED_FIELDS.includes(k))) : fields;
+/** A copy of the hooks whose `end` cannot set QA fields. Applies to forked copies too. */
+function reservedFieldsDropped(hooks: BrowseAgentExtraToolHooks): BrowseAgentExtraToolHooks {
+  const end = hooks.end?.bind(hooks);
+  const fork = hooks.fork?.bind(hooks);
+  return {
+    guard: hooks.guard?.bind(hooks),
+    begin: hooks.begin?.bind(hooks),
+    endsRun: hooks.endsRun?.bind(hooks),
+    end: end
+      ? (output) => {
+          const fields = end(output);
+          return fields ? Object.fromEntries(Object.entries(fields).filter(([k]) => !QA_RESERVED_FIELDS.includes(k))) : fields;
+        }
+      : undefined,
+    fork: fork ? () => reservedFieldsDropped(fork()) : undefined,
   };
 }
 
@@ -273,11 +283,9 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const qaOn = opts.qa !== undefined && opts.qa !== false;
   const onScreenshot = typeof opts.qa === "object" ? opts.qa.onScreenshot : undefined;
   if (qaOn && opts.extraTools?.[QA_VERDICT_TOOL]) throw new Error(`runBrowseAgent: qa mode owns the tool name ${QA_VERDICT_TOOL}; rename your extra tool.`);
-  // The verdict is set once qa_verdict succeeded; the tool loop ends then (the verdict is the last step).
-  let verdictSet = false;
   const extras: Record<string, BrowseAgentExtraTool> = {
     ...opts.extraTools,
-    ...(qaOn ? { [QA_VERDICT_TOOL]: { ...qaVerdictHooks(), ...qaVerdictDefinition, execute: async (input: unknown) => { const out = executeQaVerdict(input); if (parseJsonObject(out).ok === true) verdictSet = true; return out; } } } : {}),
+    ...(qaOn ? { [QA_VERDICT_TOOL]: { ...qaVerdictHooks(), ...qaVerdictDefinition, execute: async (input: unknown) => executeQaVerdict(input) } } : {}),
   };
   const trail = qaOn ? createStepRecorder() : undefined;
   const executeTool = async (call: BrowseAgentToolCall, ctx: { signal: AbortSignal }) => {
@@ -317,7 +325,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     deadlineMs: opts.deadlineMs,
     maxRequests: opts.maxRequests,
     baseTools,
-    extraTools: Object.fromEntries(Object.entries(extras).map(([n, e]) => [n, { guard: e.guard?.bind(e), begin: e.begin?.bind(e), end: qaOn && n !== QA_VERDICT_TOOL ? reservedFieldsDropped(e.end?.bind(e)) : e.end?.bind(e), fork: e.fork?.bind(e) }])),
+    extraTools: Object.fromEntries(Object.entries(extras).map(([n, e]) => [n, qaOn && n !== QA_VERDICT_TOOL ? reservedFieldsDropped(e) : { guard: e.guard?.bind(e), begin: e.begin?.bind(e), endsRun: e.endsRun?.bind(e), end: e.end?.bind(e), fork: e.fork?.bind(e) }])),
     executeTool,
   });
 
@@ -360,7 +368,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
             prompt: text,
             tools: buildTools(session, opts, defs, [...baseTools], extras),
             // Called after a step that ended with tool results. False ends the loop.
-            stopWhen: () => verdictSet || !session.continueRequest(),
+            stopWhen: () => !session.continueRequest(),
             abortSignal: session.signal,
             providerOptions: opts.providerOptions as never,
             maxOutputTokens: opts.maxOutputTokens,

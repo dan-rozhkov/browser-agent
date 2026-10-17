@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
+import * as sessionEntry from "../../src/agent/sessionEntry.js";
+import { qaVerdictSchema } from "../../src/agent/qa.js";
 
 // `agent/session` is the entry a browser bundle uses. Its JS (the TypeScript
 // output of its import graph) must not reach zod, the schemas or the
@@ -47,6 +49,70 @@ describe("agent/session entry", () => {
     }
     expect(names).toContain("session.ts");
     expect(names).toContain("fixtureSetup.ts");
+    expect(names).toContain("qaCore.ts");
+  });
+
+  it("exports the QA core", () => {
+    for (const n of ["QA_VERDICT_TOOL", "QA_PRINCIPAL", "QA_PROMPT_SECTION", "QA_VERDICT_FIELD", "qaVerdictHooks", "executeQaVerdict", "qaOutcome", "qaResultOf", "createStepRecorder"]) {
+      expect(sessionEntry, n).toHaveProperty(n);
+    }
+    expect(sessionEntry).not.toHaveProperty("qaVerdictSchema");
+  });
+
+  it("a successful qa_verdict ends the run: continueRequest is false; a failed one does not", async () => {
+    const { createBrowseAgentSession, qaVerdictHooks, executeQaVerdict } = sessionEntry;
+    const s = createBrowseAgentSession({ extraTools: { qa_verdict: { ...qaVerdictHooks() } }, executeTool: async (c) => executeQaVerdict(c.input) });
+    await s.runTool({ toolName: "qa_verdict", input: { verdict: "maybe", reason: "x" }, toolCallId: "1" });
+    expect(s.continueRequest()).toBe(true);
+    await s.runTool({ toolName: "qa_verdict", input: { verdict: "fail", reason: "broken" }, toolCallId: "2" });
+    expect(s.continueRequest()).toBe(false);
+  });
+
+  it("the run stays ended after a guard-refused second verdict, with no extra step", async () => {
+    const { createBrowseAgentSession, qaVerdictHooks, executeQaVerdict } = sessionEntry;
+    const s = createBrowseAgentSession({ extraTools: { qa_verdict: qaVerdictHooks() }, executeTool: async (c) => executeQaVerdict(c.input) });
+    await s.runTool({ toolName: "qa_verdict", input: { verdict: "pass", reason: "ok" }, toolCallId: "1" });
+    expect(await s.runTool({ toolName: "qa_verdict", input: { verdict: "fail", reason: "x" }, toolCallId: "2" })).toContain("already called");
+    expect(s.continueRequest()).toBe(false);
+    expect(s.steps).toBe(1);
+  });
+
+  it("a verdict at the request cap ends the run as done, not step_limit", async () => {
+    const { createBrowseAgentSession, qaVerdictHooks, executeQaVerdict } = sessionEntry;
+    const s = createBrowseAgentSession({ maxRequests: 1, extraTools: { qa_verdict: qaVerdictHooks() }, executeTool: async (c) => executeQaVerdict(c.input) });
+    const driver = {
+      send: async () => {
+        await s.runTool({ toolName: "qa_verdict", input: { verdict: "pass", reason: "ok" }, toolCallId: "1" });
+        s.continueRequest();
+      },
+      stop() {},
+      messages: () => [],
+    };
+    expect((await s.run("goal", driver)).status).toBe("done");
+  });
+
+  it("endsRun survives a fork (the session forks the hooks)", async () => {
+    const { createBrowseAgentSession, singleUseTool } = sessionEntry;
+    const hooks = singleUseTool({ name: "t", isSuccess: (p) => p.ok === true, endsRun: true });
+    const s = createBrowseAgentSession({ extraTools: { t: hooks }, executeTool: async () => '{"ok":true}' });
+    await s.runTool({ toolName: "t", input: {}, toolCallId: "1" });
+    expect(s.continueRequest()).toBe(false);
+    // The shared hooks object is untouched: a new session starts open.
+    const s2 = createBrowseAgentSession({ extraTools: { t: hooks }, executeTool: async () => '{"ok":false}' });
+    await s2.runTool({ toolName: "t", input: {}, toolCallId: "1" });
+    expect(s2.continueRequest()).toBe(true);
+  });
+
+  it("the hand check of qa_verdict agrees with qaVerdictSchema", () => {
+    const inputs: unknown[] = [
+      { verdict: "pass", reason: " ok " }, { verdict: "fail", reason: "x".repeat(500) }, { verdict: "fail", reason: "x".repeat(501) },
+      { verdict: "pass", reason: "   " }, { verdict: "maybe", reason: "x" }, { verdict: "pass" }, { reason: "x" },
+      { verdict: "pass", reason: 5 }, null, "pass", [], undefined,
+    ];
+    for (const input of inputs) {
+      const ok = JSON.parse(sessionEntry.executeQaVerdict(input)).ok === true;
+      expect(ok, JSON.stringify(input)).toBe(qaVerdictSchema.safeParse(input).success);
+    }
   });
 
   it("the package maps the subpath to the built entry", () => {
