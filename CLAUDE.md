@@ -26,6 +26,7 @@ src/policy/       decideStep / planGoal / locateTarget, step policies, schemas, 
 src/loop/         runBrowseTask, action cache, loop guard, BrowserBridge, BrowseBackend, KeyValueStorage
 src/adapters/     playwright, systemoneHttp, aiSdk, httpBackend, localBackend, controllerBridge
 src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; execute.ts + executeEntry.ts = the one executor of the seven browse tools, zod-free `agent/execute`; aiSdk.ts = runBrowseAgent (peer ai)
+src/qa/           QA suite: runQaSuite (parallel agents, one scenario and one browser each; steps come from the `onToolCall` hook of runBrowseAgent), returns a typed `QaSuiteReport` and writes or formats nothing (the consumer decides); subpath `qa` (no `node:*`); the Playwright helper `playwrightContexts` is in adapters/playwright
 src/fixture/      PageFixture: types, parsePageFixture, applyFixture, captureFixture, network rule matcher (isomorphic, zod-free; subpath `fixture`)
 src/index.ts      root barrel: controller + policy + loop + fixture (NOT adapters)
 test/<layer>/     mirrors src; examples/ is type-checked by lint
@@ -39,7 +40,7 @@ them in step when you add an entry point.
 - No imports from the pen-editor repos, Electron, Fastify or Zustand. This
   package must stand alone.
 - `src/loop`, `src/policy` and `src/fixture` are isomorphic (they run in browsers): no
-  `node:*` imports, no `ai` import outside `src/adapters/aiSdk.ts` and `src/agent/aiSdk.ts` (the rest of `src/agent` is `ai`-free), no
+  `node:*` imports, no `ai` import outside `src/adapters/aiSdk.ts`, `src/agent/aiSdk.ts` and `src/qa/` (the rest of `src/agent` is `ai`-free; `src/qa` runs `runBrowseAgent`, and `src/qa/` has no `node:*` import), no
   Playwright outside `src/adapters/playwright.ts`.
 - The loop never imports the policy at runtime (type-only imports are fine).
   It reaches the policy only through a `BrowseBackend`.

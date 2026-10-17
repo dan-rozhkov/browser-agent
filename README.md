@@ -105,7 +105,7 @@ await close();
 | `@sideform/browser-agent/controller` | controller layer |
 | `@sideform/browser-agent/policy` | policy layer |
 | `@sideform/browser-agent/loop` | loop layer |
-| `@sideform/browser-agent/adapters/playwright` | `PlaywrightTarget`, `connectOverCdp` |
+| `@sideform/browser-agent/adapters/playwright` | `PlaywrightTarget`, `connectOverCdp`, `playwrightContexts` |
 | `@sideform/browser-agent/adapters/systemone-http` | `createSystemOneClient` |
 | `@sideform/browser-agent/adapters/ai-sdk` | `aiSdkTextModel` |
 | `@sideform/browser-agent/adapters/http-backend` | `createHttpBackend` |
@@ -115,6 +115,7 @@ await close();
 | `@sideform/browser-agent/agent` | the browse agent mode: prompt, tool definitions, limits, session core (zod only, no `ai`) |
 | `@sideform/browser-agent/agent/session` | the light part of `/agent`: limits, result helpers, session core, `singleUseTool`. No zod, no schemas, no descriptions: use it in a browser bundle |
 | `@sideform/browser-agent/agent/ai-sdk` | `runBrowseAgent` (peer: `ai`) |
+| `@sideform/browser-agent/qa` | `runQaSuite` and the report types (peer: `ai`; no `node:*`) |
 
 **Name collisions at the root.** Two names exist in more than one layer.
 The root barrel exports the controller's `MAX_SNAPSHOT_ELEMENTS` (both are
@@ -208,6 +209,7 @@ loop-guard modules.
 class PlaywrightTarget implements BrowserTarget { constructor(context: BrowserContext) }
 connectOverCdp(cdpUrl: string): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }>;
 redactedError(e: unknown, secret: string): Error;
+playwrightContexts(browser: Browser, contextOptions?: BrowserContextOptions, controllerOptions?: ConstructorParameters<typeof BrowserController>[1]): () => Promise<OpenedBrowser>;  // openBrowser for runQaSuite
 
 // adapters/systemone-http
 createSystemOneClient(opts: { apiKey?: string; model?: string; baseUrl?: string;
@@ -221,7 +223,8 @@ runBrowseAgent(goal: string, opts: { model: LanguageModel; browser: BrowserBridg
   providerOptions?: Record<string, Record<string, unknown>>; extraTools?: Record<string, BrowseAgentExtraTool>;
   prompt?: string | BuildBrowseAgentPromptOptions; toolDefinitions?: BrowseToolDefinitions; screenshots?: boolean;
   toolResultImages?: boolean;
-  maxRequests?: number; deadlineMs?: number; runId?: string; maxOutputTokens?: number }): Promise<BrowseAgentResult>;
+  maxRequests?: number; deadlineMs?: number; runId?: string; maxOutputTokens?: number;
+  onToolCall?(call: { toolName: string; input: unknown; toolCallId: string; preOpen?: true }): ((result: { output?: string; error?: unknown }) => void) | void }): Promise<BrowseAgentResult>;
 
 // adapters/http-backend
 createHttpBackend(opts: { baseUrl: string; fetch?: typeof fetch;
@@ -422,6 +425,45 @@ The tool executor now serves Pen Editor and `runBrowseAgent` alike. For
 - **Unchanged**: `element` alone is still refused (before any bridge call).
   A batch with no locator has no stale-order check; an `element` entry stops
   the batch at its own error.
+
+## QA suite (`/qa`)
+
+Run a list of test scenarios with several browse agents in parallel. Each scenario
+gets its OWN browser (a new Playwright `BrowserContext`: cookies, storage and network
+mocks are per scenario), its own `PageFixture` and one agent. The model gets one extra
+tool, `qa_verdict({ verdict: "pass" | "fail", reason })`. Design:
+`docs/specs/2026-10-17-qa-suite-design.md`. Several agents on one page are not
+supported: one page has one focus, and a failure could not be attributed.
+
+```ts
+import { chromium } from "playwright-core";
+import { playwrightContexts } from "@sideform/browser-agent/adapters/playwright";
+import { runQaSuite } from "@sideform/browser-agent/qa";
+
+const browser = await chromium.launch();
+const report = await runQaSuite(
+  [
+    { id: "cart-badge", goal: "Add 2 items, check the cart badge says 2", fixture: { version: 1, fresh: true, url: "https://shop.test/" } },
+    { id: "login", goal: "Log in as the test user, check the account page opens", url: "https://shop.test/login" },
+  ],
+  { model, openBrowser: playwrightContexts(browser), concurrency: 3, providerOptions },
+);
+// report is a typed QaSuiteReport: write it, format it for a model, or show report.scenarios[i].screenshot. The package does none of that.
+await browser.close();
+```
+
+Outcome per scenario: `passed` / `failed` (the verdict), `inconclusive` (the run ended
+without a verdict), `error` (model error, timeout or step limit without a verdict, or
+`openBrowser` threw), `setup_failed` (the fixture broke; `setupStage` is kept) and
+`aborted` (`signal`; scenarios that did not start never call `openBrowser`, and a pending `openBrowser(scenario, { signal })` is not waited for: a browser that arrives late is closed). The report keeps
+the scenarios in input order, with one step per tool call of the model (`browse_open`,
+`browse_act`, ..., `qa_verdict`; built from the `onToolCall` hook of `runBrowseAgent`,
+so fixture data cannot reach the report) and a final screenshot. `concurrency` below 1 or NaN
+throws; `Infinity` runs all at once. `openBrowser(scenario, { signal })` can return any `BrowserBridge`
+(`{ browser, close }`), for example a Steel session. `close` is called in every outcome.
+
+The suite writes and formats nothing: the `QaSuiteReport` object goes back to the caller, who decides what to do with it. `examples/qa-suite.ts <scenarios.json>` runs it with OpenRouter and prints one line per scenario;
+`npm run qa-smoke` runs it with a scripted model in a real Chromium, no keys.
 
 ## Page fixtures
 

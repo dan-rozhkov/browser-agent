@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
 import type { IncomingMessage } from "node:http";
-import { PlaywrightTarget, connectOverCdp, fetchStylesheet, guardedLookup } from "../../src/adapters/playwright.js";
+import { PlaywrightTarget, connectOverCdp, fetchStylesheet, guardedLookup, playwrightContexts } from "../../src/adapters/playwright.js";
 
 vi.mock("playwright-core", () => ({
   chromium: {
@@ -627,5 +627,45 @@ describe("PlaywrightTarget.resetSession", () => {
     expect(origins).not.toContain("https://o99.test");
     expect(origins).toContain("https://o100.test");
     expect(origins).toContain("https://o599.test");
+  });
+});
+
+describe("playwrightContexts", () => {
+  it("makes a new context per call with the options, opens a page, and close closes only that context", async () => {
+    const closed: number[] = [];
+    const seen: unknown[] = [];
+    let n = 0;
+    const browser = {
+      newContext: async (opts: unknown) => {
+        seen.push(opts);
+        const id = ++n;
+        const ctx = fakeContext(async () => new FakeCdp());
+        Object.assign(ctx, { close: async () => { closed.push(id); } });
+        return ctx;
+      },
+    };
+    const open = playwrightContexts(browser as never, { viewport: { width: 800, height: 600 } });
+    const a = await open();
+    const b = await open();
+    expect(seen).toEqual([{ viewport: { width: 800, height: 600 } }, { viewport: { width: 800, height: 600 } }]);
+    expect(typeof a.browser.open).toBe("function");
+    expect(typeof a.browser.applyFixture).toBe("function");
+    await a.close();
+    expect(closed).toEqual([1]);
+    await b.close();
+    expect(closed).toEqual([1, 2]);
+  });
+
+  it("accepts controller options", async () => {
+    const browser = { newContext: async () => Object.assign(fakeContext(async () => new FakeCdp()), { close: async () => {} }) };
+    const opened = await playwrightContexts(browser as never, undefined, { cursor: false })();
+    expect(typeof opened.browser.open).toBe("function");
+  });
+
+  it("closes the context when the page cannot be made", async () => {
+    let closed = false;
+    const browser = { newContext: async () => ({ newPage: async () => { throw new Error("no page"); }, close: async () => { closed = true; } }) };
+    await expect(playwrightContexts(browser as never)()).rejects.toThrow("no page");
+    expect(closed).toBe(true);
   });
 });

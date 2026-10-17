@@ -1,4 +1,4 @@
-export type { BrowserBridge } from "./bridge.js";
+export type { BrowserBridge, OpenedBrowser } from "./bridge.js";
 export type { BrowseBackend, BrowseBackendResponse, BrowseEndpoint } from "./backend.js";
 export { memoryStorage } from "./storage.js";
 export type { KeyValueStorage } from "./storage.js";

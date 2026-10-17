@@ -217,3 +217,44 @@ describe("screenshot in the tool loop", () => {
     }
   });
 });
+
+describe("runBrowseAgent: onToolCall", () => {
+  it("reports each execution at start and at end, also the pre-open, and ignores throws", async () => {
+    const events: string[] = [];
+    const { model } = scripted([{ calls: [{ name: "browse_read", input: {} }] }, { text: "done" }]);
+    const r = await runBrowseAgent("goal", {
+      model,
+      browser: fakeBrowser(),
+      url: "https://a.test/",
+      runId: "run",
+      onToolCall(call) {
+        events.push(`start ${call.toolName} ${call.toolCallId} ${call.preOpen === true}`);
+        return (result) => {
+          events.push(`end ${call.toolName} ${typeof result.output}`);
+          throw new Error("observer bug");
+        };
+      },
+    });
+    expect(r.status).toBe("done");
+    expect(events).toEqual(["start browse_open run:open true", "end browse_open string", expect.stringMatching(/^start browse_read .* false$/), "end browse_read string"]);
+  });
+
+  it("reports a throw of a host tool and a throwing start hook does not break the run", async () => {
+    const ends: unknown[] = [];
+    const extra = { description: "x", inputSchema: z.object({}), execute: async () => { throw new Error("tool broke"); } };
+    const { model } = scripted([{ calls: [{ name: "host_tool", input: {} }] }, { text: "done" }]);
+    let first = true;
+    const r = await runBrowseAgent("goal", {
+      model,
+      browser: fakeBrowser(),
+      extraTools: { host_tool: extra },
+      onToolCall() {
+        if (first) { first = false; throw new Error("start bug"); }
+      },
+    });
+    expect(r.status).toBe("done");
+    const { model: m2 } = scripted([{ calls: [{ name: "host_tool", input: {} }] }, { text: "done" }]);
+    await runBrowseAgent("goal", { model: m2, browser: fakeBrowser(), extraTools: { host_tool: extra }, onToolCall: () => (res) => { ends.push((res.error as Error).message); } });
+    expect(ends).toEqual(["tool broke"]);
+  });
+});

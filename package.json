@@ -73,6 +73,10 @@
     "./agent/ai-sdk": {
       "types": "./dist/agent/aiSdk.d.ts",
       "default": "./dist/agent/aiSdk.js"
+    },
+    "./qa": {
+      "types": "./dist/qa/index.d.ts",
+      "default": "./dist/qa/index.js"
     }
   },
   "scripts": {
@@ -81,6 +85,7 @@
     "test": "vitest run",
     "example": "tsx examples/run-task.ts",
     "fixture-smoke": "tsx examples/fixture-smoke.ts",
+    "qa-smoke": "tsx examples/qa-smoke.ts",
     "prepare": "npm run build",
     "prepublishOnly": "node -e \"if(!process.env.GITHUB_ACTIONS){console.error('Publish only from the release workflow (.github/workflows/release.yml).');process.exit(1)}\""
   },
@@ -157,6 +162,9 @@
       ],
       "agent/ai-sdk": [
         "dist/agent/aiSdk.d.ts"
+      ],
+      "qa": [
+        "dist/qa/index.d.ts"
       ]
     }
   },

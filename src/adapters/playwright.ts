@@ -3,7 +3,7 @@
 // there is no launch path: no Chromium runs on this host.
 // Implemented optional methods: getCookies/setCookies/routeRequests/resetSession (PageFixture), isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
 // onNavigationEvent, networkStats, listFrames, executeJavaScriptInFrame, listPages/selectPage/closePage/newPage/pageHandles.
-import type { BrowserContext, Page, CDPSession, Frame, Route } from "playwright-core";
+import type { Browser, BrowserContext, BrowserContextOptions, Page, CDPSession, Frame, Route } from "playwright-core";
 import { promises as dns } from "node:dns";
 import http from "node:http";
 import https from "node:https";
@@ -11,6 +11,8 @@ import type { IncomingMessage } from "node:http";
 import zlib from "node:zlib";
 import type { Readable } from "node:stream";
 import { BrowserController } from "../controller/index.js";
+import { controllerBridge } from "./controllerBridge.js";
+import type { OpenedBrowser } from "../loop/bridge.js";
 import { isBlockedIp, isFetchableStylesheetUrl } from "../controller/captureCss.js";
 import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../controller/index.js";
 import { sleep } from "../fixture/apply.js";
@@ -625,4 +627,27 @@ export async function connectOverCdp(
     // The URL (with the API key) is inside Playwright's error text.
     throw redactedError(e, cdpUrl);
   }
+}
+
+/**
+ * An `openBrowser` for `runQaSuite`: a new `BrowserContext` per scenario, so
+ * cookies, storage and network mocks (`context.route`) are per scenario.
+ * `close` closes the context, not the browser: the host owns the browser.
+ * `controllerOptions` go to each `BrowserController` (default: its defaults, cursor on).
+ */
+export function playwrightContexts(
+  browser: Browser,
+  contextOptions?: BrowserContextOptions,
+  controllerOptions?: ConstructorParameters<typeof BrowserController>[1],
+): () => Promise<OpenedBrowser> {
+  return async () => {
+    const context = await browser.newContext(contextOptions);
+    try {
+      await context.newPage();
+      return { browser: controllerBridge(new BrowserController(new PlaywrightTarget(context), controllerOptions)), close: () => context.close() };
+    } catch (e) {
+      await context.close().catch(() => undefined);
+      throw e;
+    }
+  };
 }

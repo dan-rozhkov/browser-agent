@@ -26,6 +26,7 @@ import {
   parseJsonObject,
   type BrowseAgentExtraToolHooks,
   type BrowseAgentSession,
+  type BrowseAgentToolCall,
 } from "./session.js";
 import {
   BROWSE_AGENT_TOOL_NAMES,
@@ -117,9 +118,20 @@ export interface RunBrowseAgentOptions {
   runId?: string;
   /** Max output tokens per request. */
   maxOutputTokens?: number;
+  /**
+   * Observe every tool execution: the browse tools and the host tools, also the
+   * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
+   * execution STARTS with the model's tool name and input; the function it
+   * returns (if any) is called once when it ends, with the result string or
+   * with the error that was thrown. Calls the guard refuses or the allow-list
+   * rejects never start, so they are not reported. A throw in the hook or in
+   * the returned function is ignored. Use it for a trail of what the model did.
+   */
+  onToolCall?(call: BrowseAgentToolCall): ((result: { output?: string; error?: unknown }) => void) | void;
 }
 
-const DATA_URL = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/;
+/** Matches an image data URL: group 1 is the media type, group 2 the base64. */
+export const IMAGE_DATA_URL = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/;
 
 type ModelOutput =
   | { type: "content"; value: ({ type: "text"; text: string } | { type: "image-data"; data: string; mediaType: string })[] }
@@ -138,7 +150,7 @@ export function screenshotToModelOutput(output: unknown, opts: { attachImage?: b
   const parsed = parseJsonObject(raw);
   if (typeof parsed.imageData !== "string") return { type: "text", value: raw };
   const { imageData, ...rest } = parsed;
-  const match = DATA_URL.exec(imageData);
+  const match = IMAGE_DATA_URL.exec(imageData);
   if (opts.attachImage && match) {
     return {
       type: "content",
@@ -193,10 +205,31 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const defs = opts.toolDefinitions ?? browseToolDefinitions;
   const baseTools = BROWSE_AGENT_TOOL_NAMES.filter((n) => opts.screenshots !== false || n !== "browse_screenshot");
   const extras = opts.extraTools ?? {};
-  const executeTool = async (call: { toolName: string; input: unknown; toolCallId: string }, ctx: { signal: AbortSignal }) => {
-    const extra = extras[call.toolName];
-    if (extra) return extra.execute(call.input, { toolCallId: call.toolCallId, signal: ctx.signal });
-    return executeBrowseTool(opts.browser, call.toolName, call.input);
+  const executeTool = async (call: BrowseAgentToolCall, ctx: { signal: AbortSignal }) => {
+    let finish: ReturnType<NonNullable<RunBrowseAgentOptions["onToolCall"]>>;
+    try {
+      finish = opts.onToolCall?.(call);
+    } catch {
+      // An observer must not change the run.
+    }
+    const ended = (result: { output?: string; error?: unknown }) => {
+      try {
+        finish?.(result);
+      } catch {
+        // Same.
+      }
+    };
+    try {
+      const extra = extras[call.toolName];
+      const output = extra
+        ? await extra.execute(call.input, { toolCallId: call.toolCallId, signal: ctx.signal })
+        : await executeBrowseTool(opts.browser, call.toolName, call.input);
+      ended({ output });
+      return output;
+    } catch (error) {
+      ended({ error });
+      throw error;
+    }
   };
   const session = createBrowseAgentSession({
     signal: opts.signal,

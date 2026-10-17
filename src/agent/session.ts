@@ -36,6 +36,8 @@ export interface BrowseAgentToolCall {
   toolName: string;
   input: unknown;
   toolCallId: string;
+  /** True for the `browse_open` the session makes itself for `url`, before the model runs. Absent for the model's calls. */
+  preOpen?: true;
 }
 
 /**
@@ -142,7 +144,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 /** Keys the session owns. A host field with one of these names cannot replace them. */
 const CORE_KEYS: ReadonlySet<string> = new Set(["status", "answer", "steps", "error"]);
 
-function positiveNumber(name: string, value: number): number {
+/** Returns `value` when it is a positive number (`Infinity` too); else throws a `RangeError` that names it. */
+export function positiveNumber(name: string, value: number): number {
   if (typeof value !== "number" || Number.isNaN(value) || value <= 0) {
     throw new RangeError(`${name} must be a positive number (got ${String(value)}).`);
   }
@@ -282,6 +285,7 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
           toolName: "browse_open",
           input: { url: runOpts.url },
           toolCallId: `${runOpts.toolCallId ?? "browse_agent"}:open`,
+          preOpen: true,
         });
         if (stopped || timedOut) return result(timedOut ? "timeout" : "aborted");
         text = preOpenText(goal, runOpts.url, opened);

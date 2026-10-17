@@ -103,3 +103,9 @@ export interface BrowserBridge {
   captureCheckpoint?(token?: string): Promise<unknown>;
 }
 
+
+/** A browser a host opened for one task: the bridge, and how to close it. */
+export interface OpenedBrowser {
+  browser: BrowserBridge;
+  close(): Promise<void>;
+}

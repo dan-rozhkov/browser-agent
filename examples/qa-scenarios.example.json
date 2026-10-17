@@ -1,0 +1,19 @@
+[
+  {
+    "id": "home-heading",
+    "title": "The home page has a main heading",
+    "goal": "Check that the page shows a main heading that says \"Example Domain\".",
+    "url": "https://example.com"
+  },
+  {
+    "id": "more-info-link",
+    "title": "The page links to more information",
+    "goal": "Check that the page has a link with the text \"More information\", and that it opens a page about example domains.",
+    "fixture": {
+      "version": 1,
+      "fresh": true,
+      "url": "https://example.com",
+      "expect": { "text": "Example Domain" }
+    }
+  }
+]
