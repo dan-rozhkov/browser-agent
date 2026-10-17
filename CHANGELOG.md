@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.20](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.19...v0.2.20) (2026-10-17)
+
+
+### Bug Fixes
+
+* **agent:** QA prompt lets the scenario submit forms and ends on the verdict ([a5753b1](https://github.com/dan-rozhkov/browser-agent/commit/a5753b1c2f1ad74f4c39f75df8db7fe4620994b7))
+
 ## [0.2.19](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.18...v0.2.19) (2026-10-17)
 
 
