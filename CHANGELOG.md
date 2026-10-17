@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.19](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.18...v0.2.19) (2026-10-17)
+
+
+### Features
+
+* **agent:** zod-free QA core in agent/session, endsRun hook ([8e675fb](https://github.com/dan-rozhkov/browser-agent/commit/8e675fb7d0282c5ea590446cc6dbc70ecaf10699))
+
 ## [0.2.18](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.17...v0.2.18) (2026-10-17)
 
 
