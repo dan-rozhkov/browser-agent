@@ -6,7 +6,6 @@
 ### Features
 
 * **agent:** QA mode in runBrowseAgent, replaces runQaSuite ([d50018b](https://github.com/dan-rozhkov/browser-agent/commit/d50018b52b0a8be0d48ceb422bae2b6f32eccffe))
-* **qa:** runQaSuite, parallel QA scenarios in isolated browsers ([73780ab](https://github.com/dan-rozhkov/browser-agent/commit/73780abbc6138a25f6d7642e615ab81a80ce94e6))
 
 ## [0.2.17](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.16...v0.2.17) (2026-10-16)
 
