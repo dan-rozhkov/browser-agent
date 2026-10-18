@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.22](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.21...v0.2.22) (2026-10-18)
+
+
+### Bug Fixes
+
+* emulation fidelity and data-URL screenshots found by the live smoke ([6de0ccb](https://github.com/dan-rozhkov/browser-agent/commit/6de0ccbaf9bfef8e10a6100353cc1223ffabf9c4))
+
 ## [0.2.21](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.20...v0.2.21) (2026-10-18)
 
 
