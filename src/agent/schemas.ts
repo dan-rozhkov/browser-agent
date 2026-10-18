@@ -7,6 +7,7 @@
 // `y`) adds those fields with `.extend({...})`. Extended keys come after
 // `annotate`, which is the order Pen Editor's schema has today.
 import { z } from "zod";
+import { VIEWPORT_DEVICES, VIEWPORT_MAX, VIEWPORT_MIN } from "../shared/viewport.js";
 
 // Shared by browse_act's top-level fields and its `actions` batch entries
 // (see the tool below) — one place for the action enum so both stay in
@@ -25,6 +26,7 @@ export const browseActionEnum = z.enum([
   "upload",
   "reload",
   "wait",
+  "viewport",
 ]);
 
 const BROWSE_ACT_SINGLE_FIELDS = [
@@ -37,6 +39,10 @@ const BROWSE_ACT_SINGLE_FIELDS = [
   "key",
   "ms",
   "files",
+  "device",
+  "width",
+  "height",
+  "mobile",
 ] as const;
 
 const BROWSE_ACT_NO_ELEMENT_ACTIONS = new Set([
@@ -44,6 +50,7 @@ const BROWSE_ACT_NO_ELEMENT_ACTIONS = new Set([
   "forward",
   "reload",
   "wait",
+  "viewport",
 ]);
 
 // One file of an `upload` batch: the same strict-mode placeholders ("" / null) are removed.
@@ -77,6 +84,10 @@ function stripBrowseActPlaceholders(
       continue;
     }
     if ((key === "amount" || key === "ms") && value === 0) continue;
+    // `viewport`: width and height 0 mean "absent", except with device "custom" (there 0 is an error).
+    if ((key === "width" || key === "height") && value === 0 && entry.device !== "custom") continue;
+    // `mobile: false` is the default of a custom viewport, so dropping it loses nothing.
+    if (key === "mobile" && value === false) continue;
     out[key] = value;
   }
   // index 0 is a real element, but next to an explicit target/element (or
@@ -176,6 +187,11 @@ export const uploadFileSchema = z
 const FILES_DESCRIPTION =
   "Files for upload: 1-5 entries, 2 MB decoded in total. Each is { name, mimeType?, and one of text | base64 | sample }.";
 
+const viewportSize = z.number().int().min(VIEWPORT_MIN).max(VIEWPORT_MAX);
+
+const DEVICE_DESCRIPTION =
+  "Device for the viewport action: iphone-15, pixel-8, ipad, desktop-1440, desktop-1920, custom (needs width and height), or reset (back to the start state).";
+
 /** One entry of browse_act's `actions` batch. */
 export function createBrowseActEntrySchema(opts: BrowseActSchemaOptions = {}) {
   return z.object({
@@ -188,6 +204,10 @@ export function createBrowseActEntrySchema(opts: BrowseActSchemaOptions = {}) {
     key: z.string().optional(),
     ms: z.number().max(15000).optional(),
     files: z.array(uploadFileSchema).min(1).max(5).optional(),
+    device: z.enum(VIEWPORT_DEVICES).optional(),
+    width: viewportSize.optional(),
+    height: viewportSize.optional(),
+    mobile: z.boolean().optional(),
   });
 }
 
@@ -238,6 +258,10 @@ export function createBrowseActInputSchema(opts: BrowseActSchemaOptions = {}) {
           .optional()
           .describe("Milliseconds to wait. Used by wait, default 3000, hard cap 15000."),
         files: z.array(uploadFileSchema).min(1).max(5).optional().describe(FILES_DESCRIPTION),
+        device: z.enum(VIEWPORT_DEVICES).optional().describe(DEVICE_DESCRIPTION),
+        width: viewportSize.optional().describe(`Viewport width in CSS pixels, ${VIEWPORT_MIN} to ${VIEWPORT_MAX}. Used by viewport with device custom.`),
+        height: viewportSize.optional().describe(`Viewport height in CSS pixels, ${VIEWPORT_MIN} to ${VIEWPORT_MAX}. Used by viewport with device custom.`),
+        mobile: z.boolean().optional().describe("Set true for a phone-like viewport (touch, mobile layout). Used by viewport with device custom, default false."),
         actions: z
           .array(createBrowseActEntrySchema(opts))
           .min(1)

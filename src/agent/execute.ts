@@ -2,9 +2,11 @@
 // `BrowserBridge`. Pen Editor's frontend handlers (src/lib/tools/browser/*) are
 // thin wrappers over this: they plug in what only the host has (the
 // natural-language `element` locator, its own "not available" texts and the
-// canvas placement after a screenshot). Imports only ../loop/*, so it stays
-// zod-free (entry: `agent/execute`).
+// canvas placement after a screenshot). Imports only ../loop/* and ../shared/*, so it stays
+// zod-free (entry: `agent/execute`); ../shared/* is zod-free too, which is what the
+// boundary allows next to ../loop/*.
 import type { BrowserBridge } from "../loop/bridge.js";
+import { parseViewportArgs } from "../shared/viewport.js";
 import { resultError, takeSnapshot, type SnapshotResult } from "../loop/shared.js";
 
 const MAX_BATCH_ACTIONS = 10;
@@ -125,6 +127,10 @@ function validateActionArgs(action: string, rest: Record<string, unknown>): stri
   if (action === "upload" && !(Array.isArray(rest.files) && rest.files.length > 0)) {
     return `browse_act: action "upload" requires a non-empty "files" array.`;
   }
+  if (action === "viewport") {
+    const viewport = parseViewportArgs(rest);
+    if (!viewport.ok) return viewport.error;
+  }
   return null;
 }
 
@@ -221,6 +227,11 @@ async function performOne(
   }
 
   // `element` beside an index/target, or absent: it is dropped, the bridge does not know the field.
+  // `viewport` takes no element: a bad call is refused here, before the bridge.
+  if (rest.action === "viewport") {
+    const refusal = validateActionArgs("viewport", rest);
+    if (refusal) return err(refusal);
+  }
   if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
   return callBridge(() => browser.act(rest), opts);
 }
@@ -270,21 +281,23 @@ function reconcileResolvedSnapshot(result: Record<string, unknown>): Record<stri
 }
 
 /**
- * An `element` entry re-snapshots the page, which makes the batch's
- * `snapshotId` stale for every index-based entry after it. Returns the index
- * of the offending `element` entry, or `undefined` when the order is fine.
+ * An `element` entry re-snapshots the page, and a `viewport` entry changes the layout: both make the
+ * batch's `snapshotId` stale for every index-based entry after them. Returns the offending entry
+ * (the first one of either kind), or `undefined` when the order is fine. `elements` false: only
+ * `viewport` entries count (the host cannot locate elements).
  */
-function findStaleOrderViolation(entries: unknown[]): number | undefined {
-  let elementEntryIndex: number | undefined;
+function findStaleOrderViolation(entries: unknown[], elements: boolean): { at: number; kind: "element" | "viewport" } | undefined {
+  let breaker: { at: number; kind: "element" | "viewport" } | undefined;
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const obj = entry as Record<string, unknown>;
-    if (elementEntryIndex === undefined) {
-      if (routesToElement(obj)) elementEntryIndex = i;
+    if (breaker === undefined) {
+      if (obj.action === "viewport") breaker = { at: i, kind: "viewport" };
+      else if (elements && routesToElement(obj)) breaker = { at: i, kind: "element" };
       continue;
     }
-    if (obj.index != null) return elementEntryIndex;
+    if (obj.index != null) return breaker;
   }
   return undefined;
 }
@@ -309,15 +322,19 @@ export async function runActionsBatch(
   if (actions.length > MAX_BATCH_ACTIONS) return err(`browse_act: "actions" accepts at most ${MAX_BATCH_ACTIONS} entries.`);
   if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
 
-  if (opts.locateElement) {
-    const staleOrderIndex = findStaleOrderViolation(actions);
-    if (staleOrderIndex != null) {
+  const staleOrder = findStaleOrderViolation(actions, Boolean(opts.locateElement));
+  if (staleOrder) {
+    if (staleOrder.kind === "viewport") {
       return err(
-        `browse_act: actions[${staleOrderIndex}] uses "element", which re-snapshots the page and ` +
-          "makes the batch's snapshotId stale for every index-based entry after it — element entries " +
-          "re-snapshot the page; put them last or split the batch.",
+        `browse_act: actions[${staleOrder.at}] is a viewport action, which changes the layout and makes the batch's ` +
+          "snapshotId stale for every index-based entry after it. Put viewport last in a batch, or take a new snapshot after it.",
       );
     }
+    return err(
+      `browse_act: actions[${staleOrder.at}] uses "element", which re-snapshots the page and ` +
+        "makes the batch's snapshotId stale for every index-based entry after it — element entries " +
+        "re-snapshot the page; put them last or split the batch.",
+    );
   }
 
   const deadline = clock() + BATCH_DEADLINE_MS;

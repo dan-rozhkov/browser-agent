@@ -214,6 +214,8 @@ function languageScript(locale: string): string {
  * (never throws: a page that is already closed has nothing to clear). Throws
  * when an override cannot be set; the overrides set before it are cleared first.
  */
+const originalUserAgents = new WeakMap<BrowserPageHandle, string>();
+
 export async function installEmulation(page: BrowserPageHandle, resolved: ResolvedEmulation): Promise<() => Promise<void>> {
   const send: Cdp = (method, params) => page.sendCdp!(method, params);
   const undo: Array<() => Promise<unknown>> = [];
@@ -240,6 +242,8 @@ export async function installEmulation(page: BrowserPageHandle, resolved: Resolv
     if (resolved.userAgent !== undefined) {
       const env = await readEnvironment(page);
       const original = env.userAgent;
+      // The first read of a page is the real string (a later one may be an override): kept for `clearDeviceEmulation`.
+      if (original && !originalUserAgents.has(page)) originalUserAgents.set(page, original);
       const profile = resolved.profile;
       // `Emulation.setLocaleOverride` changes Intl only; the Accept-Language header follows this call's
       // `acceptLanguage`, so with a locale it travels in the same override (no extra call).
@@ -360,4 +364,56 @@ export async function installEmulation(page: BrowserPageHandle, resolved: Resolv
   }
   let done: Promise<void> | undefined;
   return () => (done ??= clear());
+}
+
+/**
+ * Clears the device layer of an emulation on a page: metrics, touch and the user agent.
+ * Never throws. The `viewport` action calls it before it installs a new device over an
+ * emulation it cannot undo piece by piece (the fixture's clear is all or nothing).
+ * An empty user agent removes the override; a target that refuses it gets the original string read
+ * before the override. Returns false when a step could not be done (the page may keep an override).
+ */
+export async function clearDeviceEmulation(page: BrowserPageHandle): Promise<boolean> {
+  let ok = true;
+  const attempt = async (step: () => Promise<unknown>): Promise<boolean> => {
+    try {
+      await step();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!(await attempt(() => page.sendCdp!("Emulation.clearDeviceMetricsOverride")))) ok = false;
+  if (!(await attempt(() => page.sendCdp!("Emulation.setTouchEmulationEnabled", { enabled: false })))) ok = false;
+  if (!(await attempt(() => page.sendCdp!("Emulation.setUserAgentOverride", { userAgent: "" })))) {
+    const original = originalUserAgents.get(page);
+    if (original === undefined || !(await attempt(() => page.sendCdp!("Emulation.setUserAgentOverride", { userAgent: original })))) ok = false;
+  }
+  return ok;
+}
+
+/**
+ * The `viewport` action over a base emulation (the fixture's, or none): the base keeps its locale,
+ * time zone, colour scheme and motion setting; its device, viewport, touch and user agent are replaced.
+ * `reset` gives the base back. Returns undefined when nothing is emulated.
+ */
+export function layerViewport(
+  base: FixtureEmulate | undefined,
+  request: { device: FixtureDevice | "reset" | "custom"; width?: number; height?: number; mobile?: boolean },
+): FixtureEmulate | undefined {
+  if (request.device === "reset") return base ? structuredClone(base) : undefined;
+  const out: FixtureEmulate = {};
+  if (base?.locale !== undefined) out.locale = base.locale;
+  if (base?.timezone !== undefined) out.timezone = base.timezone;
+  if (base?.colorScheme !== undefined) out.colorScheme = base.colorScheme;
+  if (base?.reducedMotion !== undefined) out.reducedMotion = base.reducedMotion;
+  if (request.device === "custom") out.viewport = { width: request.width!, height: request.height!, mobile: request.mobile === true };
+  else out.device = request.device;
+  return out;
+}
+
+/** What a page shows to a site as its identity: the user agent and the mobile flag. A change of it needs a reload. */
+export function emulationIdentity(emulate: FixtureEmulate | undefined): string {
+  const resolved = emulate ? resolveEmulation(emulate) : {};
+  return `${resolved.userAgent ?? ""}|${resolved.metrics?.mobile ?? false}`;
 }

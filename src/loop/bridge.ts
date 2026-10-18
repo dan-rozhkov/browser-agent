@@ -95,6 +95,14 @@ export interface BrowserBridge {
    */
   releaseFixture?(token?: string): Promise<unknown>;
   /**
+   * Ends the device emulation that browse_act `viewport` set (docs/specs/2026-10-18-qa-diagnostics-design.md,
+   * section 6): the pages go back to the state the fixture gave them, or to the real browser. Idempotent.
+   * `runBrowseAgent` calls it when a run ends, also when it applied no fixture. A host that drives the
+   * browser without `runBrowseAgent` must call it itself at the end of its run. Optional - a bridge that
+   * has it must forward it; one without it leaves the emulation to the host.
+   */
+  clearActEmulation?(): Promise<unknown>;
+  /**
    * Mid-task checkpoint (docs/specs/2026-10-16-checkpoint-design.md).
    * `startJournal` makes the browser record the agent's state-changing actions
    * (off by default, no cost while off) and returns the OWNER TOKEN of that

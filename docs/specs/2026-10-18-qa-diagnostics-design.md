@@ -304,6 +304,59 @@ type UploadFile = { name: string; mimeType?: string } & (
 - Geolocation, network throttling, offline mode.
 - Firefox/WebKit.
 
+## 6. Changing the viewport mid-run (`browse_act` action `viewport`)
+
+```ts
+{ action: "viewport", device: "iphone-15" | "pixel-8" | "ipad" | "desktop-1440" | "desktop-1920" | "custom" | "reset",
+  width?: number, height?: number, mobile?: boolean }
+```
+
+The agent can test a page on desktop, then on a phone. It is not an element action (no `index`, no `element`).
+It is also valid in an `actions` batch.
+
+- `custom` needs integer `width` and `height`, 200 to 4000; `mobile` defaults to false. For any other
+  device `width`, `height` and `mobile` are ignored. Strict-mode placeholders: `width`/`height` 0 and
+  `mobile: false` are removed by `normalizeBrowseActInput`, except `width`/`height` 0 next to `custom`, which
+  stays and is an error. The rules are in `src/shared/viewport.ts` (`parseViewportArgs`); the schema, the
+  executor (refuses a bad call before the bridge) and the controller all use them.
+- Scope: the agent's current page only. Tabs opened later are not emulated (as in section 3).
+- Mechanism, all in the controller, reusing `src/fixture/emulate.ts` (`resolveEmulation`, `installEmulation`,
+  the presets, the client hints). Each action does the same thing: clear the previous action's layer (its
+  own undo), clear the device parts of the page's fixture emulation (metrics, touch, user agent; the
+  fixture's own clear is all or nothing), then install the new emulation WHOLE. The new emulation is the
+  fixture's `locale`, `timezone`, `colorScheme` and `reducedMotion` (kept) plus the device or viewport of
+  the action (replacing the fixture's device, viewport, touch and user agent). The real user agent and hints
+  are therefore read from a clean page. `reset` installs the fixture's own emulation again if the page
+  carries one, else it only clears. A failed install clears itself and puts the page back to the fixture's state;
+  the result is `{ error: "Setting the viewport failed: ..." }`.
+- Reload: if the identity changes, the controller reloads the page (the same wait as `reload`) and the
+  result says `reloaded: true`. Identity is the user agent string and the `mobile` flag of the metrics, so
+  phone to desktop, one phone to another, and a custom `mobile` change reload; a pure size change does not.
+  The last snapshot is dropped (the layout changed); the executor attaches a fresh `snapshot`.
+- Result: `{ ok: true, viewport: { width, height, deviceScaleFactor, mobile }, device, reloaded }`. `width`,
+  `height` and the scale factor are read from the page after the change (`innerWidth`, `innerHeight`,
+  `devicePixelRatio`); if they cannot be read, the emulated metrics are used (absent with neither).
+- Page without `sendCdp`: `{ error: "This browser does not support emulation." }` with the no-effect marker.
+- Screenshots while a layer is active use the emulated capture path of section 3 (`Page.captureScreenshot`,
+  data URL), with the layer's emulation.
+- Checkpoint: the journal records no step for `viewport`, and it is not a gap. `captureCheckpoint` puts the
+  EFFECTIVE emulation into `fixture.emulate`: the layer of the current page, else the fixture's. A resumed run
+  gets the same device. With the journal on, an action that reloads declares itself like `reload` (`nav`).
+- Lifetime: the layer must not outlive the run.
+  - `BrowserController.clearActEmulation()` ends it: each page goes back to the fixture's state (or to the real
+    browser without a fixture). Idempotent, never rejects, no reload.
+  - `releaseFixture()` also clears all layers (before the fixture's own clear), so a release after any number of
+    actions leaves no override. A release without a token does this also when no fixture is active.
+  - `BrowserBridge.clearActEmulation?()` (new, optional) is forwarded by `controllerBridge`. `runBrowseAgent`
+    calls it at the end of every run, after the fixture release, also when the run used no fixture (bounded to 5 s,
+    a rejection is ignored). **Hosts that drive the browser without `runBrowseAgent` (for example Pen Editor's
+    frontend running `browse_agent` itself, or the desktop shell between runs) must call
+    `bridge.clearActEmulation()` when their run ends.** A bridge for a remote browser (cloud bridge) must forward it
+    to the controller that holds the layers; without it a phone viewport can stay on a shared browser.
+- The tool description (`describeBrowseAct`) names the action in two sentences (when to use it, that a device
+  change can reload the page, `reset`). The `browse_act` golden of the byte-identity test was updated on
+  purpose: the new enum value, the four fields and the sentences.
+
 ## Consumers (Pen Editor)
 
 - Backend: `browse_agent` gets `checks` (QA variant only) and `setup.emulate`;
@@ -315,3 +368,6 @@ type UploadFile = { name: string; mimeType?: string } & (
 - Frontend: `qa_assert` routed to `bridge.assert` + `evaluateQaChecks`; final
   checks; the new `QaResult` fields in `toJson`; tool name lists; cloud
   bridge `assert`. No UI changes.
+- `browse_act` `viewport` (section 6): backend `tools.ts` takes the new schema from the package (descriptions and
+  goldens change); the frontend/desktop/cloud bridge forwards `clearActEmulation` and calls it at the end of a
+  run that does not go through `runBrowseAgent`.

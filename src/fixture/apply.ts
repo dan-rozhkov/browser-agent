@@ -78,9 +78,14 @@ async function emulatePage(ctx: Ctx, page: BrowserPageHandle, fixture: PageFixtu
     if (ctx.signal?.aborted) throw err;
     throw new FixtureError(`${label}: setting emulation failed: ${toMessage(err)}`);
   }
-  // Registered before the abort check: a failure from here on clears it.
-  addCleanup(ctx, clear);
-  ctx.hooks?.onEmulated?.(page, emulate);
+  // Registered before the abort check: a failure from here on clears it. The host hook sees the clear first
+  // (a host registry may wrap it), and the cleanup runs whatever the hook returns.
+  let registered: (() => Promise<void>) | void = undefined;
+  try {
+    registered = ctx.hooks?.onEmulated?.(page, emulate, clear);
+  } finally {
+    addCleanup(ctx, registered ?? clear);
+  }
   throwIfAborted(ctx.signal);
 }
 

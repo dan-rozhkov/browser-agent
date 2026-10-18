@@ -66,6 +66,8 @@ const QA_SCREENSHOT_CALLBACK_MS = 15_000;
 
 /** The host's `onCapture` may take this long before the result is returned without it. */
 const CHECKPOINT_CALLBACK_MS = 15_000;
+/** Longest the run end waits for `clearActEmulation`. */
+const ACT_EMULATION_CLEAR_MS = 5_000;
 
 export interface RunBrowseAgentOptions {
   /** The chat model. Use a non-reasoning model, or switch reasoning off in `providerOptions`. */
@@ -440,12 +442,17 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     // until the task ends, whatever the outcome), stop. The stop wait is bounded, so a hung browser cannot hold a finished run.
     await checkpoint.finish(finalStatus, {
       async beforeStop(captured) {
-        // The final image first: the fixture's mocks are still live, and the page is as the run left it.
-        // The host callback waits until the release and the stop are done.
-        if (onScreenshot) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
-        // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
-        if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
-        await fixtureSetup?.release();
+        try {
+          // The final image first: the fixture's mocks are still live, and the page is as the run left it.
+          // The host callback waits until the release and the stop are done.
+          if (onScreenshot) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
+          // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
+          if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
+          await fixtureSetup?.release();
+        } finally {
+          // The emulation of browse_act `viewport` must not outlive the run, with or without a fixture.
+          await boundedCall(async () => opts.browser.clearActEmulation?.(), ACT_EMULATION_CLEAR_MS).catch(() => undefined);
+        }
       },
     });
     if (shot && onScreenshot) {

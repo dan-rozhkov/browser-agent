@@ -1338,6 +1338,42 @@ describe("emulation", () => {
   });
 });
 
+describe("viewport", () => {
+  it("the checkpoint carries the fixture's emulation overridden by the action's, and viewport is not a gap", async () => {
+    const { controller, page } = rig();
+    page.sendCdp = async () => undefined;
+    controller.startJournal();
+    const applied = await controller.applyFixture({ version: 1, url: "https://shop.test/cart", emulate: { device: "iphone-15", colorScheme: "dark" } });
+    expect(applied.ok, JSON.stringify(applied)).toBe(true);
+    const r = (await controller.act({ action: "viewport", device: "custom", width: 800, height: 600 })) as Record<string, unknown>;
+    expect(r.error).toBeUndefined();
+    const taken = ok(await controller.captureCheckpoint());
+    expect(taken.fixture.emulate).toEqual({ colorScheme: "dark", viewport: { width: 800, height: 600, mobile: false } });
+    expect(taken.complete).toBe(true);
+    await controller.act({ action: "viewport", device: "reset" });
+    expect(ok(await controller.captureCheckpoint()).fixture.emulate).toEqual({ device: "iphone-15", colorScheme: "dark" });
+  });
+
+  it("an action with no fixture is in the checkpoint, and reset removes it", async () => {
+    const { controller, page } = rig();
+    page.sendCdp = async () => undefined;
+    controller.startJournal();
+    await controller.act({ action: "viewport", device: "desktop-1440" });
+    expect(ok(await controller.captureCheckpoint()).fixture.emulate).toEqual({ device: "desktop-1440" });
+    await controller.act({ action: "viewport", device: "reset" });
+    expect("emulate" in ok(await controller.captureCheckpoint()).fixture).toBe(false);
+  });
+
+  it("a page without sendCdp fails with no effect and leaves no gap", async () => {
+    const { controller, page } = rig();
+    delete page.sendCdp;
+    controller.startJournal();
+    const r = (await controller.act({ action: "viewport", device: "ipad" })) as Record<string, unknown>;
+    expect(r.error).toBe("This browser does not support emulation.");
+    expect(ok(await controller.captureCheckpoint()).complete).toBe(true);
+  });
+});
+
 describe("upload", () => {
   const files = [{ name: "a.txt", text: "hi" }];
 

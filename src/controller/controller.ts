@@ -20,7 +20,8 @@ import { boundedCall, httpOrigin, redactUrl, redactUrls, withTimeout } from "../
 import { parsePageFixture } from "../fixture/parse.js";
 import { captureFixture, readBaseState, type BaseState } from "../fixture/capture.js";
 import { CHECKPOINT_GAPS, mergeStorage } from "../fixture/checkpoint.js";
-import { resolveEmulation } from "../fixture/emulate.js";
+import { clearDeviceEmulation, emulationIdentity, installEmulation, layerViewport, resolveEmulation } from "../fixture/emulate.js";
+import { parseViewportArgs } from "../shared/viewport.js";
 import { JournalSession, type JournalBase, type JournalCommand, type StagedAction } from "./journal.js";
 import type {
   CheckpointJournalOptions,
@@ -589,6 +590,20 @@ const PAINT_WAIT_TIMEOUT_MS = 100;
  * falls back to the DOM overlay instead of timing out the whole command. */
 const COMPOSE_MARKS_TIMEOUT_MS = 2_000;
 
+/** The real viewport of a page (`innerWidth`, `innerHeight`, `devicePixelRatio`), or undefined when it cannot be read. */
+async function readViewportSize(page: BrowserPageHandle): Promise<{ width: number; height: number; dpr: number } | undefined> {
+  try {
+    const raw: unknown = await page.executeJavaScript("JSON.stringify({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio })");
+    const read: unknown = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (isRecord(read) && typeof read.width === "number" && read.width > 0 && typeof read.height === "number" && read.height > 0 && typeof read.dpr === "number" && read.dpr > 0) {
+      return { width: read.width, height: read.height, dpr: read.dpr };
+    }
+  } catch {
+    // The caller falls back to the emulated metrics.
+  }
+  return undefined;
+}
+
 /** A browser tab's page, as the controller needs to drive it. Electron-free
  * — window.ts supplies the real implementation over a WebContentsView. */
 export interface BrowserPageHandle {
@@ -1029,7 +1044,7 @@ function validateCaptureArgs(args: unknown): { ok: true; value: ValidatedCapture
 
 // Full browser use (design doc `2026-09-23-full-browser-use-design.md`)
 // added select/press/hover/reload/wait to the original five.
-type ActAction = "click" | "type" | "select" | "press" | "hover" | "upload" | "scroll" | "back" | "forward" | "reload" | "wait";
+type ActAction = "click" | "type" | "select" | "press" | "hover" | "upload" | "scroll" | "back" | "forward" | "reload" | "wait" | "viewport";
 
 const ACT_ACTIONS: readonly ActAction[] = [
   "click",
@@ -1043,6 +1058,7 @@ const ACT_ACTIONS: readonly ActAction[] = [
   "forward",
   "reload",
   "wait",
+  "viewport",
 ];
 
 function isActAction(value: unknown): value is ActAction {
@@ -1613,9 +1629,38 @@ export class BrowserController {
    */
   async applyFixture(fixture: PageFixture, opts?: FixtureApplyOptions): Promise<FixtureApplyResult> {
     return this.runExclusive(async () => {
+      // This apply owns the "in flight" mark from its first line: a `releaseFixture()` that arrives during the
+      // early phase (the wait for a previous apply, the journal pre-read) must reach it too, not queue behind it.
+      const applyToken = Symbol("fixture-apply");
+      this.fixtureApplyInFlight = applyToken;
+      let finishApply!: () => void;
+      const applyDone = new Promise<void>((resolve) => { finishApply = resolve; });
+      const previousInFlight = this.fixtureInFlight;
+      this.fixtureInFlight = applyDone;
+      let workSettled: Promise<void> | null = null;
+      try {
+        return await this.applyFixtureOwned(fixture, opts, previousInFlight, (settled) => { workSettled = settled; });
+      } finally {
+        if (this.fixtureApplyInFlight === applyToken) this.fixtureApplyInFlight = null;
+        finishApply();
+        // An apply the deadline abandoned may still run its work: a release keeps waiting for that (bounded).
+        if (this.fixtureInFlight === applyDone) this.fixtureInFlight = workSettled;
+      }
+    });
+  }
+
+  private async applyFixtureOwned(
+    fixture: PageFixture,
+    opts: FixtureApplyOptions | undefined,
+    previousInFlight: Promise<void> | null,
+    onWork: (settled: Promise<void>) => void,
+  ): Promise<FixtureApplyResult> {
+    {
+      // One generation step for the whole replacement: a `viewport` action still running must not install into the new fixture.
+      this.actGeneration += 1;
       // A new fixture replaces the previous one, mocks included, even when the new one is invalid.
       // A release that fails (the old context is likely gone) is already marked released: it never fails this apply.
-      await this.releaseFixture().catch(() => {});
+      await this.releaseFixtureUnlocked(undefined, previousInFlight).catch(() => {});
       const parsed = parsePageFixture(fixture);
       if (!parsed.ok) return { ok: false as const, stage: "validate" as const, error: parsed.error };
       let stage: FixtureStage = "validate";
@@ -1627,7 +1672,14 @@ export class BrowserController {
       const aborted = { ok: false as const, error: "aborted" };
       // Pages this apply emulated; handed to `fixtureActive` only when the apply succeeds.
       const emulatedPages = new Set<BrowserPageHandle>();
-      const hooksBase: FixtureHooks = { onStage: (reached) => { stage = reached; }, onEmulated: (page) => { emulatedPages.add(page); } };
+      const hooksBase: FixtureHooks = {
+        onStage: (reached) => { stage = reached; },
+        // The registry holds the clear too, so the final sweep reaches it; the apply's own cleanup uses the wrapped one.
+        onEmulated: (page, _emulate, clear) => {
+          emulatedPages.add(page);
+          return this.registerEmulationClear(page, clear);
+        },
+      };
       // What a nested `open` reports, as a hook result: its drained dialogs travel up
       // (the outer drain would not see them again), and a bot-check wall fails the fixture.
       const opened = (url: string, result: BrowserCommandResult): FixtureHookResult => {
@@ -1701,7 +1753,7 @@ export class BrowserController {
               }
             }
             const work = applyParsedFixture(this.target, parsed.value, { signal, allowNetworkMocks: opts?.allowNetworkMocks }, hooks);
-            this.fixtureInFlight = work.then(() => undefined, () => undefined);
+            onWork(work.then(() => undefined, () => undefined));
             const applied = await work;
             if (!applied.ok || !applied.release) return applied as BrowserCommandResult;
             // Owned here, inside the work itself: a command the deadline abandoned still hands its mocks over.
@@ -1731,7 +1783,7 @@ export class BrowserController {
         stop.abort();
         this.lastSnapshot = null;
       }
-    });
+    }
   }
 
   /**
@@ -1744,8 +1796,14 @@ export class BrowserController {
     emulation?: { emulate: FixtureEmulate; pages: Set<BrowserPageHandle> };
   } | null = null;
   private fixtureSeq = 0;
-  /** The apply that runs now (or was abandoned by its deadline): its mocks are not in `fixtureActive` yet. */
+  /** Settles when the apply that runs now ends (and, once it was abandoned, when its work ends): what a release waits for. */
   private fixtureInFlight: Promise<void> | null = null;
+  /**
+   * The mark of the `applyFixture` that holds the command queue now (null: none). Set at the first line of the apply
+   * and cleared only by the same apply, so an abandoned apply that ends late cannot clear the mark of a newer one.
+   * While it is set, a release without a token does not queue behind the apply (it may hang until its deadline).
+   */
+  private fixtureApplyInFlight: symbol | null = null;
 
   /**
    * Removes the network mocks the last `applyFixture` installed. Idempotent.
@@ -1759,20 +1817,45 @@ export class BrowserController {
    * call releases only the fixture that token names, and does nothing when a
    * newer apply replaced it (a late finally of run A must not remove the mocks
    * of run B). Without a token it releases whatever is active.
+   *
+   * Ends with a sweep: every emulation clear the controller registered runs, so no override, init script or
+   * extra header the controller installed is left on any page.
    */
   async releaseFixture(token?: string): Promise<void> {
+    // One generation step per release: a `viewport` action still running (a timed-out one keeps going) must not install after it.
+    if (token === undefined || this.fixtureActive?.token === token) this.actGeneration += 1;
+    // An apply holds the queue (and may hang until its deadline): a release without a token must reach it, not wait behind it.
+    if (token === undefined && this.fixtureApplyInFlight !== null) return this.releaseFixtureUnlocked(token);
+    return this.runExclusive(() => this.releaseFixtureUnlocked(token));
+  }
+
+  /** `releaseFixture` inside the command queue (`applyFixture` already holds it). `waitFor` replaces the in-flight apply to wait for. */
+  private async releaseFixtureUnlocked(token?: string, waitFor?: Promise<void> | null): Promise<void> {
     if (token !== undefined && this.fixtureActive?.token !== token) return;
     if (token === undefined) {
-      const inFlight = this.fixtureInFlight;
+      const inFlight = waitFor !== undefined ? waitFor : this.fixtureInFlight;
       if (inFlight) {
         await boundedCall(() => inFlight, FIXTURE_RELEASE_WAIT_MS);
         if (this.fixtureInFlight === inFlight) this.fixtureInFlight = null;
       }
     }
     const active = this.fixtureActive;
-    if (!active || (token !== undefined && active.token !== token)) return;
+    if (!active || (token !== undefined && active.token !== token)) {
+      // No fixture to release, but a `viewport` layer may be left from a run without one.
+      if (token === undefined) {
+        await this.dropActLayers();
+        await this.sweepEmulations();
+      }
+      return;
+    }
     this.fixtureActive = null;
-    await active.release();
+    try {
+      // The layers hold the whole emulation they installed: they go first, then the fixture's own clear.
+      await this.dropActLayers();
+      await active.release();
+    } finally {
+      await this.sweepEmulations();
+    }
   }
 
   /**
@@ -2254,7 +2337,9 @@ export class BrowserController {
 
   /** The emulation the last applied fixture left active, or undefined. */
   private activeEmulation(): FixtureEmulate | undefined {
-    return this.fixtureActive?.emulation?.emulate;
+    // The `viewport` action's layer of the current page is the emulation as it is now; else the fixture's.
+    const page = this.target.currentPage();
+    return (page ? this.actLayers.get(page)?.emulate : undefined) ?? this.fixtureActive?.emulation?.emulate;
   }
 
   private withActiveEmulation(opts?: FixtureCaptureOptions): FixtureCaptureOptions | undefined {
@@ -2285,7 +2370,7 @@ export class BrowserController {
     if (!isRecord(args) || !isActAction(args.action)) {
       return errorResult(
         `browse_act requires an "action" of "click", "type", "select", "press", "hover", "upload", "scroll", "back", ` +
-          `"forward", "reload", or "wait" (got ${
+          `"forward", "reload", "wait", or "viewport" (got ${
             isRecord(args) ? JSON.stringify(args.action) : JSON.stringify(args)
           }).`,
       );
@@ -2296,21 +2381,7 @@ export class BrowserController {
       return this.withCommandTimeout(async () => {
         const page = this.target.currentPage();
         if (!page) return errorResult("No browser tab is open — call browse_open first.");
-        const previousUrl = page.getURL();
-        // Armed before reload() — Wave 1 speed's event-driven equivalent of
-        // the old fixed-probe wait. Same two-phase settle as a click's
-        // navigation (addendum F) — reload() is fire-and-forget just like
-        // goBack()/goForward(), so "did it even start" and "has it
-        // finished" are separate questions. reload() always intends to
-        // navigate, so the load-stop wait below runs unconditionally,
-        // regardless of what the watcher observed (same as before this
-        // change) — it just resolves immediately if isLoading() never went
-        // true.
-        const navWatcher = this.armNavigationWatcher(page, previousUrl);
-        page.reload();
-        await navWatcher.wait();
-        navWatcher.dispose();
-        await this.waitForLoadStop(page, CLICK_LOAD_SETTLE_TIMEOUT_MS);
+        await this.reloadAndSettle(page);
         return { url: page.getURL(), title: page.getTitle() };
       }, undefined, this.journal ? { op: "nav" } : undefined);
     }
@@ -2390,6 +2461,8 @@ export class BrowserController {
     }
 
     if (action === "upload") return this.actUpload(args);
+
+    if (action === "viewport") return this.actViewport(args);
 
     if (action === "select") {
       const validated = validateIndexSnapshot(args, "select");
@@ -3573,6 +3646,309 @@ export class BrowserController {
     return { url: page.getURL(), title: page.getTitle(), ...this.diffSignatures(before, after, {}) };
   }
 
+  /** The reload of the `reload` action: armed before the call, then the two-phase settle of a navigation. */
+  private async reloadAndSettle(page: BrowserPageHandle): Promise<void> {
+    const previousUrl = page.getURL();
+    // Armed before reload() — Wave 1 speed's event-driven equivalent of
+    // the old fixed-probe wait. Same two-phase settle as a click's
+    // navigation (addendum F) — reload() is fire-and-forget just like
+    // goBack()/goForward(), so "did it even start" and "has it
+    // finished" are separate questions. reload() always intends to
+    // navigate, so the load-stop wait below runs unconditionally,
+    // regardless of what the watcher observed (same as before this
+    // change) — it just resolves immediately if isLoading() never went
+    // true.
+    const navWatcher = this.armNavigationWatcher(page, previousUrl);
+    page.reload();
+    await navWatcher.wait();
+    navWatcher.dispose();
+    await this.waitForLoadStop(page, CLICK_LOAD_SETTLE_TIMEOUT_MS);
+  }
+
+  /**
+   * Emulation the `viewport` action installed, per page. Each entry holds the emulation as it is NOW (the
+   * fixture's locale, time zone and media settings plus the device of the action) and the function that clears
+   * all of it. `releaseFixture` and `clearActEmulation` clear the entries, so nothing outlives the run.
+   */
+  private actLayers = new Map<BrowserPageHandle, { emulate: FixtureEmulate; clear: () => Promise<void> }>();
+
+  /** The clear of the fixture state `clearActEmulation` / `reset` put back on a page (not an act layer). The next swap clears it first. */
+  private fixtureRestores = new Map<BrowserPageHandle, () => Promise<void>>();
+
+  /**
+   * Every emulation clear the controller owns, per page: the fixture apply, the act layers and the fixture restores
+   * all register here, and a clear removes itself from the set when it is called. Nothing installs without
+   * registering. `sweepEmulations` calls what is left, so a clear that a swap lost track of (a stale install, a
+   * discarded restore) is still run at the end of the run.
+   */
+  private emulationClears = new Map<BrowserPageHandle, Set<() => Promise<void>>>();
+
+  /** Registers `clear` for `page`; returns the registered form (it forgets itself when it runs). */
+  private registerEmulationClear(page: BrowserPageHandle, clear: () => Promise<void>): () => Promise<void> {
+    let set = this.emulationClears.get(page);
+    if (!set) this.emulationClears.set(page, (set = new Set()));
+    const owner = set;
+    const registered = async (): Promise<void> => {
+      owner.delete(registered);
+      await clear();
+    };
+    owner.add(registered);
+    return registered;
+  }
+
+  /** `installEmulation` plus registration: the one way the controller installs an emulation itself. */
+  private async installRegistered(page: BrowserPageHandle, emulate: FixtureEmulate): Promise<() => Promise<void>> {
+    return this.registerEmulationClear(page, await installEmulation(page, resolveEmulation(emulate)));
+  }
+
+  /**
+   * Runs every registered clear of every open page (idempotent, never throws). After it no override, init script
+   * or extra header the controller installed remains. Closed pages are dropped without a CDP call.
+   */
+  private async sweepEmulations(): Promise<void> {
+    await this.pruneClosedLayers();
+    const clears = [...this.emulationClears.values()].flatMap((set) => [...set]);
+    this.emulationClears.clear();
+    this.fixtureRestores.clear();
+    for (const clear of clears) {
+      try {
+        await clear();
+      } catch {
+        // The tab is gone or refuses: nothing more to do.
+      }
+    }
+  }
+
+  /** The emulation the last applied fixture put on this page, if any. */
+  private fixtureEmulationOf(page: BrowserPageHandle): FixtureEmulate | undefined {
+    const emulation = this.fixtureActive?.emulation;
+    return emulation?.pages.has(page) ? emulation.emulate : undefined;
+  }
+
+  /** The emulation this page carries now: the `viewport` action's layer, else the fixture's. */
+  private emulationOf(page: BrowserPageHandle): FixtureEmulate | undefined {
+    return this.actLayers.get(page)?.emulate ?? this.fixtureEmulationOf(page);
+  }
+
+  /**
+   * Counts the operations that end or replace a `viewport` state: every `viewport` action, `clearActEmulation`,
+   * `releaseFixture` and `applyFixture` takes ONE step when it starts. An operation keeps the number it started with
+   * and checks it right before each step that installs, restores or records; once the number moved it undoes what it
+   * installed and stops. A timed-out action keeps running in the background, and its late steps must not outlive
+   * the run end or a newer operation. (A step already sent to the page cannot be recalled: it is undone afterwards.)
+   */
+  private actGeneration = 0;
+
+  /** Forgets the layers (and registered clears) of pages that are closed (no CDP call: their session is gone). */
+  private async pruneClosedLayers(): Promise<void> {
+    if (this.actLayers.size === 0 && this.fixtureRestores.size === 0 && this.emulationClears.size === 0) return;
+    if (!this.target.pageHandles) return;
+    let handles: { tabId: number; page: BrowserPageHandle }[];
+    try {
+      handles = await this.target.pageHandles();
+    } catch {
+      return;
+    }
+    const live = new Set(handles.map((h) => h.page));
+    for (const map of [this.actLayers, this.fixtureRestores, this.emulationClears]) {
+      for (const page of [...map.keys()]) if (!live.has(page)) map.delete(page);
+    }
+  }
+
+  /**
+   * Puts the emulation the fixture gives this page back, as the fixture's own state (not an act layer; its clear is
+   * kept in `fixtureRestores`). The fixture is read NOW, at restore time: a fixture that was released or replaced
+   * since `token` was read, or a generation that moved, restores nothing. Returns "superseded" in that case, and
+   * undoes what it installed when the check fails after the install.
+   */
+  private async restoreFixtureState(page: BrowserPageHandle, token: string | undefined, isCurrent: () => boolean): Promise<"done" | "superseded"> {
+    const stale = (): boolean => !isCurrent() || this.fixtureActive?.token !== token;
+    if (stale()) return "superseded";
+    const base = this.fixtureEmulationOf(page);
+    if (!base) return "done";
+    if (!(await clearDeviceEmulation(page))) throw new Error("the device emulation of the page could not be cleared");
+    if (stale()) return "superseded";
+    const clear = await this.installRegistered(page, base);
+    if (stale()) {
+      await clear();
+      return "superseded";
+    }
+    this.fixtureRestores.set(page, clear);
+    return "done";
+  }
+
+  /**
+   * Replaces the emulation of `page` with `next` (undefined: back to the fixture's state, or none). The previous
+   * layer is cleared first, and the device layer of the fixture too (its own clear is all or nothing), so the real
+   * user agent and hints are read clean. `next` is installed whole, locale and media settings included, and is what
+   * the next swap clears. Every step checks `isCurrent` right before it acts. Returns "superseded" (and leaves
+   * nothing of its own installed) when `isCurrent` turned false.
+   */
+  private async swapActEmulation(page: BrowserPageHandle, next: FixtureEmulate | undefined, isCurrent: () => boolean): Promise<"done" | "superseded"> {
+    if (!isCurrent()) return "superseded";
+    const previous = this.actLayers.get(page);
+    this.actLayers.delete(page);
+    const restored = this.fixtureRestores.get(page);
+    this.fixtureRestores.delete(page);
+    if (previous) await previous.clear();
+    if (restored) await restored();
+    const token = this.fixtureActive?.token;
+    if (!next) return this.restoreFixtureState(page, token, isCurrent);
+    const base = this.fixtureEmulationOf(page);
+    if (!isCurrent()) return "superseded";
+    if (base && !(await clearDeviceEmulation(page))) throw new Error("the device emulation of the page could not be cleared");
+    if (!isCurrent() || this.fixtureActive?.token !== token) return "superseded";
+    const clear = await this.installRegistered(page, next);
+    if (!isCurrent() || this.fixtureActive?.token !== token) {
+      // Abandoned while installing. A newer layer on the page owns the overrides now (our clear stays registered and
+      // runs in the final sweep); otherwise undo ours.
+      if (!this.actLayers.has(page)) await clear();
+      return "superseded";
+    }
+    this.actLayers.set(page, { emulate: next, clear });
+    return "done";
+  }
+
+  /** Drops every `viewport` layer without restoring anything (the fixture release or the run end follows). */
+  private async dropActLayers(): Promise<void> {
+    await this.pruneClosedLayers();
+    const clears = [...this.actLayers.values()].map((layer) => layer.clear).concat([...this.fixtureRestores.values()]);
+    this.actLayers.clear();
+    this.fixtureRestores.clear();
+    for (const clear of clears) {
+      try {
+        await clear();
+      } catch {
+        // The tab is gone: nothing is left to clear.
+      }
+    }
+  }
+
+  /**
+   * Ends what the `viewport` action set: the pages go back to the state the fixture gave them, or to the real
+   * browser when there is no fixture. Idempotent (a page with no layer gets no CDP call), never rejects, no reload.
+   * Runs in the command queue, after any `viewport` action still in flight. `runBrowseAgent` calls it when a run
+   * ends (the emulation must not outlive the run), also when no fixture was applied; a host that drives the
+   * controller itself calls it at the end of its own run. `releaseFixture` clears the same state. With no fixture
+   * left it ends with the same sweep as `releaseFixture`.
+   *
+   * It is bounded by `OVERRUN_GRACE_MS`. A clear that outlives the bound keeps running, so it is registered as an
+   * overrun (the next command waits for it, within the grace) and its remaining steps are cancelled.
+   */
+  async clearActEmulation(): Promise<void> {
+    const generation = (this.actGeneration += 1);
+    const isCurrent = (): boolean => this.actGeneration === generation;
+    await this.runExclusive(async () => {
+      const work = this.clearActEmulationUnlocked(isCurrent);
+      const outcome = await boundedCall(() => work, OVERRUN_GRACE_MS);
+      if (!outcome.done) {
+        // Cancel what is left of the clear (its next step sees a moved generation and undoes itself), and make the queue wait for it.
+        this.actGeneration += 1;
+        this.registerOverrun(work.then(() => undefined, () => undefined));
+      }
+    }).catch(() => undefined);
+  }
+
+  private async clearActEmulationUnlocked(isCurrent: () => boolean): Promise<void> {
+    await this.pruneClosedLayers();
+    for (const page of [...this.actLayers.keys()]) {
+      if (!isCurrent()) return;
+      try {
+        await this.swapActEmulation(page, undefined, isCurrent);
+      } catch {
+        // Best effort: the page is gone or refuses the override.
+      }
+    }
+    // With a fixture the pages keep its state; without one nothing the controller installed may remain.
+    if (isCurrent() && !this.fixtureActive) await this.sweepEmulations();
+  }
+
+  /** The next queued command waits for `settled` (bounded by `OVERRUN_GRACE_MS`): abandoned work must not overlap it. */
+  private registerOverrun(settled: Promise<void>): void {
+    const next = boundedCall(() => settled, OVERRUN_GRACE_MS).then(() => undefined);
+    // Merged, not replaced: a command nested in another one (a fixture's navigation) must not drop the outer command's pending overrun.
+    this.overrun = this.overrun ? Promise.all([this.overrun, next]).then(() => undefined) : next;
+  }
+
+  /**
+   * `act`'s `viewport`: sets the device emulation of the current page (docs/specs/2026-10-18-qa-diagnostics-design.md,
+   * section 6). The arguments are checked before the page is touched. A change of the user agent or the mobile flag
+   * reloads the page.
+   */
+  private async actViewport(args: Record<string, unknown>): Promise<BrowserCommandResult> {
+    const parsed = parseViewportArgs(args);
+    if (!parsed.ok) return errorResult(parsed.error);
+    const request = parsed.value;
+    const page = this.target.currentPage();
+    if (!page) return errorResult("No browser tab is open — call browse_open first.");
+    if (!page.sendCdp) return Object.assign(errorResult("This browser does not support emulation."), { [NO_EFFECT]: true });
+    const before = this.emulationOf(page);
+    const previousLayer = this.actLayers.get(page)?.emulate;
+    // `reset` gives back the fixture's emulation, but only on a page the fixture emulated.
+    const next = layerViewport(this.fixtureEmulationOf(page), request);
+    const reload = emulationIdentity(before) !== emulationIdentity(next);
+    const generation = (this.actGeneration += 1);
+    const isCurrent = (): boolean => this.actGeneration === generation;
+    const superseded = (): BrowserCommandResult => errorResult("Setting the viewport was cancelled: the run ended or a newer viewport change came first. Take a snapshot.");
+    const result = await this.withCommandTimeout(
+      async () => {
+        // The page is touched from here on: an index of the last snapshot may point at another element now.
+        this.lastSnapshot = null;
+        await this.pruneClosedLayers();
+        let outcome: "done" | "superseded";
+        try {
+          outcome = await this.swapActEmulation(page, next, isCurrent);
+        } catch (err) {
+          // The failed install cleared itself: put the page back to the previous layer, else to the fixture's state.
+          // Both steps check the generation, so a run that ended meanwhile gets no layer recorded.
+          this.lastSnapshot = null;
+          let restored = true;
+          try {
+            if ((await this.swapActEmulation(page, previousLayer, isCurrent)) === "superseded") return superseded();
+          } catch {
+            restored = false;
+            await this.swapActEmulation(page, undefined, isCurrent).catch(() => undefined);
+          }
+          if (!isCurrent()) return superseded();
+          const now = restored ? before : this.fixtureEmulationOf(page);
+          // The failed attempt never reloaded, so the DOM matches `before`: reload when the page now shows another identity.
+          const mismatch = emulationIdentity(now) !== emulationIdentity(before);
+          if (mismatch) await this.reloadAndSettle(page).catch(() => undefined);
+          return errorResult(
+            `Setting the viewport failed: ${toMessage(err)}` +
+              (restored ? "" : `. The previous viewport could not be put back${mismatch ? " (the page was reloaded)" : ""}; take a snapshot.`),
+          );
+        }
+        if (outcome === "superseded") return superseded();
+        this.lastSnapshot = null;
+        if (reload) {
+          await this.reloadAndSettle(page);
+          if (!isCurrent()) return superseded();
+        }
+        const metrics = next ? resolveEmulation(next).metrics : undefined;
+        const size = await readViewportSize(page);
+        const width = size?.width ?? metrics?.width;
+        const height = size?.height ?? metrics?.height;
+        const deviceScaleFactor = size?.dpr ?? metrics?.deviceScaleFactor;
+        return {
+          ok: true,
+          ...(width !== undefined && height !== undefined && deviceScaleFactor !== undefined
+            ? { viewport: { width, height, deviceScaleFactor, mobile: metrics?.mobile ?? false } }
+            : {}),
+          device: request.device,
+          reloaded: reload,
+        };
+      },
+      this.timeoutMs + 5_000,
+      reload && this.journal ? { op: "nav" } : undefined,
+    );
+    if (typeof result.error === "string" && result.error.startsWith("Browser command timed out")) {
+      this.lastSnapshot = null;
+      return { ...result, error: "Setting the viewport timed out; the page may have changed. Take a snapshot." };
+    }
+    return result;
+  }
+
   /**
    * `act`'s `upload`: limits and file shapes are checked here, before the page
    * is touched (a refusal leaves no journal trace); then UPLOAD_JS sets the
@@ -4216,7 +4592,7 @@ export class BrowserController {
 
   /** The page carries an emulation of the active fixture and can take a CDP screenshot. */
   private isEmulated(page: BrowserPageHandle): boolean {
-    return page.sendCdp !== undefined && this.fixtureActive?.emulation?.pages.has(page) === true;
+    return page.sendCdp !== undefined && this.emulationOf(page) !== undefined;
   }
 
   /**
@@ -4226,10 +4602,10 @@ export class BrowserController {
    * to `capture()`.
    */
   private async captureImage(page: BrowserPageHandle): Promise<{ imageData: string; width: number; height: number } | null> {
-    const emulation = this.fixtureActive?.emulation;
-    if (page.sendCdp && emulation?.pages.has(page)) {
+    const emulate = this.emulationOf(page);
+    if (page.sendCdp && emulate) {
       try {
-        const shot = await this.captureEmulated(page, emulation.emulate);
+        const shot = await this.captureEmulated(page, emulate);
         if (shot) return shot;
       } catch {
         // fall through to the plain capture
@@ -4262,16 +4638,10 @@ export class BrowserController {
     }
     if (width === undefined || height === undefined || dpr === undefined) {
       // No viewport override (only locale, colour scheme, ...): read the real viewport.
-      let read: unknown;
-      try {
-        const raw: unknown = await page.executeJavaScript("JSON.stringify({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio })");
-        read = typeof raw === "string" ? JSON.parse(raw) : raw;
-      } catch {
-        read = undefined;
-      }
-      width ??= isRecord(read) && typeof read.width === "number" && read.width > 0 ? read.width : 1280;
-      height ??= isRecord(read) && typeof read.height === "number" && read.height > 0 ? read.height : 800;
-      dpr = isRecord(read) && typeof read.dpr === "number" && read.dpr > 0 ? read.dpr : 1;
+      const read = await readViewportSize(page);
+      width ??= read?.width ?? 1280;
+      height ??= read?.height ?? 800;
+      dpr = read?.dpr ?? 1;
     }
     const outWidth = Math.min(width, EMULATED_SCREENSHOT_MAX_WIDTH);
     const ratio = outWidth / width;
@@ -5630,10 +6000,7 @@ export class BrowserController {
         () => undefined,
         () => undefined,
       );
-      const next = boundedCall(() => settled, OVERRUN_GRACE_MS).then(() => undefined);
-      // Merged, not replaced: a command nested in another one (a fixture's
-      // navigation) must not drop the outer command's pending overrun.
-      this.overrun = this.overrun ? Promise.all([this.overrun, next]).then(() => undefined) : next;
+      this.registerOverrun(settled);
     }
     return this.mergeDialogs(result, pageHandles, actedPage);
   }

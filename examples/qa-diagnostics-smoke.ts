@@ -1,6 +1,6 @@
 /**
  * Live smoke test of the QA diagnostics features in a real Chromium (docs/specs/2026-10-18-qa-diagnostics-design.md):
- * failed requests + console errors in results, `assert`, `PageFixture.emulate` and `act upload`.
+ * failed requests + console errors in results, `assert`, `PageFixture.emulate`, `act upload` and `act viewport`.
  * No API keys, no network: a local HTTP server and the real BrowserController + Playwright adapter.
  *
  *   npm run qa-diagnostics-smoke
@@ -351,6 +351,40 @@ try {
 
   const up5 = asRecord(await controller.act({ action: "upload", target: "#single", files: [{ name: "1.txt", text: "1" }, { name: "2.txt", text: "2" }] }));
   check('upload: >1 file to a single input -> "This input takes one file"', typeof up5.error === "string" && up5.error.includes("This input takes one file"), up5);
+
+  // ---------------------------------------------------------------- 5. viewport
+  await controller.open({ url: `${base}/emu` });
+  const readReport = async () => JSON.parse((await mainPage().textContent("#report")) ?? "{}") as { innerWidth: number; ua: string };
+  const original = await readReport();
+  await mainPage().evaluate(() => { (window as unknown as { __marker: number }).__marker = 1; });
+  const vp1 = asRecord(await controller.act({ action: "viewport", device: "iphone-15" }));
+  const afterPhone = await readReport();
+  check("viewport: iphone-15 ok, reloaded", vp1.ok === true && vp1.reloaded === true && vp1.device === "iphone-15", vp1);
+  check("viewport: iphone-15 innerWidth 393 in the result and on the page", asRecord(vp1.viewport).width === 393 && afterPhone.innerWidth === 393, { vp1, afterPhone });
+  check("viewport: iphone-15 UA is the iPhone one after the reload", afterPhone.ua.includes("iPhone"), afterPhone.ua);
+  check("viewport: the page really reloaded (marker gone)", (await mainPage().evaluate(() => (window as unknown as { __marker?: number }).__marker)) === undefined);
+  const vpShot = asRecord(await controller.screenshot({}));
+  check("viewport: screenshot under the action is a data URL", typeof vpShot.imageData === "string" && vpShot.imageData.startsWith("data:image/jpeg;base64,"), String(vpShot.imageData).slice(0, 30));
+  const vpDec = await decode(String(vpShot.imageData), [[10, 10]]);
+  check("viewport: screenshot has the aspect of the phone (393x852)", vpDec.w === 393 && vpDec.h === 852, vpDec);
+
+  const vp2 = asRecord(await controller.act({ action: "viewport", device: "custom", width: 800, height: 600 }));
+  const afterCustom = await readReport();
+  check("viewport: custom 800x600 -> 800 in result and on the page", vp2.ok === true && asRecord(vp2.viewport).width === 800 && asRecord(vp2.viewport).height === 600 && afterCustom.innerWidth === 800, { vp2, afterCustom });
+  check("viewport: custom (desktop) drops the iPhone UA, page reloaded", vp2.reloaded === true && !afterCustom.ua.includes("iPhone"), { vp2, ua: afterCustom.ua });
+  const vp3 = asRecord(await controller.act({ action: "viewport", device: "custom", width: 700, height: 500 }));
+  check("viewport: a pure size change does not reload", vp3.ok === true && vp3.reloaded === false && asRecord(vp3.viewport).width === 700, vp3);
+
+  const vp4 = asRecord(await controller.act({ action: "viewport", device: "reset" }));
+  // A pure size change does not reload, so the report written at load is stale: read the live values.
+  const afterReset = await mainPage().evaluate(() => ({ innerWidth: window.innerWidth, ua: navigator.userAgent }));
+  check("viewport: reset -> original width and UA", vp4.ok === true && asRecord(vp4.viewport).width === original.innerWidth && afterReset.innerWidth === original.innerWidth && afterReset.ua === original.ua, { vp4, original, afterReset });
+
+  await controller.act({ action: "viewport", device: "pixel-8" });
+  await controller.clearActEmulation();
+  await controller.act({ action: "reload" });
+  const afterClear = await readReport();
+  check("viewport: clearActEmulation leaves the real browser (width and UA back)", afterClear.innerWidth === original.innerWidth && afterClear.ua === original.ua, { original, afterClear });
 } catch (e) {
   failed++;
   console.log(`FAIL  smoke crashed: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);

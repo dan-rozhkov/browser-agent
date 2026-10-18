@@ -201,8 +201,8 @@ export interface FixtureHooks {
   press?(page: BrowserPageHandle, key: ParsedKeySpec): Promise<boolean>;
   /** Called when the apply enters a stage, so a host that cuts the run short can still name the stage. */
   onStage?(stage: FixtureStage): void;
-  /** Called for each page the apply emulated, so a host can track which pages carry an emulation (for example to capture them differently). */
-  onEmulated?(page: BrowserPageHandle, emulate: FixtureEmulate): void;
+  /** Called for each page the apply emulated, so a host can track which pages carry an emulation (for example to capture them differently). `clear` removes what was installed; a host may return a replacement clear (for example one that also forgets it), which the apply then uses as the cleanup. */
+  onEmulated?(page: BrowserPageHandle, emulate: FixtureEmulate, clear: () => Promise<void>): void | (() => Promise<void>);
   /** Runs a click or press `action` and settles after it like `act` does (navigation watcher, load stop, network quiet). */
   settled?<T>(page: BrowserPageHandle, action: () => Promise<T>): Promise<T>;
 }
