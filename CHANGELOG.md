@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.21](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.20...v0.2.21) (2026-10-18)
+
+
+### Features
+
+* QA diagnostics, deterministic checks, device emulation and file upload ([eb82ee1](https://github.com/dan-rozhkov/browser-agent/commit/eb82ee1a77ea6c1ecf111ec48c7f63c5200651fb))
+
 ## [0.2.20](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.19...v0.2.20) (2026-10-17)
 
 
