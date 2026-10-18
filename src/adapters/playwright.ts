@@ -334,7 +334,7 @@ class PwPage implements BrowserPageHandle {
     try {
       const buf = await this.page.screenshot({ type: "jpeg", quality: 70, scale: "css" });
       const vp = this.page.viewportSize() ?? { width: 1280, height: 800 };
-      return { imageData: buf.toString("base64"), width: vp.width, height: vp.height };
+      return { imageData: `data:image/jpeg;base64,${buf.toString("base64")}`, width: vp.width, height: vp.height };
     } catch { return null; }
   }
   /** See `fetchStylesheet`: SSRF-hardened and cookie-less. */

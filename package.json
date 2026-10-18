@@ -82,6 +82,7 @@
     "example": "tsx examples/run-task.ts",
     "fixture-smoke": "tsx examples/fixture-smoke.ts",
     "qa-smoke": "tsx examples/qa-smoke.ts",
+    "qa-diagnostics-smoke": "tsx examples/qa-diagnostics-smoke.ts",
     "prepare": "npm run build",
     "prepublishOnly": "node -e \"if(!process.env.GITHUB_ACTIONS){console.error('Publish only from the release workflow (.github/workflows/release.yml).');process.exit(1)}\""
   },

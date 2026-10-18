@@ -4,6 +4,8 @@ import type { FixtureCookie, FixtureMockResponse, FixtureRequestInfo } from "../
 export interface FakePage extends BrowserPageHandle {
   url: string;
   keys: { method: string; params?: Record<string, unknown> }[];
+  /** Every script passed to `executeJavaScript`, in order. */
+  executed: string[];
 }
 
 /** A page handle that logs into `log`. `exec` answers `executeJavaScript` (default: every script succeeds). */
@@ -16,12 +18,14 @@ export function fakePage(
   const page: FakePage = {
     url: "about:blank",
     keys: [],
+    executed: [],
     async loadURL(url) {
       log.push(`${name}: load ${url}`);
       page.url = url;
     },
     async executeJavaScript(code) {
       log.push(`${name}: js`);
+      page.executed.push(code);
       return exec(code, page);
     },
     getURL: () => page.url,

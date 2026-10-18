@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { applyFixture, fixtureBudgetMs } from "../../src/fixture/apply.js";
 import { captureFixture } from "../../src/fixture/capture.js";
 import { DEVICE_PRESETS, resolveEmulation } from "../../src/fixture/emulate.js";
@@ -7,8 +7,10 @@ import { BrowserController } from "../../src/controller/controller.js";
 import { fakeTarget, type FakePage } from "./fakes.js";
 
 const UA = "Mozilla/5.0 (X11; Linux x86_64) Chrome/126";
-/** A script answer that serves the fixture scripts and the user-agent read. */
-const exec = (code: string) => (code === "navigator.userAgent" ? UA : { ok: true, found: true });
+/** The environment read (user agent + client hints) is the one script that mentions getHighEntropyValues. */
+const isEnvRead = (code: string) => code.includes("getHighEntropyValues");
+/** A script answer that serves the fixture scripts; the environment read answers with the user agent only (no client hints). */
+const exec = (code: string) => (isEnvRead(code) ? JSON.stringify({ ua: UA }) : { ok: true, found: true });
 const methods = (page: FakePage) => page.keys.map((k) => k.method);
 
 describe("parsePageFixture emulate", () => {
@@ -89,12 +91,206 @@ describe("applyFixture emulate", () => {
     if (r.ok) expect(r.summary).toContain("emulation (iphone-15)");
   });
 
-  it("sends locale, time zone and media features", async () => {
+  /** Makes the fake page answer Page.addScriptToEvaluateOnNewDocument with an identifier, like Chromium. */
+  const withScriptId = (page: FakePage) => {
+    const base = page.sendCdp!;
+    page.sendCdp = async (m, p) => {
+      await base(m, p);
+      return m === "Page.addScriptToEvaluateOnNewDocument" ? { identifier: "script-7" } : undefined;
+    };
+  };
+
+  it("a locale alone: header + init script, no user-agent read or override; release removes both", async () => {
     const t = fakeTarget({ exec });
-    await applyFixture(t, { version: 1, emulate: { locale: "de-DE", timezone: "Europe/Berlin", colorScheme: "dark", reducedMotion: true } });
     const page = t.pages.get(1)!;
-    expect(page.keys).toEqual([
-      { method: "Emulation.setLocaleOverride", params: { locale: "de-DE" } },
+    withScriptId(page);
+    const r = await applyFixture(t, { version: 1, emulate: { locale: "de-DE", timezone: "Europe/Berlin", colorScheme: "dark", reducedMotion: true } });
+    if (!r.ok || !r.release) throw new Error("expected a release");
+    expect(methods(page)).not.toContain("Emulation.setUserAgentOverride");
+    expect(page.keys.find((k) => k.method === "Network.setExtraHTTPHeaders")?.params).toEqual({ headers: { "Accept-Language": "de-DE,de;q=0.9" } });
+    const script = String(page.keys.find((k) => k.method === "Page.addScriptToEvaluateOnNewDocument")?.params?.source);
+    expect(script).toContain('"de-DE"');
+    expect(script).toContain('["de-DE","de"]');
+    expect(script).toContain("Navigator.prototype");
+    expect(methods(page)).toEqual(expect.arrayContaining(["Emulation.setLocaleOverride", "Emulation.setTimezoneOverride", "Emulation.setEmulatedMedia"]));
+    // exactly one script ran: the language script for the open document. No environment (user agent) read.
+    const scripts = t.log.filter((l) => l === "main: js");
+    expect(scripts).toHaveLength(1);
+    expect(page.executed.filter(isEnvRead)).toEqual([]);
+    expect(page.executed).toEqual([script]);
+    page.keys.length = 0;
+    await r.release();
+    expect(page.keys).toContainEqual({ method: "Page.removeScriptToEvaluateOnNewDocument", params: { identifier: "script-7" } });
+    expect(page.keys).toContainEqual({ method: "Network.setExtraHTTPHeaders", params: { headers: {} } });
+    expect(methods(page)).not.toContain("Emulation.setUserAgentOverride");
+  });
+
+  it("a bare language subtag gives a plain Accept-Language value", async () => {
+    const t = fakeTarget({ exec });
+    await applyFixture(t, { version: 1, emulate: { locale: "de" } });
+    const page = t.pages.get(1)!;
+    expect(page.keys.find((k) => k.method === "Network.setExtraHTTPHeaders")?.params).toEqual({ headers: { "Accept-Language": "de" } });
+    expect(String(page.keys.find((k) => k.method === "Page.addScriptToEvaluateOnNewDocument")?.params?.source)).toContain('["de"]');
+  });
+
+  /** Makes the named CDP method reject, like a target that refuses it. */
+  const rejecting = (page: FakePage, method: string) => {
+    const base = page.sendCdp!;
+    page.sendCdp = async (m, p) => {
+      await base(m, p);
+      if (m === method) throw new Error(`no ${method}`);
+      return m === "Page.addScriptToEvaluateOnNewDocument" ? { identifier: "script-9" } : undefined;
+    };
+  };
+
+  it("a locale alone with a rejecting setExtraHTTPHeaders rolls back (no script added, header set cleared)", async () => {
+    const t = fakeTarget({ exec });
+    const page = t.pages.get(1)!;
+    rejecting(page, "Network.setExtraHTTPHeaders");
+    const r = await applyFixture(t, { version: 1, emulate: { locale: "de-DE" } });
+    expect(r.ok).toBe(false);
+    expect(methods(page)).not.toContain("Page.addScriptToEvaluateOnNewDocument");
+    expect(methods(page)).not.toContain("Emulation.setLocaleOverride");
+    expect(page.keys.filter((k) => k.method === "Network.setExtraHTTPHeaders")).toEqual([
+      { method: "Network.setExtraHTTPHeaders", params: { headers: { "Accept-Language": "de-DE,de;q=0.9" } } },
+    ]);
+  });
+
+  it("a locale alone with a rejecting addScriptToEvaluateOnNewDocument rolls back the header", async () => {
+    const t = fakeTarget({ exec });
+    const page = t.pages.get(1)!;
+    rejecting(page, "Page.addScriptToEvaluateOnNewDocument");
+    const r = await applyFixture(t, { version: 1, emulate: { locale: "de-DE" } });
+    expect(r.ok).toBe(false);
+    expect(page.keys.filter((k) => k.method === "Network.setExtraHTTPHeaders")).toEqual([
+      { method: "Network.setExtraHTTPHeaders", params: { headers: { "Accept-Language": "de-DE,de;q=0.9" } } },
+      { method: "Network.setExtraHTTPHeaders", params: { headers: {} } },
+    ]);
+    expect(methods(page)).not.toContain("Emulation.setLocaleOverride");
+  });
+
+  it("a locale with a device preset puts acceptLanguage in the device user-agent override; one clear", async () => {
+    const t = fakeTarget({ exec });
+    const r = await applyFixture(t, { version: 1, emulate: { device: "iphone-15", locale: "fr-FR" } });
+    if (!r.ok || !r.release) throw new Error("expected a release");
+    const page = t.pages.get(1)!;
+    const ua = page.keys.filter((k) => k.method === "Emulation.setUserAgentOverride");
+    expect(ua).toHaveLength(1);
+    expect(ua[0]!.params).toMatchObject({ acceptLanguage: "fr-FR,fr", platform: "iPhone" });
+    expect(String(ua[0]!.params?.userAgent)).toContain("iPhone");
+    expect(methods(page)).not.toContain("Network.setExtraHTTPHeaders");
+    expect(methods(page)).not.toContain("Page.addScriptToEvaluateOnNewDocument");
+    page.keys.length = 0;
+    await r.release();
+    expect(page.keys.filter((k) => k.method === "Emulation.setUserAgentOverride")).toEqual([{ method: "Emulation.setUserAgentOverride", params: { userAgent: "" } }]);
+  });
+
+  it("a locale with an explicit user agent sends both in one override; release clears it once", async () => {
+    const t = fakeTarget({ exec });
+    const r = await applyFixture(t, { version: 1, emulate: { userAgent: "Mine/1", locale: "fr-FR" } });
+    if (!r.ok || !r.release) throw new Error("expected a release");
+    const page = t.pages.get(1)!;
+    const ua = page.keys.filter((k) => k.method === "Emulation.setUserAgentOverride");
+    expect(ua).toHaveLength(1);
+    expect(ua[0]!.params).toMatchObject({ userAgent: "Mine/1", acceptLanguage: "fr-FR,fr" });
+    expect(ua[0]!.params).not.toHaveProperty("platform");
+    // hints unreadable (the fake answers with the user agent only): no invented metadata
+    expect(ua[0]!.params).not.toHaveProperty("userAgentMetadata");
+    expect(methods(page)).not.toContain("Network.setExtraHTTPHeaders");
+    page.keys.length = 0;
+    await r.release();
+    expect(page.keys.filter((k) => k.method === "Emulation.setUserAgentOverride")).toEqual([{ method: "Emulation.setUserAgentOverride", params: { userAgent: "" } }]);
+  });
+
+  const hintsJson = JSON.stringify({
+    ua: "Mozilla/5.0 (Macintosh) Chrome/131.0.0.0 Safari/537.36",
+    brands: [{ brand: "Chromium", version: "131" }, { brand: "Not_A Brand", version: "24" }],
+    platform: "macOS",
+    h: { fullVersionList: [{ brand: "Chromium", version: "131.0.6778.86" }], platformVersion: "14.5.0", architecture: "arm", bitness: "64", wow64: true },
+  });
+  const hintsExec = (code: string) => (isEnvRead(code) ? hintsJson : { ok: true, found: true });
+  type Sent = { userAgent: string; platform?: string; acceptLanguage?: string; userAgentMetadata?: Record<string, unknown> };
+  const sentUa = (t: ReturnType<typeof fakeTarget>) => t.pages.get(1)!.keys.find((k) => k.method === "Emulation.setUserAgentOverride")!.params as unknown as Sent;
+
+  it("an iOS preset sends userAgent + platform and NO userAgentMetadata (Safari has no UA Client Hints)", async () => {
+    for (const [device, platform] of [["iphone-15", "iPhone"], ["ipad", "iPad"]] as const) {
+      const t = fakeTarget({ exec: hintsExec });
+      await applyFixture(t, { version: 1, emulate: { device, locale: "fr-FR" } });
+      const p = sentUa(t);
+      expect(p.platform).toBe(platform);
+      expect(p.userAgent).toContain(platform);
+      expect(p.acceptLanguage).toBe("fr-FR,fr");
+      expect(p).not.toHaveProperty("userAgentMetadata");
+    }
+  });
+
+  it("the Android preset takes the real browser's Chrome version and brands as reported", async () => {
+    const t = fakeTarget({ exec: hintsExec });
+    await applyFixture(t, { version: 1, emulate: { device: "pixel-8" } });
+    const p = sentUa(t);
+    expect(p.userAgent).toContain("Android 14; Pixel 8");
+    expect(p.userAgent).toContain("Chrome/131.0.0.0");
+    expect(p.platform).toBe("Linux armv8l");
+    expect(p.userAgentMetadata).toMatchObject({
+      brands: [{ brand: "Chromium", version: "131" }, { brand: "Not_A Brand", version: "24" }],
+      fullVersionList: [{ brand: "Chromium", version: "131.0.6778.86" }],
+      platform: "Android",
+      platformVersion: "14.0.0",
+      model: "Pixel 8",
+      mobile: true,
+      wow64: true,
+    });
+  });
+
+  it("the Android preset with unreadable hints builds metadata from the user agent's Chrome version only", async () => {
+    const t = fakeTarget({ exec });
+    await applyFixture(t, { version: 1, emulate: { device: "pixel-8" } });
+    const p = sentUa(t);
+    expect(p.platform).toBe("Linux armv8l");
+    expect(p.userAgent).toContain("Chrome/126.0.0.0");
+    expect(p.userAgentMetadata).toMatchObject({
+      brands: [{ brand: "Chromium", version: "126" }, { brand: "Not.A/Brand", version: "8" }],
+      platform: "Android",
+      mobile: true,
+    });
+    expect(JSON.stringify(p.userAgentMetadata)).not.toContain("Google Chrome");
+  });
+
+  it("an explicit user agent keeps the real browser's platform and wow64; mobile follows viewport.mobile", async () => {
+    const t = fakeTarget({ exec: hintsExec });
+    await applyFixture(t, { version: 1, emulate: { userAgent: "Mine/1", viewport: { width: 400, height: 800, mobile: true } } });
+    const p = sentUa(t);
+    expect(p).not.toHaveProperty("platform");
+    expect(p.userAgentMetadata).toMatchObject({ platform: "macOS", platformVersion: "14.5.0", architecture: "arm", mobile: true, wow64: true });
+  });
+
+  it("reads user agent and hints in one script; a page that never answers counts as unreadable after the timeout", async () => {
+    const t = fakeTarget({ exec: hintsExec });
+    await applyFixture(t, { version: 1, emulate: { userAgent: "Mine/1" } });
+    expect(t.pages.get(1)!.executed.filter(isEnvRead)).toHaveLength(1);
+    vi.useFakeTimers();
+    try {
+      const hang = fakeTarget({ exec: (code) => (isEnvRead(code) ? new Promise(() => {}) : { ok: true, found: true }) });
+      const pending = applyFixture(hang, { version: 1, emulate: { userAgent: "Mine/1" } });
+      await vi.advanceTimersByTimeAsync(2100);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(sentUa(hang)).toEqual({ userAgent: "Mine/1" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a desktop preset sends no user-agent override", async () => {
+    const t = fakeTarget({ exec });
+    await applyFixture(t, { version: 1, emulate: { device: "desktop-1440" } });
+    expect(methods(t.pages.get(1)!)).not.toContain("Emulation.setUserAgentOverride");
+  });
+
+  it("sends time zone and media features without a locale", async () => {
+    const t = fakeTarget({ exec });
+    await applyFixture(t, { version: 1, emulate: { timezone: "Europe/Berlin", colorScheme: "dark", reducedMotion: true } });
+    expect(t.pages.get(1)!.keys).toEqual([
       { method: "Emulation.setTimezoneOverride", params: { timezoneId: "Europe/Berlin" } },
       { method: "Emulation.setEmulatedMedia", params: { features: [{ name: "prefers-color-scheme", value: "dark" }, { name: "prefers-reduced-motion", value: "reduce" }] } },
     ]);
@@ -308,7 +504,7 @@ describe("BrowserController emulation", () => {
     const c = new BrowserController(t);
     expect((await c.applyFixture({ version: 1, url: "https://a.test/", emulate: { device: "iphone-15" } })).ok).toBe(true);
     const shot = await c.screenshot({});
-    expect(shot).toMatchObject({ imageData: jpeg, width: 393, height: 852 });
+    expect(shot).toMatchObject({ imageData: `data:image/jpeg;base64,${jpeg}`, width: 393, height: 852 });
     const call = page.keys.find((k) => k.method === "Page.captureScreenshot")!;
     expect(call.params).toMatchObject({ format: "jpeg", quality: 70, clip: { width: 393, height: 852, scale: 1 / 3 } });
     expect(plain()).toBe(0);

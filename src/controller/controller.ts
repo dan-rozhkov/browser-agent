@@ -4221,7 +4221,7 @@ export class BrowserController {
 
   /**
    * One screenshot of `page`. While an emulation is active on the page, `Page.captureScreenshot`
-   * (JPEG, quality 70, at most 1280 px wide, raw base64 like `capture()`) replaces `page.capture()`:
+   * (JPEG, quality 70, at most 1280 px wide, a `data:image/jpeg;base64,` URL like `capture()`) replaces `page.capture()`:
    * Electron's `capturePage` captures the view, not the emulated viewport. A CDP failure falls back
    * to `capture()`.
    */
@@ -4283,7 +4283,7 @@ export class BrowserController {
     });
     const data = isRecord(raw) && typeof raw.data === "string" ? raw.data : "";
     if (!data) return null;
-    return { imageData: data, width: Math.round(outWidth), height: Math.round(height * ratio) };
+    return { imageData: `data:image/jpeg;base64,${data}`, width: Math.round(outWidth), height: Math.round(height * ratio) };
   }
 
   private async screenshotUnlocked(args: unknown): Promise<BrowserCommandResult> {

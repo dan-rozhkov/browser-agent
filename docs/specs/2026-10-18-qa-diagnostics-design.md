@@ -179,6 +179,59 @@ interface FixtureEmulate {
   `Emulation.setDeviceMetricsOverride`, `setTouchEmulationEnabled`,
   `setUserAgentOverride`, `setLocaleOverride`, `setTimezoneOverride`,
   `setEmulatedMedia` (`prefers-color-scheme`, `prefers-reduced-motion`).
+- User-agent override: only for an explicit `userAgent` or a mobile preset (a
+  desktop preset sends none). The user agent and the client hints of the real
+  browser are read in ONE `executeJavaScript` round-trip before the override,
+  with a 2 s timeout (a timeout or an unreadable `navigator.userAgentData`
+  means "hints unreadable"). Per case:
+  - iPhone / iPad preset: `userAgent` + `platform` ("iPhone"/"iPad") (+
+    `acceptLanguage`) and NO `userAgentMetadata`. Real iOS Safari has no UA
+    Client Hints; an override without metadata makes Chromium disable them
+    (live: `navigator.userAgentData` exists with empty `brands`, `mobile`
+    false, `platform` "").
+  - Android preset (pixel-8): the preset UA string is a template; its Chrome
+    version is replaced by the real browser's major (from the Chromium /
+    Google Chrome brand of the hints, else from the browser's own UA), so UA
+    string and brands agree. Metadata carries the brands and `fullVersionList`
+    as the browser reports them (nothing is invented), `wow64` as reported,
+    `platform` "Android", `platformVersion`, `model`, `mobile: true`. With
+    unreadable hints the metadata is built from the UA's Chrome version only:
+    brands `["Chromium", "Not.A/Brand"]`, platform "Android".
+  - Explicit `userAgent`: the real browser's hints (brands, platform,
+    architecture, bitness, `wow64`) with `mobile` from `viewport.mobile`. With
+    unreadable hints: the UA (+ `acceptLanguage`) without metadata; no platform
+    or brand is invented.
+- Emulated screenshots return a `data:image/jpeg;base64,` URL, the same format as
+  `page.capture()` (the Playwright adapter's `capture()` now returns it too).
+- `locale` and `navigator.language` / `Accept-Language`: `setLocaleOverride` alone
+  changes `Intl` only (found by the live smoke `npm run qa-diagnostics-smoke`).
+  Both paths end in the same header `de-DE,de;q=0.9` and the same
+  `navigator.languages` `["de-DE","de"]` (a locale without a region gives just
+  the locale; the smoke compares locale-only with locale + pixel-8).
+  - When the fixture also sets a UA override (explicit `userAgent` or a mobile
+    device preset), `acceptLanguage` goes into that same `setUserAgentOverride`
+    call (no extra call). The field is a plain list (`de-DE,de`): Chromium adds
+    the `;q=` weights itself and derives `navigator.languages` from it (live:
+    sending `de-DE,de;q=0.9` there gives `de-DE,de;q=0.9;q=0.9`).
+  - Otherwise the UA is not touched (an override without `userAgentMetadata`
+    disables UA Client Hints). The fixture sends `Network.enable` (left
+    enabled; both shipped hosts already enable Network), then
+    `Network.setExtraHTTPHeaders` `{ "Accept-Language": "de-DE,de;q=0.9" }` and
+    `Page.addScriptToEvaluateOnNewDocument` with a script that defines
+    `navigator.language` and `navigator.languages` (`[locale, base]`, deduped)
+    as configurable getters on `Navigator.prototype`. The fixture applies
+    emulation before the start URL loads, so the init script covers the run's
+    documents; it also runs once in the document that is open at apply time.
+  - `setExtraHTTPHeaders` replaces the session's WHOLE extra-header set (CDP
+    keeps one set per session) at apply, for the whole run, and again at
+    release (`{ headers: {} }`). A host that sets its own extra headers through
+    CDP loses them from apply on, and must re-apply them after `release()`.
+  - Limit: the locale-only path covers the tab's top document session only.
+    Out-of-process iframes and workers keep the real browser language.
+  - `release()` calls `removeScriptToEvaluateOnNewDocument(identifier)` and
+    `setExtraHTTPHeaders({ headers: {} })`. An already loaded document keeps
+    the patched `navigator.language` until it navigates. A failure in apply
+    rolls back like the other overrides.
 - A target whose page has no `sendCdp` → `setup_failed`, stage `emulate`,
   "This browser does not support emulation."
 - `release()` clears every override it set (`clearDeviceMetricsOverride`,
