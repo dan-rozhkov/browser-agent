@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.23](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.22...v0.2.23) (2026-10-18)
+
+
+### Features
+
+* **agent:** browse_act viewport action to change device emulation mid-run ([180243d](https://github.com/dan-rozhkov/browser-agent/commit/180243d97a213e8d7946bc17f86292473e3cd00e))
+
 ## [0.2.22](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.21...v0.2.22) (2026-10-18)
 
 
