@@ -1,6 +1,6 @@
 {
   "name": "@sideform/browser-agent",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "description": "Goal-driven browser agent: page controller, step policy and browse_task loop, decoupled from pen-editor.",
   "type": "module",
   "license": "MIT",
