@@ -181,7 +181,7 @@ describe("browse_act batch: stopping on errors", () => {
   it("an unsupported element action inside a batch stops it with the same message as a single call", async () => {
     bridgeWith({ snapshot: [FINAL] });
     const e =
-      'browse_act: "element" is only supported for click, type, select, hover, and press actions (got "scroll"). Use target or index instead.';
+      'browse_act: "element" is only supported for click, type, select, hover, press, and upload actions (got "scroll"). Use target or index instead.';
     expect(await browseAct({ actions: [{ action: "scroll", element: "x" }] })).toBe(
       j({ results: [{ error: e }], completed: 0, stoppedAt: 0, error: e, snapshot: FINAL })
     );

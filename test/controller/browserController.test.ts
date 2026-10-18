@@ -4882,7 +4882,7 @@ describe("BrowserController — Wave 3 reliability", () => {
   });
 
   describe("console error ring buffer", () => {
-    it("act attaches consoleErrors (max 5) when the tab reports new ones", async () => {
+    it("act attaches consoleErrors (max 20) when the tab reports new ones", async () => {
       const drainConsoleErrors = vi.fn(() => ["TypeError: boom", "ReferenceError: x is not defined"]);
       const page = makeFakePage({
         drainConsoleErrors,
@@ -4894,6 +4894,20 @@ describe("BrowserController — Wave 3 reliability", () => {
       const result = await controller.act({ action: "click", target: "Go" });
       expect(result).toMatchObject({ consoleErrors: ["TypeError: boom", "ReferenceError: x is not defined"] });
       expect(drainConsoleErrors).toHaveBeenCalledTimes(1);
+    });
+
+    it("act keeps the last 20 distinct consoleErrors and counts the older ones", async () => {
+      const drainConsoleErrors = vi.fn(() => Array.from({ length: 25 }, (_, i) => `Error ${i}`));
+      const page = makeFakePage({
+        drainConsoleErrors,
+        executeJavaScript: vi.fn((code: string) =>
+          isSignatureCall(code) || isCursorCall(code) ? Promise.resolve({ ok: true }) : Promise.resolve({ matched: "Go" }),
+        ),
+      });
+      const result = (await new BrowserController(makeFakeTarget(page)).act({ action: "click", target: "Go" })) as { consoleErrors: string[]; consoleErrorsDropped: number };
+      expect(result.consoleErrors).toHaveLength(20);
+      expect(result.consoleErrors[19]).toBe("Error 24");
+      expect(result.consoleErrorsDropped).toBe(5);
     });
 
     it("perform omits consoleErrors entirely when there are none", async () => {
@@ -6017,4 +6031,70 @@ describe("capture", () => {
     expect(await controller.capture({})).toEqual({ error: "Page is too large to capture (3.4M characters, limit 3.0M)." });
   });
 
+});
+
+describe("BrowserController act upload", () => {
+  const uploadCalls = (mock: ReturnType<typeof vi.fn>) => mock.mock.calls.filter((c) => (c[0] as string).includes("var viaInput"));
+
+  function uploadRig(answer: Record<string, unknown> = { ok: true, uploaded: ["a.txt"], via: "input" }) {
+    const executeJavaScript = vi.fn((code: string) => {
+      if (isSignatureCall(code)) {
+        return Promise.resolve({ url: "https://example.com/", title: "Example", nodeCount: 1, textLength: 0, textHash: 0, mainImageSrc: "", scrollY: 0, focusedValueLength: 0 });
+      }
+      if ((code as string).includes("var viaInput")) return Promise.resolve(answer);
+      return Promise.resolve({ ok: true });
+    });
+    const page = makeFakePage({ executeJavaScript });
+    return { controller: new BrowserController(makeFakeTarget(page), { cursor: false }), executeJavaScript };
+  }
+
+  it("runs UPLOAD_JS with base64 files and returns ok, uploaded, via and the change evidence", async () => {
+    const { controller, executeJavaScript } = uploadRig();
+    const result = await controller.act({ action: "upload", target: "#f", files: [{ name: "a.txt", text: "hi" }] });
+    expect(result).toMatchObject({ ok: true, uploaded: ["a.txt"], via: "input", url: "https://example.com/" });
+    expect(result).toHaveProperty("changed");
+    const code = uploadCalls(executeJavaScript)[0]![0] as string;
+    expect(code).toContain('"base64":"aGk="');
+    expect(code).toContain('"mimeType":"text/plain"');
+  });
+
+  it("refuses bad files before the page is touched", async () => {
+    const { controller, executeJavaScript } = uploadRig();
+    const cases: Array<[unknown, RegExp]> = [
+      [undefined, /non-empty "files"/],
+      [Array.from({ length: 6 }, (_, i) => ({ name: `f${i}`, text: "x" })), /at most 5/],
+      [[{ name: "a/b.txt", text: "x" }], /must not contain/],
+      [[{ name: "a.bin", base64: "%%%" }], /not valid base64/],
+      [[{ name: "big.bin", base64: Buffer.alloc(2 * 1024 * 1024 + 3).toString("base64") }], /larger than 2 MB/],
+    ];
+    for (const [files, message] of cases) {
+      const result = (await controller.act({ action: "upload", target: "#f", files })) as { error: string };
+      expect(result.error).toMatch(message);
+    }
+    expect(executeJavaScript).not.toHaveBeenCalled();
+  });
+
+  it("requires a target, or an index with a snapshotId", async () => {
+    const { controller, executeJavaScript } = uploadRig();
+    const files = [{ name: "a.txt", text: "x" }];
+    expect(await controller.act({ action: "upload", files })).toHaveProperty("error");
+    expect(await controller.act({ action: "upload", index: 0, files })).toHaveProperty("error");
+    expect(executeJavaScript).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale snapshotId without running the script", async () => {
+    const { controller, executeJavaScript } = uploadRig();
+    const result = (await controller.act({ action: "upload", index: 0, snapshotId: "never-taken", files: [{ name: "a", text: "x" }] })) as { error: string };
+    expect(result.error).toMatch(/stale|unknown/i);
+    expect(uploadCalls(executeJavaScript)).toHaveLength(0);
+  });
+
+  it("passes the page script's refusal and drop result through", async () => {
+    const refused = uploadRig({ error: "This input takes one file", noEffect: true });
+    const r = await refused.controller.act({ action: "upload", target: "#f", files: [{ name: "a", text: "x" }, { name: "b", text: "y" }] });
+    expect((r as { error: string }).error).toBe("This input takes one file");
+    const dropped = uploadRig({ ok: true, uploaded: ["a"], via: "drop" });
+    const d = await dropped.controller.act({ action: "upload", target: "#zone", files: [{ name: "a", text: "x" }] });
+    expect(d).toMatchObject({ ok: true, via: "drop" });
+  });
 });

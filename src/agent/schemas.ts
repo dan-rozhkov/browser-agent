@@ -22,6 +22,7 @@ export const browseActionEnum = z.enum([
   "press",
   "hover",
   "select",
+  "upload",
   "reload",
   "wait",
 ]);
@@ -35,6 +36,7 @@ const BROWSE_ACT_SINGLE_FIELDS = [
   "amount",
   "key",
   "ms",
+  "files",
 ] as const;
 
 const BROWSE_ACT_NO_ELEMENT_ACTIONS = new Set([
@@ -43,6 +45,17 @@ const BROWSE_ACT_NO_ELEMENT_ACTIONS = new Set([
   "reload",
   "wait",
 ]);
+
+// One file of an `upload` batch: the same strict-mode placeholders ("" / null) are removed.
+function stripUploadFilePlaceholders(file: unknown): unknown {
+  if (!file || typeof file !== "object" || Array.isArray(file)) return file;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(file)) {
+    if (value === null || value === "") continue;
+    out[key] = value;
+  }
+  return out;
+}
 
 // OpenAI models on OpenRouter answer in strict mode: they fill EVERY key of
 // the schema, so unused fields arrive as "" / 0 / null, and a single action
@@ -57,6 +70,12 @@ function stripBrowseActPlaceholders(
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(entry)) {
     if (value === null || value === "") continue;
+    // An empty `files` array is the strict-mode placeholder for "no files".
+    if (key === "files" && Array.isArray(value) && value.length === 0) continue;
+    if (key === "files" && Array.isArray(value)) {
+      out[key] = value.map(stripUploadFilePlaceholders);
+      continue;
+    }
     if ((key === "amount" || key === "ms") && value === 0) continue;
     out[key] = value;
   }
@@ -116,7 +135,7 @@ export function normalizeBrowseActInput(val: unknown): unknown {
 }
 
 const ELEMENT_DESCRIPTION =
-  "Describe the element in words instead of passing target/index, e.g. \"the Continue button in the cookie banner\" or \"the site search box\". A fast model picks it from a fresh snapshot of the page in one quick call — cheaper than a browse_snapshot round trip. That snapshot becomes the new current one, so any snapshotId you already had goes stale; use the result's `resolved.snapshotId` for further index-based calls. Works for click/type/select/hover and for press's optional focus target — press resolves `element` against any focusable candidate (button, text input, or select), not click-only, so it can match a text input too.";
+  "Describe the element in words instead of passing target/index, e.g. \"the Continue button in the cookie banner\" or \"the site search box\". A fast model picks it from a fresh snapshot of the page in one quick call — cheaper than a browse_snapshot round trip. That snapshot becomes the new current one, so any snapshotId you already had goes stale; use the result's `resolved.snapshotId` for further index-based calls. Works for click/type/select/hover/upload and for press's optional focus target — press resolves `element` against any focusable candidate (button, text input, or select), not click-only, so it can match a text input too.";
 
 export interface BrowseActSchemaOptions {
   /**
@@ -127,6 +146,35 @@ export interface BrowseActSchemaOptions {
    */
   elementTargeting?: boolean;
 }
+
+/**
+ * One file for the `upload` action: a name, an optional MIME type and exactly
+ * one source. Flat on purpose (not a union): OpenAI strict mode fills every
+ * key, and `stripUploadFilePlaceholders` removes the empty ones.
+ */
+export const uploadFileSchema = z
+  .object({
+    name: z.string().min(1).max(100).describe("File name the page sees, e.g. \"avatar.png\". Up to 100 characters, no / or \\."),
+    mimeType: z.string().optional().describe("MIME type. Default: from the sample kind, else from the name."),
+    text: z.string().optional().describe("UTF-8 text content. Give exactly one of text, base64 or sample."),
+    base64: z.string().optional().describe("Raw bytes as base64. Give exactly one of text, base64 or sample."),
+    sample: z
+      .enum(["png", "jpg", "pdf", "txt", "csv"])
+      .optional()
+      .describe("A built-in tiny valid file. Give exactly one of text, base64 or sample."),
+  })
+  .superRefine((val, ctx) => {
+    const sources = [val.text, val.base64, val.sample].filter((v) => v !== undefined).length;
+    if (sources !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Give exactly one of `text`, `base64` or `sample` for each file.",
+      });
+    }
+  });
+
+const FILES_DESCRIPTION =
+  "Files for upload: 1-5 entries, 2 MB decoded in total. Each is { name, mimeType?, and one of text | base64 | sample }.";
 
 /** One entry of browse_act's `actions` batch. */
 export function createBrowseActEntrySchema(opts: BrowseActSchemaOptions = {}) {
@@ -139,6 +187,7 @@ export function createBrowseActEntrySchema(opts: BrowseActSchemaOptions = {}) {
     amount: z.number().optional(),
     key: z.string().optional(),
     ms: z.number().max(15000).optional(),
+    files: z.array(uploadFileSchema).min(1).max(5).optional(),
   });
 }
 
@@ -188,6 +237,7 @@ export function createBrowseActInputSchema(opts: BrowseActSchemaOptions = {}) {
           .max(15000)
           .optional()
           .describe("Milliseconds to wait. Used by wait, default 3000, hard cap 15000."),
+        files: z.array(uploadFileSchema).min(1).max(5).optional().describe(FILES_DESCRIPTION),
         actions: z
           .array(createBrowseActEntrySchema(opts))
           .min(1)

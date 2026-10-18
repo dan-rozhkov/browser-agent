@@ -45,6 +45,49 @@ describe("PlaywrightTarget", () => {
     expect(await target.listPages()).toEqual([]);
   });
 
+  it("records failed requests as METHOD status origin+pathname, without query or hash", async () => {
+    const cdp = new FakeCdp();
+    const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+    const h = await target.ensurePage();
+    const sent = (requestId: string, url: string, method = "GET", type = "Fetch") => cdp.emit("Network.requestWillBeSent", { requestId, type, request: { url, method } });
+    sent("1", "https://a.test/api/orders?token=secret#x", "POST");
+    cdp.emit("Network.responseReceived", { requestId: "1", response: { status: 500, url: "https://a.test/api/orders?token=secret#x" } });
+    cdp.emit("Network.loadingFinished", { requestId: "1" });
+    sent("2", "https://a.test/ok");
+    cdp.emit("Network.responseReceived", { requestId: "2", response: { status: 200 } });
+    cdp.emit("Network.loadingFinished", { requestId: "2" });
+    sent("3", "https://b.test/img.png", "GET", "Image");
+    cdp.emit("Network.loadingFailed", { requestId: "3", errorText: "net::ERR_NAME_NOT_RESOLVED" });
+    sent("4", "https://a.test/aborted");
+    cdp.emit("Network.loadingFailed", { requestId: "4", errorText: "net::ERR_ABORTED", canceled: true });
+    sent("5", "https://a.test/aborted2");
+    cdp.emit("Network.loadingFailed", { requestId: "5", errorText: "net::ERR_ABORTED" });
+    sent("6", "data:image/png;base64,AAAA", "GET", "Image");
+    cdp.emit("Network.loadingFailed", { requestId: "6", errorText: "net::ERR_FAILED" });
+    sent("7", "wss://a.test/socket", "GET", "WebSocket");
+    cdp.emit("Network.responseReceived", { requestId: "7", response: { status: 400 } });
+    sent("8", "https://a.test/beacon", "POST", "Ping");
+    cdp.emit("Network.responseReceived", { requestId: "8", response: { status: 400 } });
+    // A response with no matching request is skipped (it cannot name a method).
+    cdp.emit("Network.responseReceived", { requestId: "99", response: { status: 404 } });
+    expect(h.drainFailedRequests?.()).toEqual(["POST 500 https://a.test/api/orders", "GET net::ERR_NAME_NOT_RESOLVED https://b.test/img.png"]);
+    expect(h.drainFailedRequests?.()).toEqual([]);
+  });
+
+  it("caps the failed-request ring at 50 and each entry at 200 chars", async () => {
+    const cdp = new FakeCdp();
+    const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+    const h = await target.ensurePage();
+    for (let i = 0; i < 60; i++) {
+      cdp.emit("Network.requestWillBeSent", { requestId: `r${i}`, type: "Fetch", request: { url: `https://a.test/${"p".repeat(i === 59 ? 400 : 3)}${i}`, method: "GET" } });
+      cdp.emit("Network.responseReceived", { requestId: `r${i}`, response: { status: 404 } });
+    }
+    const drained = h.drainFailedRequests!();
+    expect(drained).toHaveLength(50);
+    expect(drained[0]).toContain("/ppp10");
+    expect(drained[49]!.length).toBeLessThanOrEqual(200);
+  });
+
   it("answers canGoBack/canGoForward from the CDP navigation history", async () => {
     const cdp = new FakeCdp();
     const ctx = fakeContext(async () => cdp, [fakePage()]);

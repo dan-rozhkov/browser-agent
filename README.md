@@ -536,6 +536,29 @@ start URL, extra tabs, steps, `expect`. Cookies need a target with `setCookies`
 uses `BrowseAgentRunOptions.setup`. Capture takes storage, URL and tabs, not the
 DOM state of a page.
 
+### Environment emulation: `emulate`
+
+`PageFixture.emulate` makes the page look like another device or environment. Design:
+`docs/specs/2026-10-18-qa-diagnostics-design.md` (section 3).
+
+```ts
+{ version: 1, url: "https://shop.test/", emulate: { device: "iphone-15", locale: "de-DE", timezone: "Europe/Berlin", colorScheme: "dark" } }
+```
+
+- Fields: `device` (preset `iphone-15`, `pixel-8`, `ipad`, `desktop-1440`, `desktop-1920`), `viewport`
+  (`width`, `height` 200..4000, `deviceScaleFactor` 0.5..4, `mobile`), `touch`, `userAgent` (max 512
+  characters), `locale` (BCP 47), `timezone` (IANA), `colorScheme`, `reducedMotion`. An explicit field
+  overrides the preset. A desktop preset keeps the browser's own user agent.
+- Applied through `page.sendCdp` after `fresh` and before `url` and `steps`, on the main tab and on `tabs`.
+  A page without `sendCdp` fails with stage `emulate` ("This browser does not support emulation.").
+  Popups and tabs opened later are NOT emulated. Geolocation is not supported.
+- `release()` (the controller's `releaseFixture`) clears every override, and the original user agent returns.
+  It is one release with the network mocks, so a fixture with only `emulate` has a release too.
+- While an emulation is active, `BrowserController.screenshot` uses `Page.captureScreenshot`
+  (JPEG, quality 70, at most 1280 px wide) because an embedder's own capture may show the view, not the
+  emulated viewport. `captureFixture` and `captureCheckpoint` include the active `emulate`, so a resumed run
+  gets the same device.
+
 ### QA start: expect, network mocks, fresh session
 
 Design: `docs/specs/2026-10-15-qa-start-design.md`. A QA host turns a fixture

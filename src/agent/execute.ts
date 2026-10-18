@@ -14,7 +14,7 @@ export const BATCH_DEADLINE_MS = 60_000;
 const ELEMENT_UNAVAILABLE = "browse_act: element targeting is not available here. Use target or index instead.";
 
 /** Default for `ExecuteBrowseToolOptions.elementActions`. */
-const DEFAULT_ELEMENT_ACTIONS: readonly string[] = ["click", "type", "select", "hover", "press"];
+const DEFAULT_ELEMENT_ACTIONS: readonly string[] = ["click", "type", "select", "hover", "press", "upload"];
 
 /** "a", "a and b", "a, b, and c": the list as the refusal text prints it. */
 function listActions(actions: readonly string[]): string {
@@ -57,7 +57,7 @@ export interface ExecuteBrowseToolOptions {
   locateElement?: ElementLocator;
   /**
    * The actions an `element` description can be resolved for: the host's
-   * locator must know each one. Default: click, type, select, hover, press.
+   * locator must know each one. Default: click, type, select, hover, press, upload.
    * The refusal text for any other action lists these.
    */
   elementActions?: readonly string[];
@@ -121,6 +121,9 @@ function validateActionArgs(action: string, rest: Record<string, unknown>): stri
   }
   if (action === "press" && !isNonEmptyString(rest.key)) {
     return `browse_act: action "press" requires a non-empty "key" field.`;
+  }
+  if (action === "upload" && !(Array.isArray(rest.files) && rest.files.length > 0)) {
+    return `browse_act: action "upload" requires a non-empty "files" array.`;
   }
   return null;
 }

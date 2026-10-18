@@ -140,6 +140,8 @@ export async function captureFixture(target: BrowserTarget, opts: FixtureCapture
     if (state.cookieError !== undefined) throw state.cookieError;
     if (state.cookies.length > 0) fixture.storage = { cookies: state.cookies };
     if (state.origins.length > 0) fixture.storage = { ...fixture.storage, origins: state.origins };
+    // The host knows which emulation is active (the controller passes it): a resumed run gets the same device.
+    if (opts.emulate) fixture.emulate = structuredClone(opts.emulate);
     return { ok: true, fixture };
   } catch (err) {
     return { ok: false, error: redactUrls(`capturing the fixture failed: ${toMessage(err)}`) };

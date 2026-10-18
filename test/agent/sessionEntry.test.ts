@@ -53,10 +53,11 @@ describe("agent/session entry", () => {
   });
 
   it("exports the QA core", () => {
-    for (const n of ["QA_VERDICT_TOOL", "QA_PRINCIPAL", "QA_PROMPT_SECTION", "QA_IRREVERSIBLE_LINE", "QA_AGENT_CLOSING", "QA_VERDICT_FIELD", "qaVerdictHooks", "executeQaVerdict", "qaOutcome", "qaResultOf", "createStepRecorder"]) {
+    for (const n of ["QA_VERDICT_TOOL", "QA_PRINCIPAL", "QA_PROMPT_SECTION", "QA_IRREVERSIBLE_LINE", "QA_AGENT_CLOSING", "QA_VERDICT_FIELD", "qaVerdictHooks", "executeQaVerdict", "qaOutcome", "qaResultOf", "createStepRecorder", "QA_ASSERT_TOOL", "parseQaChecks", "evaluateQaChecks", "executeQaAssert", "runFinalChecks", "applyFinalChecks"]) {
       expect(sessionEntry, n).toHaveProperty(n);
     }
     expect(sessionEntry).not.toHaveProperty("qaVerdictSchema");
+    expect(sessionEntry).not.toHaveProperty("qaAssertDefinition");
   });
 
   it("a successful qa_verdict ends the run: continueRequest is false; a failed one does not", async () => {

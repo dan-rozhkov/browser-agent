@@ -5,8 +5,11 @@
 // This is the zod-free core (exported from `agent/session` and `agent`); the zod
 // schema of `qa_verdict` is in qa.ts. Imports the session and result only.
 import { browseAgentErrorMessage, type BrowseAgentStatus } from "./result.js";
-import type { QaOutcome, QaResult, QaStep } from "./qaTypes.js";
+import { QA_ASSERT_TOOL, REASON_MAX_CHARS, type QaFinalSink } from "./qaChecks.js";
+import type { QaCheckRecord, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
 import { parseJsonObject, singleUseTool, type BrowseAgentExtraToolHooks, type BrowseAgentToolCall } from "./session.js";
+
+export * from "./qaChecks.js";
 
 export const QA_VERDICT_TOOL = "qa_verdict";
 /** The principal of the QA prompt ("You are a browsing subagent working for a QA engineer"). */
@@ -15,12 +18,11 @@ export const QA_PRINCIPAL = "a QA engineer";
 export const QA_RESULT_MAX_STEPS = 30;
 /** `text` values longer than this are cut in the recorded args. */
 export const QA_STEP_TEXT_MAX_CHARS = 200;
-/** `qa_verdict` reason: 1 to this many chars. */
-export const REASON_MAX_CHARS = 500;
 
 /** The prompt section of a QA run. A host with its own full prompt text must include it. */
 export const QA_PROMPT_SECTION = `You test a web app. The user message is one test scenario: do what it says in the browser, then check the expected result on the page.
-When you have checked the result, call \`${QA_VERDICT_TOOL}\` exactly once, at the end. Use verdict \`pass\` when the app behaves as the scenario expects. Use verdict \`fail\` when it does not, and give the reason in one or two sentences: what you expected and what you saw. Base the verdict only on what you saw on the page.
+To confirm an expected result, call \`${QA_ASSERT_TOOL}\`. It runs exact checks on the page: visible text, the state of an element, the value of an input, the number of matching elements, the page URL, console errors and failed requests. Use it for each result the scenario expects, before the verdict. A failed check does not end the test: look at the page, then decide.
+When you have checked the result, call \`${QA_VERDICT_TOOL}\` exactly once, at the end. Use verdict \`pass\` when the app behaves as the scenario expects. Use verdict \`fail\` when it does not, and give the reason in one or two sentences: what you expected and what you saw. Give verdict \`pass\` only when the checks you rely on passed. Base the verdict only on what you saw on the page.
 A blocked step (a CAPTCHA, a login wall, a missing page) is not a fail. Do not call \`${QA_VERDICT_TOOL}\` then: explain in your final answer what blocked you.`;
 
 /** The input of `qa_verdict`. */
@@ -29,7 +31,7 @@ export interface QaVerdict {
   reason: string;
 }
 
-export type { QaOutcome, QaResult, QaStep } from "./qaTypes.js";
+export type { QaAssertResult, QaCheck, QaCheckRecord, QaCheckResult, QaElementState, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
 
 /**
  * Checks `qa_verdict` input by hand (no zod). The rules are those of
@@ -102,11 +104,15 @@ function verdictOf(fields: Record<string, unknown>): QaVerdict | undefined {
   return parsed.ok ? parsed.value : undefined;
 }
 
+/** The run-level lists a step recorder collects (`StepRecorder.extras()`): console errors, failed requests, check records. */
+export type QaRunExtras = Pick<QaResult, "consoleErrors" | "consoleErrorsDropped" | "failedRequests" | "failedRequestsDropped" | "checks">;
+
 /**
  * Builds the `qa` field from a run result (any object with `status`, `error`
- * and the `qaVerdict` field) and the recorded steps.
+ * and the `qaVerdict` field) and the recorded steps. `extras` (from the step
+ * recorder) adds the console errors, failed requests and checks.
  */
-export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown; [k: string]: unknown }, steps: readonly QaStep[]): QaResult {
+export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown; [k: string]: unknown }, steps: readonly QaStep[], extras?: QaRunExtras): QaResult {
   const verdict = verdictOf(result);
   const outcome = qaOutcome(result.status, verdict);
   // The run's own `error` is on the result already; `reason` does not copy it.
@@ -118,6 +124,7 @@ export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown;
     ...(reason !== undefined ? { reason } : {}),
     steps: kept.map(({ ms: _ms, ...step }) => step),
     ...(steps.length > kept.length ? { stepsDropped: steps.length - kept.length } : {}),
+    ...(extras ?? {}),
   };
 }
 
@@ -135,11 +142,68 @@ function cutText(value: unknown, depth = 0): unknown {
   return out;
 }
 
-export interface StepRecorder {
+/** At most this many console errors (and as many failed requests) go into a `QaResult`. */
+export const QA_RESULT_MAX_DIAGNOSTICS = 20;
+/** The recorder remembers this many distinct entries per list (for check evaluation). */
+const DIAGNOSTICS_MEMORY = 200;
+
+export interface StepRecorder extends QaFinalSink {
   /** Pass this as `onToolCall`. */
   onToolCall(call: BrowseAgentToolCall): (result: { output?: string; error?: unknown }) => void;
   /** The steps so far in call order. A call that has not ended is not ok. */
   steps(): QaStep[];
+  /** The run-level lists for `qaResultOf`: deduped, first-seen order, capped, with dropped counters. Empty lists are absent. */
+  extras(): QaRunExtras;
+}
+
+/** A deduped, first-seen-order list of strings. */
+function createSeenList() {
+  const seen = new Set<string>();
+  const list: string[] = [];
+  let lost = 0;
+  return {
+    add(entries: unknown): void {
+      if (!Array.isArray(entries)) return;
+      for (const entry of entries) {
+        if (typeof entry !== "string" || seen.has(entry)) continue;
+        if (list.length >= DIAGNOSTICS_MEMORY) {
+          lost += 1;
+          continue;
+        }
+        seen.add(entry);
+        list.push(entry);
+      }
+    },
+    /** Adds the count of entries the controller left out of its own drain (`...Dropped`). */
+    lose(n: unknown): void {
+      if (typeof n === "number" && Number.isInteger(n) && n > 0) lost += n;
+    },
+    list: (): readonly string[] => list,
+    kept: (): string[] => list.slice(0, QA_RESULT_MAX_DIAGNOSTICS),
+    dropped: (): number => Math.max(0, list.length - QA_RESULT_MAX_DIAGNOSTICS) + lost,
+  };
+}
+
+type SeenList = ReturnType<typeof createSeenList>;
+
+/**
+ * Takes `consoleErrors` and `failedRequests` (and their `...Dropped` counters) from a tool output. A batched `browse_act`
+ * (`actions`) has them in each entry of `results` (the executor's `{ results, completed, ... }`),
+ * so the entries are read too.
+ */
+function harvestDiagnostics(output: Record<string, unknown>, consoleErrors: SeenList, failedRequests: SeenList): void {
+  const take = (o: Record<string, unknown>) => {
+    consoleErrors.add(o.consoleErrors);
+    consoleErrors.lose(o.consoleErrorsDropped);
+    failedRequests.add(o.failedRequests);
+    failedRequests.lose(o.failedRequestsDropped);
+  };
+  take(output);
+  if (!Array.isArray(output.results)) return;
+  for (const entry of output.results) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    take(entry as Record<string, unknown>);
+  }
 }
 
 /**
@@ -151,7 +215,30 @@ export interface StepRecorder {
 export function createStepRecorder(now: () => number = Date.now): StepRecorder {
   // One record per call, in call order: the step, when it started, and whether it is still running.
   const slots: { step: QaStep; started: number; open: boolean }[] = [];
+  const consoleErrors = createSeenList();
+  const failedRequests = createSeenList();
+  const checks: QaCheckRecord[] = [];
   return {
+    seenConsoleErrors: () => consoleErrors.list(),
+    seenFailedRequests: () => failedRequests.list(),
+    addChecks(records) {
+      checks.push(...records);
+    },
+    addDiagnostics(d) {
+      consoleErrors.add(d.consoleErrors);
+      consoleErrors.lose(d.consoleErrorsDropped);
+      failedRequests.add(d.failedRequests);
+      failedRequests.lose(d.failedRequestsDropped);
+    },
+    extras() {
+      return {
+        ...(consoleErrors.list().length > 0 ? { consoleErrors: consoleErrors.kept() } : {}),
+        ...(consoleErrors.dropped() > 0 ? { consoleErrorsDropped: consoleErrors.dropped() } : {}),
+        ...(failedRequests.list().length > 0 ? { failedRequests: failedRequests.kept() } : {}),
+        ...(failedRequests.dropped() > 0 ? { failedRequestsDropped: failedRequests.dropped() } : {}),
+        ...(checks.length > 0 ? { checks: [...checks] } : {}),
+      };
+    },
     onToolCall(call) {
       if (call.preOpen) return () => undefined;
       // The slot is taken when the call starts, so parallel calls keep their order.
@@ -163,7 +250,9 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
           step.ok = false;
           step.error = browseAgentErrorMessage(result.error);
         } else {
-          const error = parseJsonObject(result.output ?? "").error;
+          const parsed = parseJsonObject(result.output ?? "");
+          harvestDiagnostics(parsed, consoleErrors, failedRequests);
+          const error = parsed.error;
           if (typeof error === "string") {
             step.ok = false;
             step.error = browseAgentErrorMessage(error);

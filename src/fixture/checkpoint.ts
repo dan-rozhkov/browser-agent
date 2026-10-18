@@ -20,6 +20,7 @@ export const CHECKPOINT_GAPS = {
   noStartUrl: "the base page has no http(s) URL, so the recorded steps cannot be replayed",
   history: "history navigation inside the page cannot be replayed",
   hover: "a hover cannot be replayed",
+  upload: "an upload cannot be replayed",
   sameDocumentNav: "navigation inside the page cannot be replayed",
   optionNotUnique: "a select option has no unique value",
 } as const;

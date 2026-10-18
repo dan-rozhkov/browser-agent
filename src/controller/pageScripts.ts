@@ -6564,6 +6564,197 @@ export const HOVER_TARGET_JS = `(() => {
 })()`;
 
 /**
+ * `act`'s `upload`: sets files on an `input[type=file]` without CDP or temp
+ * files (Playwright's buffer path). Resolves the target like `hover`, then
+ * finds the input: the element itself, a file input inside it, the control of
+ * its (or its enclosing) `<label>`, the only file input in the nearest ancestor
+ * (up to 3 levels) that has one. With none, it drops the files on the
+ * element (dragenter, dragover, drop: drop zones) and reports success only when a
+ * listener cancelled dragover or drop (`preventDefault`); otherwise it is an error
+ * (with `noEffect` when the page did not change). `accept` is not enforced.
+ * Every refusal carries `noEffect`: nothing was touched.
+ * `args.files` is `[{ name, mimeType, base64 }]`, already validated.
+ */
+export const UPLOAD_JS = `(() => {
+  var args = ${ARGS_MARKER};
+
+  ${LOCATE_TARGET_JS}
+
+  var located = locateTarget(Object.assign({}, args, { skipReveal: true }));
+  var el = located.el;
+  var label = args.target !== undefined && args.target !== null ? args.target : "index " + args.index;
+  if (!el) {
+    return {
+      error: located.hidden === true ? "target is not visible (hidden element): " + label : "No element matched for upload: " + label,
+      noEffect: true,
+    };
+  }
+
+  function isFileInput(e) {
+    return !!e && e.tagName === "INPUT" && String(e.type || "").toLowerCase() === "file";
+  }
+  function labelControl(lab) {
+    if (!lab) return null;
+    var control = lab.control;
+    if (!control && lab.htmlFor) {
+      var root = lab.getRootNode ? lab.getRootNode() : document;
+      control = root && root.getElementById ? root.getElementById(lab.htmlFor) : document.getElementById(lab.htmlFor);
+    }
+    return control || null;
+  }
+
+  // Does the element (or a trigger around it) look like what opens a file picker?
+  function opensPicker(e) {
+    var trigger = e.closest ? e.closest('button, a, label, [role="button"], [role="link"], input[type="button"], input[type="submit"]') : null;
+    return !!trigger;
+  }
+
+  var input = null;
+  if (isFileInput(el)) {
+    input = el;
+  } else {
+    if (el.querySelector) input = el.querySelector('input[type="file"]');
+    if (!input && String(el.tagName).toLowerCase() === "label") {
+      var viaFor = labelControl(el);
+      if (isFileInput(viaFor)) input = viaFor;
+    }
+    if (!input && el.closest) {
+      var enclosing = el.closest("label");
+      if (enclosing) {
+        var inner = enclosing.querySelector ? enclosing.querySelector('input[type="file"]') : null;
+        var control = inner || labelControl(enclosing);
+        if (isFileInput(control)) input = control;
+      }
+    }
+    if (!input && el.parentElement && opensPicker(el)) {
+      // A sibling or cousin: the nearest ancestor (up to 3 levels) that holds exactly one file input.
+      // More than one in the nearest ancestor that holds any is ambiguous: stop, do not guess.
+      // Only for a trigger-like target (a button, link, label or the like): any other element, for
+      // example a div drop zone beside an unrelated avatar input, goes to the drop below.
+      var group = el.parentElement;
+      for (var depth = 0; group && depth < 3 && !input; depth++, group = group.parentElement) {
+        var inGroup = group.querySelectorAll ? group.querySelectorAll('input[type="file"]') : [];
+        if (inGroup.length === 1) input = inGroup[0];
+        if (inGroup.length > 0) break;
+      }
+    }
+  }
+
+  var specs = Array.isArray(args.files) ? args.files : [];
+  if (specs.length === 0) return { error: "No files given for upload.", noEffect: true };
+  if (input) {
+    if (input.disabled) return { error: "This input is disabled: " + label, noEffect: true };
+    if (specs.length > 1 && !input.multiple) return { error: "This input takes one file", noEffect: true };
+  }
+
+  var transfer;
+  var built = [];
+  try {
+    transfer = new DataTransfer();
+    for (var i = 0; i < specs.length; i++) {
+      var binary = atob(specs[i].base64);
+      var bytes = new Uint8Array(binary.length);
+      for (var b = 0; b < binary.length; b++) bytes[b] = binary.charCodeAt(b);
+      var file = new File([bytes], specs[i].name, { type: specs[i].mimeType || "" });
+      transfer.items.add(file);
+      built.push(specs[i].name);
+    }
+  } catch (err) {
+    return { error: "Could not build the files: " + (err && err.message ? err.message : String(err)), noEffect: true };
+  }
+
+  if (input) {
+    try {
+      input.files = transfer.files;
+    } catch (err) {
+      return { error: "Could not set the files on the input: " + (err && err.message ? err.message : String(err)), noEffect: true };
+    }
+    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    var viaInput = { ok: true, uploaded: built, via: "input" };
+    if (located.relocated) viaInput.relocated = true;
+    return viaInput;
+  }
+
+  penRevealIfNeeded(el);
+  var rect = el.getBoundingClientRect();
+  var types = ["dragenter", "dragover", "drop"];
+  // A drop zone accepts the drop by cancelling dragover or drop (preventDefault). Without that the
+  // browser itself would refuse the drop, so it is not reported as an upload. The observer's
+  // synchronous records tell whether the events changed the page at all.
+  var accepted = false;
+  var observer = null;
+  // The observer on the document does not see inside a shadow root. The shadow roots of the target's
+  // composed ancestors (and the target's own open one) are observed too. A CLOSED shadow root cannot
+  // be reached from a page script: a change only there is not seen, and the drop then counts as refused.
+  try {
+    observer = new MutationObserver(function () {});
+    var watchInit = { subtree: true, childList: true, attributes: true, characterData: true };
+    observer.observe(document, watchInit);
+    if (el.shadowRoot) observer.observe(el.shadowRoot, watchInit);
+    var walker = el;
+    for (var hops = 0; walker && hops < 10; hops++) {
+      var rootNode = walker.getRootNode ? walker.getRootNode() : null;
+      if (!rootNode || rootNode === document || !rootNode.host) break;
+      observer.observe(rootNode, watchInit);
+      walker = rootNode.host;
+    }
+  } catch (err) {
+    if (!observer) observer = null;
+  }
+  for (var t = 0; t < types.length; t++) {
+    var init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      dataTransfer: transfer,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    };
+    var ev;
+    try {
+      ev = new DragEvent(types[t], init);
+    } catch (err) {
+      ev = new Event(types[t], { bubbles: true, cancelable: true, composed: true });
+    }
+    if (!ev.dataTransfer) {
+      try {
+        Object.defineProperty(ev, "dataTransfer", { value: transfer });
+      } catch (err) {
+        // read-only on this engine: the listener sees no files
+      }
+    }
+    el.dispatchEvent(ev);
+    if (types[t] !== "dragenter" && ev.defaultPrevented) accepted = true;
+  }
+  var changed = true;
+  if (observer) {
+    try {
+      changed = observer.takeRecords().length > 0;
+    } catch (err) {
+      changed = true;
+    }
+    observer.disconnect();
+  }
+  if (!accepted) {
+    if (changed) {
+      // Nobody cancelled the events, but the page reacted: it may have taken the files. Report success
+      // that is not confirmed, so the agent does not retry and upload twice.
+      var unconfirmed = { ok: true, uploaded: built, via: "drop", unconfirmed: true };
+      if (located.relocated) unconfirmed.relocated = true;
+      return unconfirmed;
+    }
+    return {
+      error: "No file input or drop zone found at this element. Target the file input or the element that opens it: " + label,
+      noEffect: true,
+    };
+  }
+  var viaDrop = { ok: true, uploaded: built, via: "drop" };
+  if (located.relocated) viaDrop.relocated = true;
+  return viaDrop;
+})()`;
+
+/**
  * Focus step for `act`'s `press` action when it's given a `target`/
  * `index`+`snapshotId` to focus first (pressing a key with no element in
  * mind just goes to whatever already has focus). This script itself never
@@ -7604,4 +7795,123 @@ export const DOC_MARKER_JS = `(() => {
   ${DOC_MARKER_FN_JS}
   var marker = penDocMarker();
   return marker === null ? { ok: false } : { ok: true, marker: marker };
+})()`;
+
+/**
+ * The DOM checks of the controller command `assert` (QA diagnostics, section 2):
+ * `args.checks` is a list of `text`, `element`, `value` and `count` checks (the
+ * controller handles `url` and the console/network checks itself). Read-only: it
+ * never scrolls, clicks or stamps. Returns `{ results: [{ passed, actual?, error? }] }`, one per
+ * check in order. `actual` is a short text that explains a failure. An index check finds its
+ * element like `act` does (`args.snapshotId`, the fingerprint in `args.fingerprints[index]` for a
+ * re-mounted node); the controller has refused stale snapshots and frame indexes before. A password field never gives its value.
+ */
+export const ASSERT_JS = `(() => {
+  var args = ${ARGS_MARKER};
+
+  ${LOCATE_TARGET_JS}
+
+  function cut(s, n) {
+    s = String(s);
+    return s.length > n ? s.slice(0, n - 3) + "..." : s;
+  }
+
+  // { el } (may be null), or { error }.
+  function resolve(check) {
+    if (check.selector !== undefined) {
+      try {
+        return { el: document.querySelector(check.selector) };
+      } catch (err) {
+        return { error: "Invalid selector: " + cut(check.selector, 80) };
+      }
+    }
+    if (check.index === undefined) return { error: "No selector or index." };
+    var fp = args.fingerprints && args.fingerprints[String(check.index)];
+    return { el: findBySnapshot(args.snapshotId, check.index, fp) };
+  }
+
+  function isChecked(el) {
+    if (el.checked === true) return true;
+    return (el.getAttribute("aria-checked") || "") === "true";
+  }
+
+  function isDisabled(el) {
+    var d = false;
+    try { d = el.matches(":disabled"); } catch (err) { d = el.disabled === true; }
+    return d || (el.getAttribute("aria-disabled") || "") === "true";
+  }
+
+  function checkElement(check) {
+    var r = resolve(check);
+    if (r.error) return { passed: false, error: r.error };
+    var el = r.el;
+    var s = check.state;
+    if (s === "exists") return el ? { passed: true } : { passed: false, actual: "not found" };
+    if (s === "absent") return el ? { passed: false, actual: "found" } : { passed: true };
+    if (s === "hidden") {
+      if (!el) return { passed: true, actual: "not found" };
+      return penBoxVisible(el) ? { passed: false, actual: "visible" } : { passed: true };
+    }
+    if (!el) return { passed: false, actual: "not found" };
+    if (s === "visible") return penBoxVisible(el) ? { passed: true } : { passed: false, actual: "hidden" };
+    if (s === "enabled") return isDisabled(el) ? { passed: false, actual: "disabled" } : { passed: true };
+    if (s === "disabled") return isDisabled(el) ? { passed: true } : { passed: false, actual: "enabled" };
+    if (s === "checked") return isChecked(el) ? { passed: true } : { passed: false, actual: "unchecked" };
+    if (s === "unchecked") return isChecked(el) ? { passed: false, actual: "checked" } : { passed: true };
+    return { passed: false, error: "Unknown state." };
+  }
+
+  function checkValue(check) {
+    var r = resolve(check);
+    if (r.error) return { passed: false, error: r.error };
+    var el = r.el;
+    if (!el) return { passed: false, actual: "not found" };
+    if (typeof el.value !== "string") return { passed: false, error: "The element has no value." };
+    var secret = (el.getAttribute("type") || "").toLowerCase() === "password";
+    var v = el.value;
+    var ok = true;
+    if (check.equals !== undefined && v !== check.equals) ok = false;
+    if (check.contains !== undefined && v.indexOf(check.contains) === -1) ok = false;
+    return ok ? { passed: true } : { passed: false, actual: secret ? "value hidden (password field)" : "value " + JSON.stringify(cut(v, 100)) };
+  }
+
+  function checkCount(check) {
+    var n;
+    try {
+      n = document.querySelectorAll(check.selector).length;
+    } catch (err) {
+      return { passed: false, error: "Invalid selector: " + cut(check.selector, 80) };
+    }
+    var ok = true;
+    if (check.equals !== undefined && n !== check.equals) ok = false;
+    if (check.min !== undefined && n < check.min) ok = false;
+    if (check.max !== undefined && n > check.max) ok = false;
+    return ok ? { passed: true } : { passed: false, actual: n + (n === 1 ? " match" : " matches") };
+  }
+
+  var bodyText = null;
+  function checkText(check) {
+    if (bodyText === null) bodyText = ((document.body && document.body.innerText) || "").toLowerCase();
+    var found = bodyText.indexOf(String(check.text).toLowerCase()) !== -1;
+    var want = check.absent !== true;
+    if (found === want) return { passed: true };
+    return { passed: false, actual: found ? "found" : "not found" };
+  }
+
+  var results = [];
+  for (var i = 0; i < args.checks.length; i++) {
+    var check = args.checks[i];
+    var res;
+    try {
+      if (check.type === "text") res = checkText(check);
+      else if (check.type === "element") res = checkElement(check);
+      else if (check.type === "value") res = checkValue(check);
+      else if (check.type === "count") res = checkCount(check);
+      else res = { passed: false, error: "Not a page check." };
+    } catch (err) {
+      res = { passed: false, error: cut(err && err.message ? err.message : err, 120) };
+    }
+    results.push(res);
+  }
+  return { results: results };
 })()`;

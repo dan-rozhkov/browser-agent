@@ -193,7 +193,7 @@ describe("item 7: abort", () => {
       { signal: ctl.signal },
       {
         navigate: async (url) => { calls.push(`navigate ${url}`); ctl.abort(); return { ok: true }; },
-        openTab: async (url) => { calls.push(`tab ${url}`); return { ok: true }; },
+        newTab: async () => { calls.push("new tab"); return { ok: true }; },
       },
     );
     expect(r).toEqual({ ok: false, stage: "url", error: "aborted" });

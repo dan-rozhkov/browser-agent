@@ -27,6 +27,14 @@ describe("controllerBridge", () => {
     expect(fake.tabs).toHaveBeenCalledWith({ action: "list" });
   });
 
+  it("forwards assert", async () => {
+    const fake = { assert: vi.fn(async () => ({ ok: true, passed: true, results: [] })) };
+    const bridge = controllerBridge(fake as unknown as BrowserController);
+    const args = { checks: [{ type: "text", text: "a" }] };
+    expect(await bridge.assert?.(args)).toEqual({ ok: true, passed: true, results: [] });
+    expect(fake.assert).toHaveBeenCalledWith(args);
+  });
+
   it("forwards the checkpoint journal methods", async () => {
     const fake = {
       startJournal: vi.fn(() => "journal-7"),

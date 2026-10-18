@@ -108,6 +108,18 @@ describe("createStepRecorder", () => {
     expect(rec.steps().map((s) => [s.index, s.tool])).toEqual([[1, "browse_read"], [2, "browse_open"]]);
   });
 
+  it("harvests console errors and failed requests from the entries of a batched browse_act", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_act", { actions: [] }))({
+      output: JSON.stringify({
+        results: [{ ok: true, consoleErrors: ["E1"] }, { ok: true, failedRequests: ["GET 500 https://a.test/x"] }, { consoleErrors: ["E1", "E2"] }],
+        completed: 3,
+        consoleErrors: ["E0"],
+      }),
+    });
+    expect(rec.extras()).toMatchObject({ consoleErrors: ["E0", "E1", "E2"], failedRequests: ["GET 500 https://a.test/x"] });
+  });
+
   it("ok is false for an error result string, a throw, and a call that did not end", () => {
     const rec = createStepRecorder();
     rec.onToolCall(call("browse_read", {}))({ output: '{"error":"page is gone"}' });

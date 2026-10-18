@@ -27,7 +27,7 @@ const NOTE_STALE =
 const noteNewer = (id: string) =>
   `a newer snapshot was taken after this action settled — use snapshot.snapshotId ("${id}") for further index-based browse_act calls, not the snapshotId this "resolved" carried`;
 const UNSUPPORTED = (a: string) =>
-  `browse_act: "element" is only supported for click, type, select, hover, and press actions (got "${a}"). Use target or index instead.`;
+  `browse_act: "element" is only supported for click, type, select, hover, press, and upload actions (got "${a}"). Use target or index instead.`;
 
 describe("browse_act element: locate success", () => {
   it("snapshot -> locate -> act(index, snapshotId) -> trailing snapshot; resolved is reconciled", async () => {

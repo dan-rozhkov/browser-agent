@@ -124,7 +124,7 @@ New subpath `@sideform/browser-agent/fixture` (types, `parsePageFixture`,
 
 - `captureFixture` returns `{ ok: true, fixture } | { ok: false, error }`. `origins: []` captures nothing.
 - `applyFixture` = `parsePageFixture` + `applyParsedFixture`. The controller validates once and calls `applyParsedFixture`.
-- `FixtureHooks` (`navigate`, `openTab`, `press`, `settled`): the controller routes navigation through
+- `FixtureHooks` (`navigate`, `newTab`, `press`, `settled`; `newTab` opens a blank tab, the apply emulates it and then loads it with `navigate`, so an extra tab never loads without the emulation): the controller routes navigation through
   `openUnlocked` (bot check = error), extra tabs through the `tabs new` path (the desktop `newPage` ignores
   its url), keys through the shared `dispatchKeyPair` in `keys.ts`, and click/press settle through the `act`
   helpers. Without hooks, the standalone path does the same with plain target calls.

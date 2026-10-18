@@ -13,11 +13,14 @@
 // (and how dispatcher.ts's ToolCallResult never rejects either).
 
 import { decideBrowserNavigation } from "./navigation.js";
+import { evaluateQaChecks, parseQaChecks } from "../shared/qaChecks.js";
+import type { QaCheckResult } from "../shared/qaTypes.js";
 import { applyParsedFixture, fixtureBudgetMs } from "../fixture/apply.js";
 import { boundedCall, httpOrigin, redactUrl, redactUrls, withTimeout } from "../fixture/util.js";
 import { parsePageFixture } from "../fixture/parse.js";
 import { captureFixture, readBaseState, type BaseState } from "../fixture/capture.js";
 import { CHECKPOINT_GAPS, mergeStorage } from "../fixture/checkpoint.js";
+import { resolveEmulation } from "../fixture/emulate.js";
 import { JournalSession, type JournalBase, type JournalCommand, type StagedAction } from "./journal.js";
 import type {
   CheckpointJournalOptions,
@@ -25,6 +28,7 @@ import type {
   FixtureApplyOptions,
   FixtureApplyResult,
   FixtureCaptureOptions,
+  FixtureEmulate,
   FixtureCaptureResult,
   FixtureCookie,
   FixtureOrigin,
@@ -47,6 +51,7 @@ import {
   type ResolvedSheet,
   v1Shape,
 } from "./captureCss.js";
+import { validateUploadFiles, type UploadPayloadFile } from "./uploadFiles.js";
 import { parseKeySpec, resolveNamedKey, keyDispatchOptions, dispatchKeyPair as dispatchKeyPairShared } from "./keys.js";
 import {
   ARGS_MARKER,
@@ -69,6 +74,8 @@ import {
   REMOVE_MARKS_JS,
   CURSOR_VISIBILITY_JS,
   HOVER_TARGET_JS,
+  ASSERT_JS,
+  UPLOAD_JS,
   FOCUS_JS,
   WAIT_TEXT_JS,
   WAIT_DOM_ACTIVITY_JS,
@@ -112,6 +119,8 @@ const SCRIPT_TEMPLATES = {
   REMOVE_MARKS_JS,
   CURSOR_VISIBILITY_JS,
   HOVER_TARGET_JS,
+  ASSERT_JS,
+  UPLOAD_JS,
   FOCUS_JS,
   WAIT_TEXT_JS,
   WAIT_DOM_ACTIVITY_JS,
@@ -385,6 +394,8 @@ export const FRAME_SCRIPT_TIMEOUT_MS = 1_500;
  * `checkBotWall`'s doc comment for why this has to be its own short budget
  * rather than inheriting whatever's left of the command's timeout. */
 export const BOT_CHECK_TIMEOUT_MS = 400;
+/** `act`/`perform` results keep this many (deduped, newest) console errors and failed requests; the drain empties the buffer. */
+const MAX_DRAINED_DIAGNOSTICS = 20;
 
 /** A top-document `<iframe>` matched to its `WebFrameMain` child frame — see
  * `resolveVisibleFrames`'s doc comment. */
@@ -535,6 +546,8 @@ const CURSOR_TIMEOUT_MS = 900;
  * to settle before letting the next command run anyway — see
  * `BrowserController.overrun`. */
 const OVERRUN_GRACE_MS = 10_000;
+/** Widest image of a screenshot taken under emulation (the same bound `capture()` applies). */
+const EMULATED_SCREENSHOT_MAX_WIDTH = 1280;
 /** Longest `releaseFixture` waits for an apply that is still running. */
 const FIXTURE_RELEASE_WAIT_MS = 5_000;
 
@@ -688,6 +701,16 @@ export interface BrowserPageHandle {
    * `drainDialogs`, since it needs no debugger session at all.
    */
   drainConsoleErrors?(): string[];
+  /**
+   * Optional: drains (and clears) the requests that failed since the last drain
+   * (QA diagnostics, docs/specs/2026-10-18-qa-diagnostics-design.md). Each entry is
+   * "<METHOD> <status|errorText> <origin><pathname>" (no query, no hash), at most
+   * 200 chars; the ring buffer caps at 50. It records HTTP status >= 400 and
+   * network failures, not requests the page canceled, and skips data: URLs,
+   * WebSocket, EventSource and beacons. Merged into `act`/`perform`/`assert`
+   * results as `failedRequests`, like `drainConsoleErrors`.
+   */
+  drainFailedRequests?(): string[];
   /**
    * Optional: Wave 1 speed (`2026-09-24-browse-speed-contract.md`).
    * Subscribes to this tab's navigation lifecycle (`did-start-navigation`,
@@ -915,7 +938,7 @@ interface JournalLookup {
  * move inside the same document is a gap, a new document a reset), or a `hover`
  * (lasting page state no step replays: a gap when it succeeds).
  */
-type JournalDeclare = JournalAction | { op: "nav" } | { op: "history" } | { op: "hover" };
+type JournalDeclare = JournalAction | { op: "nav" } | { op: "history" } | { op: "hover" } | { op: "upload" };
 
 /** The state read before an `applyFixture` changes anything (see `journalAfterApply`). */
 interface PreApply {
@@ -1006,7 +1029,7 @@ function validateCaptureArgs(args: unknown): { ok: true; value: ValidatedCapture
 
 // Full browser use (design doc `2026-09-23-full-browser-use-design.md`)
 // added select/press/hover/reload/wait to the original five.
-type ActAction = "click" | "type" | "select" | "press" | "hover" | "scroll" | "back" | "forward" | "reload" | "wait";
+type ActAction = "click" | "type" | "select" | "press" | "hover" | "upload" | "scroll" | "back" | "forward" | "reload" | "wait";
 
 const ACT_ACTIONS: readonly ActAction[] = [
   "click",
@@ -1014,6 +1037,7 @@ const ACT_ACTIONS: readonly ActAction[] = [
   "select",
   "press",
   "hover",
+  "upload",
   "scroll",
   "back",
   "forward",
@@ -1601,7 +1625,9 @@ export class BrowserController {
       const stop = new AbortController();
       const signal = opts?.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal;
       const aborted = { ok: false as const, error: "aborted" };
-      const hooksBase: FixtureHooks = { onStage: (reached) => { stage = reached; } };
+      // Pages this apply emulated; handed to `fixtureActive` only when the apply succeeds.
+      const emulatedPages = new Set<BrowserPageHandle>();
+      const hooksBase: FixtureHooks = { onStage: (reached) => { stage = reached; }, onEmulated: (page) => { emulatedPages.add(page); } };
       // What a nested `open` reports, as a hook result: its drained dialogs travel up
       // (the outer drain would not see them again), and a bot-check wall fails the fixture.
       const opened = (url: string, result: BrowserCommandResult): FixtureHookResult => {
@@ -1617,8 +1643,9 @@ export class BrowserController {
           if (abortSignal?.aborted) return aborted;
           return opened(url, await this.openUnlocked({ url }));
         },
-        // Same path as `tabs({ action: "new", url })`: the tab is created empty, then `open` loads it.
-        openTab: async (url, abortSignal) => {
+        // The first half of `tabs({ action: "new", url })`: the tab is created empty. The apply emulates it,
+        // then loads it through the `navigate` hook (`open`), so the emulation is there before the first load.
+        newTab: async (abortSignal) => {
           if (abortSignal?.aborted) return aborted;
           const before = (await this.listPagesSafe()).find((t) => t.current)?.tabId;
           const tab = await this.target.newPage!();
@@ -1632,7 +1659,7 @@ export class BrowserController {
             }
             return aborted;
           }
-          return opened(url, await this.openUnlocked({ url }));
+          return { ok: true };
         },
         press: async (page, key) => {
           if (!page.sendCdp) return false;
@@ -1680,7 +1707,11 @@ export class BrowserController {
             // Owned here, inside the work itself: a command the deadline abandoned still hands its mocks over.
             // (The apply releases them on its own when its signal aborted first.)
             const token = `fixture-${++this.fixtureSeq}`;
-            this.fixtureActive = { release: applied.release, token };
+            this.fixtureActive = {
+              release: applied.release,
+              token,
+              ...(parsed.value.emulate && emulatedPages.size > 0 ? { emulation: { emulate: parsed.value.emulate, pages: emulatedPages } } : {}),
+            };
             const rest = { ...applied, fixtureToken: token };
             delete rest.release;
             return rest as BrowserCommandResult;
@@ -1703,8 +1734,15 @@ export class BrowserController {
     });
   }
 
-  /** Network mocks of the last applied fixture, until `releaseFixture`. */
-  private fixtureActive: { release: () => Promise<void>; token: string } | null = null;
+  /**
+   * Network mocks and emulation of the last applied fixture, until `releaseFixture`. `emulation` lists
+   * the pages that carry it (the main tab and the fixture's tabs; popups are not emulated).
+   */
+  private fixtureActive: {
+    release: () => Promise<void>;
+    token: string;
+    emulation?: { emulate: FixtureEmulate; pages: Set<BrowserPageHandle> };
+  } | null = null;
   private fixtureSeq = 0;
   /** The apply that runs now (or was abandoned by its deadline): its mocks are not in `fixtureActive` yet. */
   private fixtureInFlight: Promise<void> | null = null;
@@ -1799,7 +1837,7 @@ export class BrowserController {
       if (!tab || !tab.base) return { ok: false as const, error: "the journal has no page to checkpoint (no browser tab is open)" };
       try {
         const tabs = (await this.listPagesSafe()).filter((t) => !t.current).map((t) => t.url);
-        return { ok: true as const, ...tab.build(tabs) };
+        return { ok: true as const, ...tab.build(tabs, this.activeEmulation()) };
       } catch (err) {
         return { ok: false as const, error: redactUrls(`capturing the checkpoint failed: ${toMessage(err)}`) };
       }
@@ -2108,10 +2146,11 @@ export class BrowserController {
       session.declare(command, "nav", page, page ? this.pageUrl(page) : undefined);
       return;
     }
-    const kind = declare.op === "history" ? "history" : declare.op === "hover" ? "hover" : "action";
+    const kind =
+      declare.op === "history" ? "history" : declare.op === "hover" ? "hover" : declare.op === "upload" ? "upload" : "action";
     session.declare(command, kind, page);
     if (!page) return;
-    const action = declare.op === "history" || declare.op === "hover" ? null : declare;
+    const action = declare.op === "history" || declare.op === "hover" || declare.op === "upload" ? null : declare;
     const overrun = await this.journalBounded(session, [page], (canWrite) =>
       action ? this.journalPreAction(session, command, page, action, canWrite) : this.journalSync(session, page, canWrite),
     );
@@ -2213,10 +2252,20 @@ export class BrowserController {
     return { staged, marker };
   }
 
+  /** The emulation the last applied fixture left active, or undefined. */
+  private activeEmulation(): FixtureEmulate | undefined {
+    return this.fixtureActive?.emulation?.emulate;
+  }
+
+  private withActiveEmulation(opts?: FixtureCaptureOptions): FixtureCaptureOptions | undefined {
+    const emulate = this.activeEmulation();
+    return emulate ? { ...opts, emulate } : opts;
+  }
+
   /** Reads the browser state as a `PageFixture` (host use: it holds secrets). Bounded like any command. */
   async captureFixture(opts?: FixtureCaptureOptions): Promise<FixtureCaptureResult> {
     return this.runExclusive(async () =>
-      fixtureResult<FixtureCaptureResult>(await this.withCommandTimeout(async () => (await captureFixture(this.target, opts)) as BrowserCommandResult)),
+      fixtureResult<FixtureCaptureResult>(await this.withCommandTimeout(async () => (await captureFixture(this.target, this.withActiveEmulation(opts))) as BrowserCommandResult)),
     );
   }
 
@@ -2227,15 +2276,15 @@ export class BrowserController {
       this.relocatedThisCommand = false;
       const result = this.withRelocated(await this.actUnlocked(args));
       // Wave 3 reliability, item 3: drained once, at the outermost public
-      // entry point — see mergeConsoleErrors's doc comment.
-      return this.mergeConsoleErrors(result, this.target.currentPage());
+      // entry point — see mergeDiagnostics's doc comment.
+      return this.mergeDiagnostics(result, this.target.currentPage());
     });
   }
 
   private async actUnlocked(args: unknown): Promise<BrowserCommandResult> {
     if (!isRecord(args) || !isActAction(args.action)) {
       return errorResult(
-        `browse_act requires an "action" of "click", "type", "select", "press", "hover", "scroll", "back", ` +
+        `browse_act requires an "action" of "click", "type", "select", "press", "hover", "upload", "scroll", "back", ` +
           `"forward", "reload", or "wait" (got ${
             isRecord(args) ? JSON.stringify(args.action) : JSON.stringify(args)
           }).`,
@@ -2339,6 +2388,8 @@ export class BrowserController {
         this.journal ? { op: "hover" } : undefined,
       );
     }
+
+    if (action === "upload") return this.actUpload(args);
 
     if (action === "select") {
       const validated = validateIndexSnapshot(args, "select");
@@ -3522,6 +3573,77 @@ export class BrowserController {
     return { url: page.getURL(), title: page.getTitle(), ...this.diffSignatures(before, after, {}) };
   }
 
+  /**
+   * `act`'s `upload`: limits and file shapes are checked here, before the page
+   * is touched (a refusal leaves no journal trace); then UPLOAD_JS sets the
+   * files. A successful upload is a checkpoint gap (the bytes cannot replay).
+   */
+  private async actUpload(args: Record<string, unknown>): Promise<BrowserCommandResult> {
+    let target: string | undefined;
+    let index: number | undefined;
+    let snapshotId: string | undefined;
+    if (typeof args.target === "string" && args.target.trim() !== "") {
+      target = args.target;
+    } else if (args.index !== undefined || args.snapshotId !== undefined) {
+      const validated = validateIndexSnapshot(args, "upload");
+      if (!validated.ok) return errorResult(validated.error);
+      index = validated.index;
+      snapshotId = validated.snapshotId;
+    } else {
+      return errorResult('browse_act "upload" requires a "target" string, or "index" with "snapshotId".');
+    }
+    const files = validateUploadFiles(args.files);
+    if (!files.ok) return errorResult(files.error);
+    return this.withCommandTimeout(
+      () => this.runUpload({ target, index, snapshotId, files: files.files }),
+      this.timeoutMs + this.cursorBudgetMs,
+      this.journal ? { op: "upload" } : undefined,
+    );
+  }
+
+  private async runUpload(spec: {
+    target?: string;
+    index?: number;
+    snapshotId?: string;
+    files: UploadPayloadFile[];
+  }): Promise<BrowserCommandResult> {
+    const page = this.target.currentPage();
+    if (!page) return errorResult("No browser tab is open — call browse_open first.");
+    if (spec.index !== undefined && spec.snapshotId !== undefined) {
+      const staleError = this.checkSnapshotStale(spec.snapshotId, page);
+      if (staleError) return staleError;
+    }
+    const { frameRoute } = this.resolveFrameRouteWithCursorPoint(spec.index);
+    const before = await this.captureSignature(page, "before");
+    const result =
+      frameRoute.frameId === null
+        ? await this.executeScript(page, "UPLOAD_JS", {
+            target: spec.target,
+            index: spec.index,
+            snapshotId: spec.snapshotId,
+            files: spec.files,
+          })
+        : await this.executeScriptInFrame(page, frameRoute.frameId, "UPLOAD_JS", {
+            target: spec.target,
+            index: frameRoute.localIndex,
+            snapshotId: spec.snapshotId,
+            files: spec.files,
+          });
+    if ("error" in result) return result;
+    await this.settleShort();
+    const after = await this.captureSignature(page, "after");
+    return {
+      url: page.getURL(),
+      title: page.getTitle(),
+      ok: true,
+      uploaded: result.uploaded,
+      via: result.via,
+      ...(result.unconfirmed === true ? { unconfirmed: true } : {}),
+      ...(result.relocated === true ? { relocated: true } : {}),
+      ...this.diffSignatures(before, after, {}),
+    };
+  }
+
   /** `act`'s `wait` — without `text`, Wave 1 speed's follow-up rule: `wait`
    * exists precisely because the caller expects *something* — often a
    * client-side timer with no network involvement at all (a spinner
@@ -4016,7 +4138,7 @@ export class BrowserController {
     // Capturing right after MARKS_JS can miss the overlay: wait for a paint
     // (double rAF raced against a timeout — a hidden view never fires rAF).
     await this.waitForPaint(page);
-    return { captured: (await page.capture?.()) ?? null, marked };
+    return { captured: await this.captureImage(page), marked };
   }
 
   /** The compose path of `captureAnnotated`; `null` on ANY failure. Never
@@ -4026,7 +4148,7 @@ export class BrowserController {
     snapshotId: string,
     cursorHidden: boolean,
   ): Promise<{ captured: { imageData: string; width: number; height: number }; marked: number } | null> {
-    if (!page.executeJavaScriptIsolated || !page.capture) return null;
+    if (!page.executeJavaScriptIsolated || !(page.capture || this.isEmulated(page))) return null;
     try {
       const layout = await this.executeScript(page, "MARKS_JS", { snapshotId, draw: false });
       if (
@@ -4038,7 +4160,7 @@ export class BrowserController {
         return null;
       }
       if (cursorHidden) await this.waitForPaint(page);
-      const clean = await page.capture();
+      const clean = await this.captureImage(page);
       if (!clean || !clean.imageData) return null;
       const code = COMPOSE_MARKS_JS.replace(ARGS_MARKER, () =>
         JSON.stringify({
@@ -4092,6 +4214,78 @@ export class BrowserController {
     return this.runExclusive(() => this.screenshotUnlocked(args));
   }
 
+  /** The page carries an emulation of the active fixture and can take a CDP screenshot. */
+  private isEmulated(page: BrowserPageHandle): boolean {
+    return page.sendCdp !== undefined && this.fixtureActive?.emulation?.pages.has(page) === true;
+  }
+
+  /**
+   * One screenshot of `page`. While an emulation is active on the page, `Page.captureScreenshot`
+   * (JPEG, quality 70, at most 1280 px wide, raw base64 like `capture()`) replaces `page.capture()`:
+   * Electron's `capturePage` captures the view, not the emulated viewport. A CDP failure falls back
+   * to `capture()`.
+   */
+  private async captureImage(page: BrowserPageHandle): Promise<{ imageData: string; width: number; height: number } | null> {
+    const emulation = this.fixtureActive?.emulation;
+    if (page.sendCdp && emulation?.pages.has(page)) {
+      try {
+        const shot = await this.captureEmulated(page, emulation.emulate);
+        if (shot) return shot;
+      } catch {
+        // fall through to the plain capture
+      }
+    }
+    return (await page.capture?.()) ?? null;
+  }
+
+  private async captureEmulated(page: BrowserPageHandle, emulate: FixtureEmulate): Promise<{ imageData: string; width: number; height: number } | null> {
+    const metrics = resolveEmulation(emulate).metrics;
+    let width = metrics?.width;
+    let height = metrics?.height;
+    let dpr = metrics?.deviceScaleFactor;
+    // `clip` is document-relative: start at the visible viewport (the scroll offset), not at the document origin.
+    let originX = 0;
+    let originY = 0;
+    try {
+      const layout: unknown = await page.sendCdp!("Page.getLayoutMetrics", {});
+      const vv = isRecord(layout) && isRecord(layout.cssVisualViewport) ? layout.cssVisualViewport : undefined;
+      if (vv) {
+        if (typeof vv.pageX === "number" && Number.isFinite(vv.pageX)) originX = Math.max(0, vv.pageX);
+        if (typeof vv.pageY === "number" && Number.isFinite(vv.pageY)) originY = Math.max(0, vv.pageY);
+        // The size comes from the real visual viewport, not from the emulated metrics: a mobile page without
+        // a meta viewport lays out at 980 px while the emulated width is 390, and the clip must cover it all.
+        if (typeof vv.clientWidth === "number" && vv.clientWidth > 0) width = vv.clientWidth;
+        if (typeof vv.clientHeight === "number" && vv.clientHeight > 0) height = vv.clientHeight;
+      }
+    } catch {
+      // keep the document origin
+    }
+    if (width === undefined || height === undefined || dpr === undefined) {
+      // No viewport override (only locale, colour scheme, ...): read the real viewport.
+      let read: unknown;
+      try {
+        const raw: unknown = await page.executeJavaScript("JSON.stringify({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio })");
+        read = typeof raw === "string" ? JSON.parse(raw) : raw;
+      } catch {
+        read = undefined;
+      }
+      width ??= isRecord(read) && typeof read.width === "number" && read.width > 0 ? read.width : 1280;
+      height ??= isRecord(read) && typeof read.height === "number" && read.height > 0 ? read.height : 800;
+      dpr = isRecord(read) && typeof read.dpr === "number" && read.dpr > 0 ? read.dpr : 1;
+    }
+    const outWidth = Math.min(width, EMULATED_SCREENSHOT_MAX_WIDTH);
+    const ratio = outWidth / width;
+    const raw = await page.sendCdp!("Page.captureScreenshot", {
+      format: "jpeg",
+      quality: 70,
+      // The output is css size * DPR * scale: scale cancels the DPR so the image is css-sized, then caps the width.
+      clip: { x: originX, y: originY, width, height, scale: ratio / dpr },
+    });
+    const data = isRecord(raw) && typeof raw.data === "string" ? raw.data : "";
+    if (!data) return null;
+    return { imageData: data, width: Math.round(outWidth), height: Math.round(height * ratio) };
+  }
+
   private async screenshotUnlocked(args: unknown): Promise<BrowserCommandResult> {
     const validated = validateScreenshotArgs(args);
     if (!validated.ok) return errorResult(validated.error);
@@ -4099,7 +4293,7 @@ export class BrowserController {
     return this.withCommandTimeout(async () => {
       const page = this.target.currentPage();
       if (!page) return errorResult("No browser tab is open — call browse_open first.");
-      if (!page.capture) return errorResult("Screenshot is not supported by this browser tab.");
+      if (!page.capture && !this.isEmulated(page)) return errorResult("Screenshot is not supported by this browser tab.");
       // Reusing the caller's snapshot: refuse a stale one BEFORE touching the
       // page. Read-only — `lastSnapshot` is neither replaced nor cleared.
       if (givenSnapshotId !== undefined) {
@@ -4157,7 +4351,7 @@ export class BrowserController {
         } else {
           await hideCursor();
           if (cursorHidden) await this.waitForPaint(page);
-          captured = await page.capture();
+          captured = await this.captureImage(page);
         }
         if (!captured || !captured.imageData) {
           return errorResult("Screenshot capture failed (empty image).");
@@ -4335,8 +4529,125 @@ export class BrowserController {
       const result = this.withRelocated(await this.performUnlocked(args));
       // Wave 3 reliability, item 3: see act()'s identical call for why this
       // only ever runs once, at the outermost public entry point.
-      return this.mergeConsoleErrors(result, this.target.currentPage());
+      return this.mergeDiagnostics(result, this.target.currentPage());
     });
+  }
+
+  /**
+   * QA diagnostics, section 2: deterministic page checks (`QaCheck`, see agent/qaChecks.ts).
+   * Runs under the command lock like `perform`. Read-only: no journal entry, no scroll, no
+   * click. `args.checks` is the array `parseQaChecks` accepts; `args.snapshotId` (optional)
+   * names the snapshot an `index` belongs to, else the current one is used. Resolves to
+   * `{ ok: true, passed, results, consoleErrors?, failedRequests? }` (one result per check);
+   * a bad `checks` array or a missing tab is `{ error }`. A failed check is a normal result.
+   * `no_console_errors` and `no_failed_requests` see what THIS call drains; the agent layer
+   * adds the history of the run.
+   */
+  async assert(args: unknown): Promise<BrowserCommandResult> {
+    return this.runExclusive(() => this.assertUnlocked(args));
+  }
+
+  private async assertUnlocked(args: unknown): Promise<BrowserCommandResult> {
+    if (!isRecord(args)) return errorResult('assert requires an object with "checks".');
+    const parsed = parseQaChecks(args.checks);
+    if (!parsed.ok) return errorResult(`assert: ${parsed.errors.join("; ")}`);
+    const checks = parsed.value;
+    if (args.snapshotId !== undefined && (typeof args.snapshotId !== "string" || args.snapshotId.trim() === "")) {
+      return errorResult('assert requires "snapshotId" to be a non-empty string when provided.');
+    }
+    const givenSnapshotId = typeof args.snapshotId === "string" ? args.snapshotId : undefined;
+    return this.withCommandTimeout(async () => {
+      const page = this.target.currentPage();
+      if (!page) return errorResult("No browser tab is open — call browse_open first.");
+      const results: QaCheckResult[] = checks.map((check) => ({ check, passed: true }));
+      // The checks that go to the page. An index check that cannot be resolved is answered here.
+      const domIndexes: number[] = [];
+      const snapshotId = givenSnapshotId ?? this.lastSnapshot?.id;
+      const fingerprints: Record<string, unknown> = {};
+      let snapshotError: string | undefined;
+      checks.forEach((check, i) => {
+        if (check.type === "text" || check.type === "count") return void domIndexes.push(i);
+        if (check.type !== "element" && check.type !== "value") return;
+        if (check.selector !== undefined || check.index === undefined) return void domIndexes.push(i);
+        if (snapshotId === undefined) snapshotError = "No snapshot yet: call browse_snapshot before a check by index.";
+        else if (snapshotError === undefined) snapshotError = (this.checkSnapshotStale(snapshotId, page) as { error?: string } | null)?.error;
+        if (snapshotError !== undefined) {
+          results[i] = { check, passed: false, error: snapshotError };
+          return;
+        }
+        const route = this.lastSnapshot?.frameMap.get(check.index);
+        if (route && route.frameId !== null) {
+          results[i] = { check, passed: false, error: `Element ${check.index} is inside a frame; assert reads the top document only.` };
+          return;
+        }
+        const fingerprint = this.lastSnapshot?.fingerprints.get(check.index);
+        if (fingerprint) fingerprints[String(check.index)] = fingerprint;
+        domIndexes.push(i);
+      });
+      if (domIndexes.length > 0) {
+        let script: BrowserCommandResult;
+        try {
+          script = await this.executeScript(page, "ASSERT_JS", {
+            checks: domIndexes.map((i) => checks[i]),
+            ...(snapshotId !== undefined ? { snapshotId } : {}),
+            fingerprints,
+          });
+        } catch (err) {
+          script = errorResult(toMessage(err));
+        }
+        const answers = Array.isArray(script.results) ? (script.results as unknown[]) : undefined;
+        domIndexes.forEach((checkIndex, k) => {
+          const check = checks[checkIndex]!;
+          const a = answers?.[k];
+          if (isRecord(a)) {
+            results[checkIndex] = {
+              check,
+              passed: a.passed === true,
+              ...(typeof a.actual === "string" ? { actual: a.actual } : {}),
+              ...(typeof a.error === "string" ? { error: a.error } : {}),
+            };
+          } else {
+            results[checkIndex] = { check, passed: false, error: typeof script.error === "string" ? script.error : "The page did not answer the check." };
+          }
+        });
+      }
+      checks.forEach((check, i) => {
+        if (check.type !== "url") return;
+        const url = page.getURL();
+        let passed = true;
+        if (check.equals !== undefined && url !== check.equals) passed = false;
+        if (check.contains !== undefined && !url.includes(check.contains)) passed = false;
+        if (check.matches !== undefined) {
+          try {
+            if (!new RegExp(check.matches).test(url)) passed = false;
+          } catch {
+            results[i] = { check, passed: false, error: "matches: not a valid regular expression" };
+            return;
+          }
+        }
+        // The URL may hold a secret in its query or hash: report origin + pathname only.
+        results[i] = passed ? { check, passed } : { check, passed, actual: `url ${redactUrl(url)}` };
+      });
+      // Same drain as act/perform: deduped, the last 20, with dropped counters.
+      const diagnostics = this.drainDiagnostics(page);
+      // The two history checks: evaluated here on what this call drained (the agent layer adds the run history).
+      const evaluated = evaluateQaChecks({ results, consoleErrors: diagnostics.consoleErrors, failedRequests: diagnostics.failedRequests }, checks);
+      const finalResults = evaluated.ok ? evaluated.results : results;
+      return {
+        ok: true,
+        passed: finalResults.every((r) => r.passed),
+        results: finalResults,
+        ...diagnostics,
+      };
+    });
+  }
+
+  private drainList(drain: () => string[] | undefined): string[] {
+    try {
+      return drain() ?? [];
+    } catch {
+      return [];
+    }
   }
 
   private async performUnlocked(args: unknown): Promise<BrowserCommandResult> {
@@ -4736,23 +5047,40 @@ export class BrowserController {
 
   /** Wave 3 reliability, item 3: drains this tab's console-error ring buffer
    * (window.ts, via the same CDP session as sendCdp/drainDialogs) and merges
-   * up to 5 entries into `act`/`perform`'s own result as `consoleErrors` —
-   * omitted entirely when there's nothing new, so a caller can check for the
-   * field's presence rather than an always-present empty array. Called once,
+   * the entries into `act`/`perform`'s own result as `consoleErrors` — and,
+   * the same way, the requests that failed since the last command as
+   * `failedRequests`. Each list is deduped (first-seen order) and keeps the
+   * LAST `MAX_DRAINED_DIAGNOSTICS` (20) entries; `consoleErrorsDropped` /
+   * `failedRequestsDropped` count the older ones that did not fit. The drain
+   * empties the buffer, so what the result leaves out is gone: the cap is 20
+   * (not 5) so a step recorder (QA mode) that reads the result loses little.
+   * A field is omitted entirely when there's nothing new, so a caller can check
+   * for its presence rather than an always-present empty array. Called once,
    * by the outermost public `act()`/`perform()` entry point (not by every
    * internal branch), so an action that itself routes through another
    * command internally (`act`'s index-based click calling `perform`'s CLICK
    * branch) never double-drains the same ring buffer. */
-  private mergeConsoleErrors(result: BrowserCommandResult, page: BrowserPageHandle | null): BrowserCommandResult {
-    if (!page?.drainConsoleErrors) return result;
-    let errors: string[];
-    try {
-      errors = page.drainConsoleErrors();
-    } catch {
-      return result;
+  private mergeDiagnostics(result: BrowserCommandResult, page: BrowserPageHandle | null): BrowserCommandResult {
+    if (!page) return result;
+    const merged = this.drainDiagnostics(page);
+    return Object.keys(merged).length > 0 ? { ...result, ...merged } : result;
+  }
+
+  /** The drain behind `mergeDiagnostics` and `assert`: deduped, the last 20, with `...Dropped` counters. */
+  private drainDiagnostics(page: BrowserPageHandle): Record<string, unknown> {
+    const merged: Record<string, unknown> = {};
+    const lists = [
+      { key: "consoleErrors", drain: page.drainConsoleErrors?.bind(page) },
+      { key: "failedRequests", drain: page.drainFailedRequests?.bind(page) },
+    ] as const;
+    for (const { key, drain } of lists) {
+      if (!drain) continue;
+      const entries = [...new Set(this.drainList(drain))];
+      if (entries.length === 0) continue;
+      merged[key] = entries.slice(-MAX_DRAINED_DIAGNOSTICS);
+      if (entries.length > MAX_DRAINED_DIAGNOSTICS) merged[`${key}Dropped`] = entries.length - MAX_DRAINED_DIAGNOSTICS;
     }
-    if (errors.length === 0) return result;
-    return { ...result, consoleErrors: errors.slice(-5) };
+    return merged;
   }
 
   /** Wave 3 reliability, item 2: discovers which of the top document's

@@ -2,6 +2,8 @@
 // redaction. A URL may carry a token in its query or hash, so no text a model
 // can read ever holds more than origin + pathname.
 import type { BrowserPageHandle } from "../controller/controller.js";
+import { summarizeEmulation } from "./emulate.js";
+import type { FixtureEmulate } from "./types.js";
 
 /** Longest wait for one page script of a fixture. */
 export const SCRIPT_TIMEOUT_MS = 10_000;
@@ -87,7 +89,7 @@ export function plural(n: number, noun: string): string {
  * count, extra tab count. Counts and origin + pathname only: no cookie name, no
  * storage key, no value. Shared by the apply summary and the checkpoint summary.
  */
-export function fixtureStateParts(fixture: { url?: string; storage?: { cookies?: unknown[]; origins?: unknown[] }; tabs?: unknown[] }): string[] {
+export function fixtureStateParts(fixture: { url?: string; storage?: { cookies?: unknown[]; origins?: unknown[] }; tabs?: unknown[]; emulate?: FixtureEmulate }): string[] {
   const parts: string[] = [];
   if (fixture.url) parts.push(`start page ${redactUrl(fixture.url)}`);
   const cookies = fixture.storage?.cookies?.length ?? 0;
@@ -96,5 +98,6 @@ export function fixtureStateParts(fixture: { url?: string; storage?: { cookies?:
   if (origins) parts.push(`storage for ${plural(origins, "origin")}`);
   const tabs = fixture.tabs?.length ?? 0;
   if (tabs) parts.push(plural(tabs, "extra tab"));
+  if (fixture.emulate) parts.push(summarizeEmulation(fixture.emulate));
   return parts;
 }

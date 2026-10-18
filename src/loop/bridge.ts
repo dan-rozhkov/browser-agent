@@ -70,6 +70,15 @@ export interface BrowserBridge {
    */
   capture?(args?: { index?: number; snapshotId?: string }): Promise<unknown>;
   /**
+   * QA assertions (docs/specs/2026-10-18-qa-diagnostics-design.md, section 2): runs
+   * `checks` (see `QaCheck`) against the current page and resolves to a `QaAssertResult`
+   * (`{ ok: true, passed, results, consoleErrors?, failedRequests? }`) or `{ error }`.
+   * Read-only. `snapshotId` names the snapshot an `index` check belongs to (default: the
+   * current one). Optional - absent on bridges older than this feature; QA `qa_assert` and
+   * `qa.checks` then fail clearly.
+   */
+  assert?(args: { checks: unknown[]; snapshotId?: string }): Promise<unknown>;
+  /**
    * PageFixture (docs/specs/2026-10-15-page-fixture-design.md) — prepare the
    * browser state before a task, or read it back. `applyFixture` resolves to a
    * `FixtureApplyResult` (`{ ok, summary }` or `{ ok: false, error }`),

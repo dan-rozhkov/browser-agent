@@ -55,7 +55,7 @@
       }
     },
     "browse_act": {
-      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Act on the currently open browser tab: click, type, scroll, go back/forward, press a key, hover, pick a `<select>` option, reload, or wait. `target` (for click/type) is matched first as visible text (case-insensitive, trimmed, first match in document order), then as a CSS selector; alternatively pass `index` (from browse_snapshot or an annotated browse_screenshot) together with that call's `snapshotId` to act on a specific element by its number — more reliable than text matching once you have a snapshot; or pass `element` instead (see below) to skip taking a snapshot yourself. Scrolling is what makes an infinite-scroll grid like Pinterest's usable: call `scroll` to load more results, then call browse_find_images (or browse_snapshot) again — `scroll` also takes `index`+`snapshotId` (or `target`) to scroll INSIDE that element (a scrollable panel/modal, or any element browse_snapshot marked `scrollable: true`) instead of the whole window. `press` sends a real key event (`key`: \"Enter\", \"Escape\", \"Tab\", \"ArrowDown\", \"Meta+a\", …), optionally focusing `target`/`index`/`element` first — this is how you submit a form with Enter or close a modal with Escape. `hover` moves the pointer over `target`/`index`/`element` without clicking, for hover-revealed menus. `select` needs `index`+`snapshotId` (or `element`) and `text` = the option's label or value. `reload` takes no fields. `wait` polls for `text` to appear (or just sleeps `ms`, default 3000, hard cap 15000) — use it after an action that triggers an async page update before your next snapshot/screenshot. Batching: pass `actions` (1-10 entries, each the same shape as this call minus `snapshotId` — all index-based entries refer to THIS call's top-level `snapshotId`) instead of a single `action` to run several simple steps in one round trip — e.g. fill a few fields then press Enter to submit — rather than spending one chat turn per step. When `actions` is given the top-level `action`/`target`/`index`/etc. fields are ignored; provide exactly one of `action` or `actions`. Entries run in order and stop at the first one that errors or whose target goes stale; the result is `{ results: [...one per entry actually run], completed, stoppedAt?, error? }` alongside the usual fields below. An `element` entry re-snapshots the page to resolve it, which makes the batch's top-level `snapshotId` stale for every entry after it — put `element` entries LAST in the batch, or split into separate batches, never an index-based entry after one; a batch that violates this order is rejected up front with an error naming the offending entry, before anything runs. A batch also has its own internal time budget and may stop early with `stoppedAt` and an error saying so if it runs too long — check `completed` rather than assuming every entry ran. Returns `{ url, title, matched }` on success or `{ error }` naming what wasn't found; resolving via `element` takes a fresh snapshot to match against, so it also returns `resolved: { index, label, confidence, snapshotId?, note }` on both success and failure — `snapshotId` is the NEW current snapshot (any snapshotId you already had is now stale) and `note` says so, UNLESS this same result also carries a `snapshot` field (see below), in which case `resolved.snapshotId` is omitted and `note` instead points you at `snapshot.snapshotId` — always use whichever snapshotId `note` actually names, never an older one you already had. If it can't resolve (no fast model configured, or nothing matched clearly) the error says to retry with `target`/`index` instead. A click/type/press result may also carry `openedTab: { tabId, url, title }` when the action opened a new browser tab — a click on your own tab that opens a popup DOES make that popup your current tab, so your next browse_* call already acts on it; use browse_tabs to switch back to the previous one — and `dialogs: [{ type, message }]` listing any JS alert/confirm/prompt the browser auto-handled since your last command. `changed` (with `changes`, when present) tells you whether the action actually altered the page — check it instead of assuming success; when the action changed the page (or at the end of an `actions` batch, or for `wait`/`scroll`), the result also carries `snapshot` — a compact current snapshot (same shape as browse_snapshot) taken after the action settles, whose `snapshotId` is current — use it for your next index-based call instead of taking a fresh browse_snapshot yourself. May also carry `consoleErrors: string[]` listing new page JS errors observed since your last command.",
+      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Act on the currently open browser tab: click, type, scroll, go back/forward, press a key, hover, pick a `<select>` option, upload files, reload, or wait. `target` (for click/type) is matched first as visible text (case-insensitive, trimmed, first match in document order), then as a CSS selector; alternatively pass `index` (from browse_snapshot or an annotated browse_screenshot) together with that call's `snapshotId` to act on a specific element by its number — more reliable than text matching once you have a snapshot; or pass `element` instead (see below) to skip taking a snapshot yourself. Scrolling is what makes an infinite-scroll grid like Pinterest's usable: call `scroll` to load more results, then call browse_find_images (or browse_snapshot) again — `scroll` also takes `index`+`snapshotId` (or `target`) to scroll INSIDE that element (a scrollable panel/modal, or any element browse_snapshot marked `scrollable: true`) instead of the whole window. `press` sends a real key event (`key`: \"Enter\", \"Escape\", \"Tab\", \"ArrowDown\", \"Meta+a\", …), optionally focusing `target`/`index`/`element` first — this is how you submit a form with Enter or close a modal with Escape. `hover` moves the pointer over `target`/`index`/`element` without clicking, for hover-revealed menus. `select` needs `index`+`snapshotId` (or `element`) and `text` = the option's label or value. `upload` sets files on a file input: pass `index`+`snapshotId` (or `element`) and `files`, 1 to 5 entries of `{ name, mimeType?, text | base64 | sample }`, 2 MB in total. `sample` is a tiny valid file: png, jpg, pdf, txt or csv. Target the input, its label, or a drop zone. A drop zone gets a file drop. `reload` takes no fields. `wait` polls for `text` to appear (or just sleeps `ms`, default 3000, hard cap 15000) — use it after an action that triggers an async page update before your next snapshot/screenshot. Batching: pass `actions` (1-10 entries, each the same shape as this call minus `snapshotId` — all index-based entries refer to THIS call's top-level `snapshotId`) instead of a single `action` to run several simple steps in one round trip — e.g. fill a few fields then press Enter to submit — rather than spending one chat turn per step. When `actions` is given the top-level `action`/`target`/`index`/etc. fields are ignored; provide exactly one of `action` or `actions`. Entries run in order and stop at the first one that errors or whose target goes stale; the result is `{ results: [...one per entry actually run], completed, stoppedAt?, error? }` alongside the usual fields below. An `element` entry re-snapshots the page to resolve it, which makes the batch's top-level `snapshotId` stale for every entry after it — put `element` entries LAST in the batch, or split into separate batches, never an index-based entry after one; a batch that violates this order is rejected up front with an error naming the offending entry, before anything runs. A batch also has its own internal time budget and may stop early with `stoppedAt` and an error saying so if it runs too long — check `completed` rather than assuming every entry ran. Returns `{ url, title, matched }` on success or `{ error }` naming what wasn't found; resolving via `element` takes a fresh snapshot to match against, so it also returns `resolved: { index, label, confidence, snapshotId?, note }` on both success and failure — `snapshotId` is the NEW current snapshot (any snapshotId you already had is now stale) and `note` says so, UNLESS this same result also carries a `snapshot` field (see below), in which case `resolved.snapshotId` is omitted and `note` instead points you at `snapshot.snapshotId` — always use whichever snapshotId `note` actually names, never an older one you already had. If it can't resolve (no fast model configured, or nothing matched clearly) the error says to retry with `target`/`index` instead. A click/type/press result may also carry `openedTab: { tabId, url, title }` when the action opened a new browser tab — a click on your own tab that opens a popup DOES make that popup your current tab, so your next browse_* call already acts on it; use browse_tabs to switch back to the previous one — and `dialogs: [{ type, message }]` listing any JS alert/confirm/prompt the browser auto-handled since your last command. `changed` (with `changes`, when present) tells you whether the action actually altered the page — check it instead of assuming success; when the action changed the page (or at the end of an `actions` batch, or for `wait`/`scroll`), the result also carries `snapshot` — a compact current snapshot (same shape as browse_snapshot) taken after the action settles, whose `snapshotId` is current — use it for your next index-based call instead of taking a fresh browse_snapshot yourself. May also carry `consoleErrors: string[]` listing new page JS errors observed since your last command.",
       "jsonSchema": {
         "type": "object",
         "properties": {
@@ -70,6 +70,7 @@
               "press",
               "hover",
               "select",
+              "upload",
               "reload",
               "wait"
             ],
@@ -91,7 +92,7 @@
           "element": {
             "type": "string",
             "maxLength": 300,
-            "description": "Describe the element in words instead of passing target/index, e.g. \"the Continue button in the cookie banner\" or \"the site search box\". A fast model picks it from a fresh snapshot of the page in one quick call — cheaper than a browse_snapshot round trip. That snapshot becomes the new current one, so any snapshotId you already had goes stale; use the result's `resolved.snapshotId` for further index-based calls. Works for click/type/select/hover and for press's optional focus target — press resolves `element` against any focusable candidate (button, text input, or select), not click-only, so it can match a text input too."
+            "description": "Describe the element in words instead of passing target/index, e.g. \"the Continue button in the cookie banner\" or \"the site search box\". A fast model picks it from a fresh snapshot of the page in one quick call — cheaper than a browse_snapshot round trip. That snapshot becomes the new current one, so any snapshotId you already had goes stale; use the result's `resolved.snapshotId` for further index-based calls. Works for click/type/select/hover/upload and for press's optional focus target — press resolves `element` against any focusable candidate (button, text input, or select), not click-only, so it can match a text input too."
           },
           "text": {
             "type": "string",
@@ -110,6 +111,50 @@
             "maximum": 15000,
             "description": "Milliseconds to wait. Used by wait, default 3000, hard cap 15000."
           },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100,
+                  "description": "File name the page sees, e.g. \"avatar.png\". Up to 100 characters, no / or \\."
+                },
+                "mimeType": {
+                  "type": "string",
+                  "description": "MIME type. Default: from the sample kind, else from the name."
+                },
+                "text": {
+                  "type": "string",
+                  "description": "UTF-8 text content. Give exactly one of text, base64 or sample."
+                },
+                "base64": {
+                  "type": "string",
+                  "description": "Raw bytes as base64. Give exactly one of text, base64 or sample."
+                },
+                "sample": {
+                  "type": "string",
+                  "enum": [
+                    "png",
+                    "jpg",
+                    "pdf",
+                    "txt",
+                    "csv"
+                  ],
+                  "description": "A built-in tiny valid file. Give exactly one of text, base64 or sample."
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "additionalProperties": false
+            },
+            "minItems": 1,
+            "maxItems": 5,
+            "description": "Files for upload: 1-5 entries, 2 MB decoded in total. Each is { name, mimeType?, and one of text | base64 | sample }."
+          },
           "actions": {
             "type": "array",
             "items": {
@@ -126,6 +171,7 @@
                     "press",
                     "hover",
                     "select",
+                    "upload",
                     "reload",
                     "wait"
                   ]
@@ -153,6 +199,49 @@
                 "ms": {
                   "type": "number",
                   "maximum": 15000
+                },
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 100,
+                        "description": "File name the page sees, e.g. \"avatar.png\". Up to 100 characters, no / or \\."
+                      },
+                      "mimeType": {
+                        "type": "string",
+                        "description": "MIME type. Default: from the sample kind, else from the name."
+                      },
+                      "text": {
+                        "type": "string",
+                        "description": "UTF-8 text content. Give exactly one of text, base64 or sample."
+                      },
+                      "base64": {
+                        "type": "string",
+                        "description": "Raw bytes as base64. Give exactly one of text, base64 or sample."
+                      },
+                      "sample": {
+                        "type": "string",
+                        "enum": [
+                          "png",
+                          "jpg",
+                          "pdf",
+                          "txt",
+                          "csv"
+                        ],
+                        "description": "A built-in tiny valid file. Give exactly one of text, base64 or sample."
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "minItems": 1,
+                  "maxItems": 5
                 }
               },
               "required": [

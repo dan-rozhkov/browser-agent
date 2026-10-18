@@ -114,7 +114,7 @@ describe("browse_act: forwarding every action kind", () => {
     expect(out).toBe(
       j({
         error:
-          'browse_act: "element" is only supported for click, type, select, hover, and press actions (got "scroll"). Use target or index instead.',
+          'browse_act: "element" is only supported for click, type, select, hover, press, and upload actions (got "scroll"). Use target or index instead.',
         snapshot: S1,
       })
     );

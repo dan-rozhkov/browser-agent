@@ -1322,3 +1322,44 @@ describe("review round 3", () => {
     });
   });
 });
+
+describe("emulation", () => {
+  it("the checkpoint carries the active emulation, and drops it after release", async () => {
+    const { controller, page } = rig();
+    page.sendCdp = async () => undefined;
+    controller.startJournal();
+    const applied = await controller.applyFixture({ version: 1, url: "https://shop.test/cart", emulate: { device: "iphone-15", colorScheme: "dark" } });
+    expect(applied.ok, JSON.stringify(applied)).toBe(true);
+    const withEmulation = ok(await controller.captureCheckpoint());
+    expect(withEmulation.fixture.emulate).toEqual({ device: "iphone-15", colorScheme: "dark" });
+    expect(withEmulation.summary).toContain("emulation (iphone-15");
+    await controller.releaseFixture();
+    expect("emulate" in ok(await controller.captureCheckpoint()).fixture).toBe(false);
+  });
+});
+
+describe("upload", () => {
+  const files = [{ name: "a.txt", text: "hi" }];
+
+  it("a successful upload is a gap (the bytes cannot replay)", async () => {
+    const { controller } = rig();
+    controller.startJournal();
+    const up = await controller.act({ action: "upload", target: "#f", files });
+    expect(up).not.toHaveProperty("error");
+    const r = ok(await controller.captureCheckpoint());
+    expect(r.complete).toBe(false);
+    expect(r.gap).toBe(CHECKPOINT_GAPS.upload);
+    expect(r.summary).toContain(CHECKPOINT_GAPS.upload);
+  });
+
+  it("a refusal before the page is touched leaves no gap", async () => {
+    const { controller, state } = rig();
+    controller.startJournal();
+    const bad = await controller.act({ action: "upload", target: "#f", files: [{ name: "a/b", text: "x" }] });
+    expect(bad).toHaveProperty("error");
+    const none = await controller.act({ action: "upload", target: "#f" });
+    expect(none).toHaveProperty("error");
+    expect(state.selectorCalls).toEqual([]);
+    expect(ok(await controller.captureCheckpoint()).complete).toBe(true);
+  });
+});

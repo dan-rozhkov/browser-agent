@@ -3,7 +3,7 @@
 // recorded since. Pure bookkeeping, no browser access: `BrowserController`
 // reads the page and feeds these classes. Isomorphic.
 import { CHECKPOINT_GAPS, summarizeCheckpoint } from "../fixture/checkpoint.js";
-import { CHECKPOINT_MAX_STEPS, type CheckpointJournalOptions, type FixtureCookie, type FixtureOrigin, type FixtureStep, type PageFixture } from "../fixture/types.js";
+import { CHECKPOINT_MAX_STEPS, type CheckpointJournalOptions, type FixtureCookie, type FixtureEmulate, type FixtureOrigin, type FixtureStep, type PageFixture } from "../fixture/types.js";
 import { httpOrigin } from "../fixture/util.js";
 import type { BrowserPageHandle } from "./controller.js";
 
@@ -74,11 +74,13 @@ export class CheckpointJournal {
   }
 
   /** The checkpoint as a PageFixture. `tabs` are the URLs of the other tabs. */
-  build(tabs: string[]): { fixture: PageFixture; complete: boolean; gap?: string; summary: string } {
+  build(tabs: string[], emulate?: FixtureEmulate): { fixture: PageFixture; complete: boolean; gap?: string; summary: string } {
     const fixture: PageFixture = { version: 1 };
     const base = this.base;
     if (base && httpOrigin(base.url)) fixture.url = base.url;
     if (base?.fresh) fixture.fresh = true;
+    // The emulation of the run: a replay applies the same device before the base page loads.
+    if (emulate) fixture.emulate = structuredClone(emulate);
     const others = tabs.filter((t) => httpOrigin(t));
     if (others.length > 0) fixture.tabs = others;
     const cookies = base?.cookies ?? [];
@@ -127,7 +129,7 @@ export interface JournalCommand {
 }
 
 /** What a command declares to the journal (see `JournalSession.declare`). */
-export type JournalDeclareKind = "action" | "nav" | "history" | "hover";
+export type JournalDeclareKind = "action" | "nav" | "history" | "hover" | "upload";
 
 /** All tabs' journals. The journal follows the current tab; a tab keeps its own. */
 export class JournalSession {
@@ -182,7 +184,7 @@ export class JournalSession {
     command.actedPage ??= page;
     if (kind === "nav") command.navUrlBefore ??= url;
     else if (kind === "history") command.history = true;
-    else command.successGap = CHECKPOINT_GAPS.hover;
+    else command.successGap = kind === "upload" ? CHECKPOINT_GAPS.upload : CHECKPOINT_GAPS.hover;
   }
 
   /** The command made the base itself (`applyFixture`): the settle step must not re-check the page. */

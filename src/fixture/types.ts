@@ -54,6 +54,32 @@ export interface PageFixture {
   expect?: FixtureExpect;
   /** Reset the browser session (cookies, storage, extra tabs) before anything else. Default false. */
   fresh?: boolean;
+  /**
+   * Device and environment emulation (viewport, touch, user agent, locale, time zone, color scheme,
+   * reduced motion). Needs a target whose page has `sendCdp`. Applied after `fresh`, before `url`
+   * and `steps`, on the main tab and on `tabs`. Tabs a page opens later (popups) are NOT emulated.
+   * `release()` clears it. Design: docs/specs/2026-10-18-qa-diagnostics-design.md
+   */
+  emulate?: FixtureEmulate;
+}
+
+/** The names of the built-in device presets. */
+export type FixtureDevice = "iphone-15" | "pixel-8" | "ipad" | "desktop-1440" | "desktop-1920";
+
+export interface FixtureEmulate {
+  /** A preset (viewport, DPR, mobile, touch, user agent). The explicit fields below override it. */
+  device?: FixtureDevice;
+  /** Width and height in CSS pixels (200 to 4000). `deviceScaleFactor` 0.5 to 4. */
+  viewport?: { width: number; height: number; deviceScaleFactor?: number; mobile?: boolean };
+  touch?: boolean;
+  /** At most 512 characters. */
+  userAgent?: string;
+  /** BCP 47, for example "de-DE". */
+  locale?: string;
+  /** IANA, for example "Europe/Berlin". */
+  timezone?: string;
+  colorScheme?: "light" | "dark";
+  reducedMotion?: boolean;
 }
 
 /** All given conditions must hold at once, on the main tab. At least one of `selector`, `text`, `url`. */
@@ -103,7 +129,7 @@ export interface FixtureRequestInfo {
 }
 
 /** Where `applyFixture` stopped. */
-export type FixtureStage = "validate" | "prepare" | "network" | "reset" | "cookies" | "storage" | "url" | "tabs" | "steps" | "expect";
+export type FixtureStage = "validate" | "prepare" | "network" | "reset" | "cookies" | "storage" | "url" | "tabs" | "steps" | "expect" | "emulate";
 
 export type ParsePageFixtureResult = { ok: true; value: PageFixture } | { ok: false; error: string };
 
@@ -137,6 +163,8 @@ export interface FixtureApplyOptions {
 export interface FixtureCaptureOptions {
   /** Keep only cookies and storage of these origins. Default: all. */
   origins?: string[];
+  /** The emulation active in the browser, put into the captured fixture. `BrowserController` fills it in; a target has no way to read it back. */
+  emulate?: FixtureEmulate;
 }
 
 export type FixtureCaptureResult =
@@ -161,12 +189,20 @@ export type FixtureHookResult = { ok: true; dialogs?: FixtureDialog[] } | { ok: 
 export interface FixtureHooks {
   /** Loads `url` in the current tab (bot-wall and aborted-navigation handling included). Must not start after `signal` aborted. */
   navigate?(url: string, signal?: AbortSignal): Promise<FixtureHookResult>;
-  /** Opens a new tab that loads `url` and becomes current. Must not start after `signal` aborted, and must not leave a tab behind after it. */
+  /** Opens a new BLANK tab that becomes current (the apply emulates it, then loads it through `navigate`). Must not start after `signal` aborted, and must not leave a tab behind after it. */
+  newTab?(signal?: AbortSignal): Promise<FixtureHookResult>;
+  /**
+   * @deprecated Use `newTab`. The released hook: opens a new tab AND loads `url` in it (it becomes current).
+   * Used only when the host gives no `newTab`. In that path the apply emulates the tab AFTER its first
+   * load, so the first load of an extra tab is NOT emulated. Must not start after `signal` aborted.
+   */
   openTab?(url: string, signal?: AbortSignal): Promise<FixtureHookResult>;
   /** Sends a trusted key press. Resolve false to fall back to the standalone page-script version. */
   press?(page: BrowserPageHandle, key: ParsedKeySpec): Promise<boolean>;
   /** Called when the apply enters a stage, so a host that cuts the run short can still name the stage. */
   onStage?(stage: FixtureStage): void;
+  /** Called for each page the apply emulated, so a host can track which pages carry an emulation (for example to capture them differently). */
+  onEmulated?(page: BrowserPageHandle, emulate: FixtureEmulate): void;
   /** Runs a click or press `action` and settles after it like `act` does (navigation watcher, load stop, network quiet). */
   settled?<T>(page: BrowserPageHandle, action: () => Promise<T>): Promise<T>;
 }

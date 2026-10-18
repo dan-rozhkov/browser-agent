@@ -1,10 +1,11 @@
 // applyFixture: put a browser into the state a PageFixture describes.
 // Isomorphic: it drives a BrowserTarget (types only) and runs every page step
 // through `executeJavaScript`. Order: session reset, network mocks, cookies,
-// storage per origin, start URL, extra tabs, steps, expect. Error text never repeats cookie or storage data: page
+// emulation, storage per origin, start URL, extra tabs, steps, expect. Error text never repeats cookie or storage data: page
 // errors are reported with fixed words, not with the message the page gave.
 import type { BrowserPageHandle, BrowserTarget } from "../controller/controller.js";
 import { dispatchKeyPair, keyDispatchOptions, parseKeySpec } from "../controller/keys.js";
+import { installEmulation, resolveEmulation } from "./emulate.js";
 import { createNetworkHandler, matchUrlPattern } from "./network.js";
 import { parsePageFixture } from "./parse.js";
 import {
@@ -33,9 +34,57 @@ interface Ctx {
   allowNetworkMocks: boolean;
   /** The part of the apply that runs now: a failure is reported with it. */
   stage: FixtureStage;
-  /** Removes the installed network mocks (idempotent); undefined when none. */
+  /** Removes the installed network mocks and clears the emulation (idempotent); undefined when none. */
   release: (() => Promise<void>) | undefined;
+  /** What `release` undoes, in install order. Filled through `addCleanup`. */
+  cleanups: Array<() => Promise<void>>;
 }
+
+/**
+ * Registers something `release` must undo. All cleanups share ONE release: it runs them in reverse
+ * order, every one even when an earlier one fails, and rethrows the first failure (the network
+ * removal's, as before; an emulation clear never throws).
+ */
+function addCleanup(ctx: Ctx, cleanup: () => Promise<void>): void {
+  ctx.cleanups.push(cleanup);
+  ctx.release ??= once(async () => {
+    let failure: unknown;
+    let failed = false;
+    for (const fn of ctx.cleanups.splice(0).reverse()) {
+      try {
+        await fn();
+      } catch (err) {
+        if (!failed) {
+          failed = true;
+          failure = err;
+        }
+      }
+    }
+    if (failed) throw failure;
+  });
+}
+
+/**
+ * Emulates `page` as `fixture.emulate` says and registers the clear. Popups and tabs opened later
+ * by the page are NOT emulated: only the main tab and the fixture's `tabs` are.
+ */
+async function emulatePage(ctx: Ctx, page: BrowserPageHandle, fixture: PageFixture, label: string): Promise<void> {
+  const emulate = fixture.emulate!;
+  if (!page.sendCdp) throw new FixtureError(EMULATION_UNSUPPORTED);
+  let clear: () => Promise<void>;
+  try {
+    clear = await installEmulation(page, resolveEmulation(emulate));
+  } catch (err) {
+    if (ctx.signal?.aborted) throw err;
+    throw new FixtureError(`${label}: setting emulation failed: ${toMessage(err)}`);
+  }
+  // Registered before the abort check: a failure from here on clears it.
+  addCleanup(ctx, clear);
+  ctx.hooks?.onEmulated?.(page, emulate);
+  throwIfAborted(ctx.signal);
+}
+
+const EMULATION_UNSUPPORTED = "This browser does not support emulation.";
 
 function enter(ctx: Ctx, stage: FixtureStage): void {
   ctx.stage = stage;
@@ -493,12 +542,13 @@ async function abandonTab(ctx: Ctx, tabId: number): Promise<void> {
   }
 }
 
-/** Opens `url` in a new tab that becomes current. Standalone version: `newPage()` takes
- * no url (the desktop target ignores it), so the page is created first and then loaded. */
-async function openTab(ctx: Ctx, url: string): Promise<void> {
+/** Opens a blank new tab that becomes current. `newPage()` takes no url (the desktop target
+ * ignores it), so the tab is created first and the caller loads it: this order lets the
+ * emulation be installed BEFORE the first load of the tab. */
+async function openBlankTab(ctx: Ctx): Promise<void> {
   throwIfAborted(ctx.signal);
-  if (ctx.hooks?.openTab) {
-    takeHookResult(ctx, await ctx.hooks.openTab(url, ctx.signal));
+  if (ctx.hooks?.newTab) {
+    takeHookResult(ctx, await ctx.hooks.newTab(ctx.signal));
     return;
   }
   const info = await ctx.target.newPage!();
@@ -506,9 +556,13 @@ async function openTab(ctx: Ctx, url: string): Promise<void> {
     await abandonTab(ctx, info.tabId);
     throw new FixtureError("aborted");
   }
-  const tab = ctx.target.currentPage();
-  if (!tab) throw new FixtureError("the new tab has no page");
-  await load(tab, url, ctx.signal);
+}
+
+/** Loads `url` in the tab that is current now (the new tab, not the main tab). */
+async function loadCurrentTab(ctx: Ctx, tab: BrowserPageHandle, url: string): Promise<void> {
+  throwIfAborted(ctx.signal);
+  if (ctx.hooks?.navigate) takeHookResult(ctx, await ctx.hooks.navigate(url, ctx.signal));
+  else await load(tab, url, ctx.signal);
 }
 
 async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> {
@@ -532,6 +586,12 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   if (cookies.length > 0) {
     enter(ctx, "cookies");
     if (!target.setCookies) throw new FixtureError("this browser target cannot set cookies (setCookies is missing)");
+  }
+  if (fixture.emulate) {
+    enter(ctx, "emulate");
+    // A page that exists now is checked up front; one that is created later is checked when it is emulated.
+    const existing = target.currentPage();
+    if (existing && !existing.sendCdp) throw new FixtureError(EMULATION_UNSUPPORTED);
   }
   if (tabs.length > 0) {
     enter(ctx, "tabs");
@@ -572,7 +632,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
       throw new FixtureError("installing network mocks failed");
     }
     // Set before the abort check: a failure from here on removes the mocks.
-    ctx.release = once(remove);
+    addCleanup(ctx, remove);
     throwIfAborted(signal);
   }
 
@@ -593,6 +653,11 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
     const current = (await target.listPages()).find((t) => t.current);
     if (!current) throw new FixtureError("the browser reports no current tab");
     ctx.mainId = current.tabId;
+  }
+
+  if (fixture.emulate) {
+    enter(ctx, "emulate");
+    await emulatePage(ctx, await mainPage(ctx), fixture, "main tab");
   }
 
   for (const [i, entry] of origins.entries()) {
@@ -630,8 +695,31 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
 
   if (tabs.length > 0) enter(ctx, "tabs");
   for (const [i, url] of tabs.entries()) {
+    // Blank tab first, then emulation, then the first load: the page never loads without the emulation.
+    // Legacy host (deprecated `openTab` hook, no `newTab`): the hook opens AND loads the tab, so the
+    // emulation below comes after the first load. That load is not emulated.
+    const legacyOpen = !ctx.hooks?.newTab ? ctx.hooks?.openTab : undefined;
     try {
-      await openTab(ctx, url);
+      if (legacyOpen) {
+        throwIfAborted(signal);
+        takeHookResult(ctx, await legacyOpen(url, signal));
+      } else {
+        await openBlankTab(ctx);
+      }
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      throw new FixtureError(`extra tab ${i + 1}: ${toMessage(err)}`);
+    }
+    const tab = target.currentPage();
+    if (!tab) throw new FixtureError(`extra tab ${i + 1}: the new tab has no page`);
+    if (fixture.emulate) {
+      enter(ctx, "emulate");
+      await emulatePage(ctx, tab, fixture, `extra tab ${i + 1}`);
+      enter(ctx, "tabs");
+    }
+    if (legacyOpen) continue;
+    try {
+      await loadCurrentTab(ctx, tab, url);
     } catch (err) {
       if (signal?.aborted) throw err;
       throw new FixtureError(`extra tab ${i + 1}: ${toMessage(err)}`);
@@ -681,6 +769,7 @@ export function fixtureBudgetMs(fixture: PageFixture, opts: FixtureBudgetOptions
   let total = loads * nav + SCRIPT_TIMEOUT_MS;
   if (fixture.fresh) total += nav + RESET_BUDGET_MS;
   if (fixture.network?.length) total += SCRIPT_TIMEOUT_MS;
+  if (fixture.emulate) total += (1 + (fixture.tabs?.length ?? 0)) * SCRIPT_TIMEOUT_MS;
   if (fixture.expect) total += Math.min(fixture.expect.timeoutMs ?? FIXTURE_WAIT_FOR_DEFAULT_MS, FIXTURE_MAX_WAIT_MS) + SCRIPT_TIMEOUT_MS;
   for (const step of fixture.steps ?? []) {
     if (step.action === "goto") total += nav;
@@ -711,6 +800,7 @@ export async function applyParsedFixture(
     allowNetworkMocks: opts.allowNetworkMocks === true,
     stage: "validate",
     release: undefined,
+    cleanups: [],
   };
   const withDialogs = <T extends FixtureApplyResult>(result: T): T => (ctx.dialogs.length > 0 ? { ...result, dialogs: ctx.dialogs } : result);
   try {

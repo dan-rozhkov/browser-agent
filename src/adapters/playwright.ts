@@ -162,6 +162,9 @@ class PwPage implements BrowserPageHandle {
   private title = "";
   private dialogs: { type: string; message: string }[] = [];
   private consoleErrors: string[] = [];
+  private failedRequests: string[] = [];
+  // requestId -> method + redacted URL, for the requests worth reporting if they fail (bounded).
+  private requestInfo = new Map<string, { method: string; url: string }>();
   private navCbs = new Set<() => void>();
   private domReadyWaiters: (() => void)[] = [];
   private pending = new Map<string, { startedAt: number; generation: number }>();
@@ -213,10 +216,20 @@ class PwPage implements BrowserPageHandle {
       if (["WebSocket", "EventSource", "Ping"].includes(p.type ?? "")) return;
       this.gen += 1;
       this.pending.set(p.requestId, { startedAt: Date.now(), generation: this.gen });
+      this.rememberRequest(p.requestId, p.request?.method, p.request?.url);
     });
     const done = (p: { requestId: string }) => this.pending.delete(p.requestId);
-    cdp.on("Network.loadingFinished", done);
-    cdp.on("Network.loadingFailed", done);
+    cdp.on("Network.loadingFinished", (p) => { done(p); this.requestInfo.delete(p.requestId); });
+    cdp.on("Network.responseReceived", (p) => {
+      const status = p.response?.status;
+      if (typeof status === "number" && status >= 400) this.recordFailedRequest(p.requestId, String(status));
+    });
+    cdp.on("Network.loadingFailed", (p) => {
+      done(p);
+      // A request the page canceled itself (an aborted fetch, a navigation away) is not a failure.
+      if (!p.canceled && p.errorText !== "net::ERR_ABORTED") this.recordFailedRequest(p.requestId, p.errorText || "failed");
+      this.requestInfo.delete(p.requestId);
+    });
     try {
       const tree = await cdp.send("Page.getFrameTree");
       this.mainFrameId = tree.frameTree.frame.id;
@@ -343,6 +356,26 @@ class PwPage implements BrowserPageHandle {
   }
   drainDialogs() { return this.dialogs.splice(0); }
   drainConsoleErrors() { return this.consoleErrors.splice(0); }
+  drainFailedRequests() { return this.failedRequests.splice(0); }
+  private rememberRequest(requestId: string, method: string | undefined, url: string | undefined) {
+    if (!url || url.startsWith("data:")) return;
+    let shown: string;
+    try {
+      const u = new URL(url);
+      shown = `${u.origin}${u.pathname}`;
+    } catch {
+      return;
+    }
+    if (shown.startsWith("null")) return;
+    this.requestInfo.set(requestId, { method: method || "GET", url: shown });
+    if (this.requestInfo.size > 500) this.requestInfo.delete(this.requestInfo.keys().next().value as string);
+  }
+  private recordFailedRequest(requestId: string, what: string) {
+    const info = this.requestInfo.get(requestId);
+    if (!info) return;
+    this.failedRequests.push(`${info.method} ${what} ${info.url}`.slice(0, 200));
+    if (this.failedRequests.length > 50) this.failedRequests.shift();
+  }
   onNavigationEvent(cb: () => void) { this.navCbs.add(cb); return () => { this.navCbs.delete(cb); }; }
   networkStats(dropAfterMs: number, sinceGeneration?: number) {
     const now = Date.now();

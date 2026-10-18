@@ -4,6 +4,7 @@
 import {
   FIXTURE_MAX_WAIT_MS,
   type FixtureCookie,
+  type FixtureEmulate,
   type FixtureExpect,
   type FixtureNetworkRule,
   type FixtureOrigin,
@@ -228,6 +229,73 @@ function expectation(value: unknown, path: string): FixtureExpect {
   return out;
 }
 
+const DEVICES = ["iphone-15", "pixel-8", "ipad", "desktop-1440", "desktop-1920"] as const;
+const COLOR_SCHEMES = ["light", "dark"] as const;
+const USER_AGENT_MAX = 512;
+
+function numberIn(value: unknown, path: string, min: number, max: number): number {
+  const n = finiteNumber(value, path);
+  if (n < min || n > max) fail(path, `must be between ${min} and ${max}`);
+  return n;
+}
+
+function integerIn(value: unknown, path: string, min: number, max: number): number {
+  const n = numberIn(value, path, min, max);
+  if (!Number.isInteger(n)) fail(path, "must be a whole number");
+  return n;
+}
+
+function emulation(value: unknown, path: string): FixtureEmulate {
+  const obj = record(value, path);
+  const out: FixtureEmulate = {};
+  const device = optional(obj, "device", (v) => {
+    if (typeof v !== "string" || !(DEVICES as readonly string[]).includes(v)) fail(`${path}.device`, `must be one of ${DEVICES.join(", ")}`);
+    return v as (typeof DEVICES)[number];
+  });
+  if (device !== undefined) out.device = device;
+  const viewport = optional(obj, "viewport", (v) => {
+    const vp = record(v, `${path}.viewport`);
+    const view: NonNullable<FixtureEmulate["viewport"]> = {
+      width: integerIn(vp.width, `${path}.viewport.width`, 200, 4000),
+      height: integerIn(vp.height, `${path}.viewport.height`, 200, 4000),
+    };
+    const dpr = optional(vp, "deviceScaleFactor", (x) => numberIn(x, `${path}.viewport.deviceScaleFactor`, 0.5, 4));
+    if (dpr !== undefined) view.deviceScaleFactor = dpr;
+    const mobile = optional(vp, "mobile", (x) => boolean(x, `${path}.viewport.mobile`));
+    if (mobile !== undefined) view.mobile = mobile;
+    return view;
+  });
+  if (viewport !== undefined) out.viewport = viewport;
+  const touch = optional(obj, "touch", (v) => boolean(v, `${path}.touch`));
+  if (touch !== undefined) out.touch = touch;
+  const userAgent = optional(obj, "userAgent", (v) => {
+    const text = string(v, `${path}.userAgent`);
+    if (text.length > USER_AGENT_MAX) fail(`${path}.userAgent`, `must be at most ${USER_AGENT_MAX} characters`);
+    return text;
+  });
+  if (userAgent !== undefined) out.userAgent = userAgent;
+  const locale = optional(obj, "locale", (v) => {
+    const text = string(v, `${path}.locale`);
+    if (!/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(text)) fail(`${path}.locale`, "must be a BCP 47 tag such as de-DE");
+    return text;
+  });
+  if (locale !== undefined) out.locale = locale;
+  const timezone = optional(obj, "timezone", (v) => {
+    const text = string(v, `${path}.timezone`);
+    if (!/^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+){0,2}$/.test(text)) fail(`${path}.timezone`, "must be an IANA time zone such as Europe/Berlin");
+    return text;
+  });
+  if (timezone !== undefined) out.timezone = timezone;
+  const colorScheme = optional(obj, "colorScheme", (v) => {
+    if (typeof v !== "string" || !(COLOR_SCHEMES as readonly string[]).includes(v)) fail(`${path}.colorScheme`, 'must be "light" or "dark"');
+    return v as (typeof COLOR_SCHEMES)[number];
+  });
+  if (colorScheme !== undefined) out.colorScheme = colorScheme;
+  const reducedMotion = optional(obj, "reducedMotion", (v) => boolean(v, `${path}.reducedMotion`));
+  if (reducedMotion !== undefined) out.reducedMotion = reducedMotion;
+  return out;
+}
+
 function parseOrThrow(input: unknown): PageFixture {
   const obj = record(input, "fixture");
   if (obj.version !== 1) fail("fixture.version", "must be 1");
@@ -250,6 +318,8 @@ function parseOrThrow(input: unknown): PageFixture {
   if (expect !== undefined) out.expect = expect;
   const fresh = optional(obj, "fresh", (v) => boolean(v, "fixture.fresh"));
   if (fresh !== undefined) out.fresh = fresh;
+  const emulate = optional(obj, "emulate", (v) => emulation(v, "fixture.emulate"));
+  if (emulate !== undefined) out.emulate = emulate;
   return out;
 }
 

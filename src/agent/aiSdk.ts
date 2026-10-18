@@ -20,14 +20,21 @@ import {
 import { boundedCall } from "../fixture/util.js";
 import { normalizeScreenshot } from "../policy/schemas.js";
 import {
+  QA_ASSERT_TOOL,
   QA_VERDICT_FIELD,
   QA_VERDICT_TOOL,
+  applyFinalChecks,
   createStepRecorder,
+  executeQaAssert,
   executeQaVerdict,
+  finalChecksApply,
+  parseQaChecks,
   qaResultOf,
   qaVerdictHooks,
+  runFinalChecks,
+  type QaCheck,
 } from "./qaCore.js";
-import { qaVerdictDefinition } from "./qa.js";
+import { qaAssertDefinition, qaVerdictDefinition } from "./qa.js";
 import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
 import { type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
@@ -154,10 +161,19 @@ export interface RunBrowseAgentOptions {
    * answer text can be empty; the verdict reason is in `qa`. With `qa` on, a host extra tool
    * named `qa_verdict` makes the call throw (before any browser command), and result fields
    * named `qa` or `qaVerdict` from a host tool's `end` hook are dropped.
+   * The model also gets `qa_assert` (exact checks on the page, not single-use; it does not end
+   * the run, and a failed check does not change the outcome). Each call is recorded in
+   * `qa.checks` with source "agent". `qa.checks`: final checks (`QaCheck[]`) the host runs ONCE
+   * after the loop, through `browser.assert`, when the outcome is `passed`, `failed` or
+   * `inconclusive` (not for `setup_failed`, `aborted`, `error`). They are recorded with source
+   * "final"; a `passed` run with a failed final check becomes `failed` (see `applyFinalChecks`).
+   * Invalid `checks` make the call throw before any browser command. With `qa` on, a host extra
+   * tool named `qa_assert` makes the call throw too. The result's `qa` also lists the console
+   * errors and failed requests the run saw (`consoleErrors`, `failedRequests`, deduped, at most 20).
    * To run several scenarios in parallel, call `runBrowseAgent` several times,
    * each with its own browser: the package does not orchestrate.
    */
-  qa?: boolean | { onScreenshot?(img: { mediaType: string; base64: string }): void | Promise<void> };
+  qa?: boolean | { onScreenshot?(img: { mediaType: string; base64: string }): void | Promise<void>; checks?: QaCheck[] };
   /**
    * Observe every tool execution: the browse tools and the host tools, also the
    * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
@@ -283,11 +299,22 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const qaOn = opts.qa !== undefined && opts.qa !== false;
   const onScreenshot = typeof opts.qa === "object" ? opts.qa.onScreenshot : undefined;
   if (qaOn && opts.extraTools?.[QA_VERDICT_TOOL]) throw new Error(`runBrowseAgent: qa mode owns the tool name ${QA_VERDICT_TOOL}; rename your extra tool.`);
+  if (qaOn && opts.extraTools?.[QA_ASSERT_TOOL]) throw new Error(`runBrowseAgent: qa mode owns the tool name ${QA_ASSERT_TOOL}; rename your extra tool.`);
+  const finalChecks = typeof opts.qa === "object" && opts.qa.checks && opts.qa.checks.length > 0 ? opts.qa.checks : undefined;
+  if (finalChecks) {
+    const parsedChecks = parseQaChecks(finalChecks);
+    if (!parsedChecks.ok) throw new Error(`runBrowseAgent: qa.checks: ${parsedChecks.errors.join("; ")}`);
+  }
+  const trail = qaOn ? createStepRecorder() : undefined;
   const extras: Record<string, BrowseAgentExtraTool> = {
     ...opts.extraTools,
-    ...(qaOn ? { [QA_VERDICT_TOOL]: { ...qaVerdictHooks(), ...qaVerdictDefinition, execute: async (input: unknown) => executeQaVerdict(input) } } : {}),
+    ...(qaOn && trail
+      ? {
+          [QA_VERDICT_TOOL]: { ...qaVerdictHooks(), ...qaVerdictDefinition, execute: async (input: unknown) => executeQaVerdict(input) },
+          [QA_ASSERT_TOOL]: { ...qaAssertDefinition, execute: async (input: unknown) => executeQaAssert(input, opts.browser, trail) },
+        }
+      : {}),
   };
-  const trail = qaOn ? createStepRecorder() : undefined;
   const executeTool = async (call: BrowseAgentToolCall, ctx: { signal: AbortSignal }) => {
     // Observers must not change the run: a throw in one is ignored.
     const finishers: ((result: { output?: string; error?: unknown }) => void)[] = [];
@@ -325,7 +352,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     deadlineMs: opts.deadlineMs,
     maxRequests: opts.maxRequests,
     baseTools,
-    extraTools: Object.fromEntries(Object.entries(extras).map(([n, e]) => [n, qaOn && n !== QA_VERDICT_TOOL ? reservedFieldsDropped(e) : { guard: e.guard?.bind(e), begin: e.begin?.bind(e), endsRun: e.endsRun?.bind(e), end: e.end?.bind(e), fork: e.fork?.bind(e) }])),
+    extraTools: Object.fromEntries(Object.entries(extras).map(([n, e]) => [n, qaOn && n !== QA_VERDICT_TOOL && n !== QA_ASSERT_TOOL ? reservedFieldsDropped(e) : { guard: e.guard?.bind(e), begin: e.begin?.bind(e), endsRun: e.endsRun?.bind(e), end: e.end?.bind(e), fork: e.fork?.bind(e) }])),
     executeTool,
   });
 
@@ -395,9 +422,16 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     if (!trail) return result;
     // `qa` is an extra field: it goes before `error` and `setupStage`, and the verdict field is folded into it.
     const { error, setupStage, [QA_VERDICT_FIELD]: _verdict, ...rest } = result;
+    let qa = qaResultOf(result, trail.steps(), trail.extras());
+    if (finalChecks && finalChecksApply(qa)) {
+      // The mocks live until the release in `finally`. The checks run bounded; a failure to run them fails every check.
+      const finalResults = await runFinalChecks(opts.browser, finalChecks, trail);
+      // The final assert drained more errors into the recorder: refresh the run-level lists (the steps did not change).
+      qa = applyFinalChecks({ ...qa, ...trail.extras() }, finalResults);
+    }
     return {
       ...rest,
-      qa: qaResultOf(result, trail.steps()),
+      qa,
       ...(error !== undefined ? { error } : {}),
       ...(setupStage !== undefined ? { setupStage } : {}),
     } as BrowseAgentResult;
