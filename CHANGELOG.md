@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.26](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.25...v0.2.26) (2026-10-19)
+
+
+### Features
+
+* **agent:** opt-in browse_open app field to launch a desktop app ([2ac2093](https://github.com/dan-rozhkov/browser-agent/commit/2ac2093ed99ff1a07f819d3ec8024a78634b234b))
+
 ## [0.2.25](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.24...v0.2.25) (2026-10-19)
 
 
