@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.25](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.24...v0.2.25) (2026-10-19)
+
+
+### Features
+
+* **adapters:** drive Electron desktop apps over CDP (launchElectronApp) ([9f9b50a](https://github.com/dan-rozhkov/browser-agent/commit/9f9b50a9bd7fbbb964f0f136b6d1341e19903934))
+
 ## [0.2.24](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.23...v0.2.24) (2026-10-19)
 
 
