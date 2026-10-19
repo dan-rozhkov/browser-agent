@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.24](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.23...v0.2.24) (2026-10-19)
+
+
+### Features
+
+* **agent:** qa.judge — a second model reviews a passed QA outcome ([fa8645d](https://github.com/dan-rozhkov/browser-agent/commit/fa8645d1f271ce14047ddb493a46f530a39900f4))
+
 ## [0.2.23](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.22...v0.2.23) (2026-10-18)
 
 
