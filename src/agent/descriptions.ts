@@ -35,18 +35,29 @@ export interface BrowseDescriptionSlots {
    * because `executeBrowseTool` refuses an element-only call.
    * `createBrowseToolDefinitions` also adds the matching field to the schema. */
   elementTargeting?: boolean;
+  /** Advertise `app` in browse_open (launch a desktop Electron app). Default false.
+   * `createBrowseToolDefinitions` also adds the matching field to the schema. */
+  appLaunch?: boolean;
+  /** Text added to browse_open's description when `appLaunch` is true. Default: a neutral STE text. */
+  openApp?: string;
   /** Second sentence of browse_read about why and when to read. */
   readHow?: string;
 }
 
 const join = (...parts: (string | undefined)[]): string => parts.filter((p): p is string => !!p).join(" ");
 
+const DEFAULT_OPEN_APP =
+  "Desktop apps: pass `app`, the path of a macOS .app of an Electron app (for example /Applications/Orca.app), instead of `url`. Pass `url` or `app`, not both.";
+
 export function describeBrowseOpen(slots: BrowseDescriptionSlots = {}): string {
   return join(
     slots.openIntro ?? slots.taskHint,
     slots.openLead ?? "Opens a browser tab and navigates it to",
-  ) + " `url`, waiting for the page to finish loading. Returns `{ url, title }` with the FINAL url after any redirects, plus `snapshot` (the same shape browse_snapshot returns — `{ snapshotId, elements, scroll, truncated? }`) taken once the page has settled, so you usually don't need a separate browse_snapshot call right after opening. May also carry `botCheck: true` when the loaded page looks like a CAPTCHA/anti-bot wall (\"just a moment\", \"verify you are human\", captcha, cloudflare…) — when set, hand the task back to the user instead of trying to click through it."
+  ) + (slots.appLaunch === true
+    ? " `url`, or starts the desktop app in `app` if you pass `app` instead of `url`, waiting for the page to finish loading."
+    : " `url`, waiting for the page to finish loading.") + " Returns `{ url, title }` with the FINAL url after any redirects, plus `snapshot` (the same shape browse_snapshot returns — `{ snapshotId, elements, scroll, truncated? }`) taken once the page has settled, so you usually don't need a separate browse_snapshot call right after opening. May also carry `botCheck: true` when the loaded page looks like a CAPTCHA/anti-bot wall (\"just a moment\", \"verify you are human\", captcha, cloudflare…) — when set, hand the task back to the user instead of trying to click through it."
     + (slots.openReach ? " " + slots.openReach : "")
+    + (slots.appLaunch === true ? " " + (slots.openApp ?? DEFAULT_OPEN_APP) : "")
     + " " + "Once open, act on the returned `snapshot` directly with browse_act (by index or selector); take a fresh browse_snapshot/browse_screenshot only if it's missing or the page has since changed.";
 }
 

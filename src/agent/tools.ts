@@ -12,7 +12,7 @@ import {
 import {
   createBrowseActInputSchema,
   browseFindImagesInputSchema,
-  browseOpenInputSchema,
+  createBrowseOpenInputSchema,
   browseReadInputSchema,
   browseScreenshotInputSchema,
   browseSnapshotInputSchema,
@@ -39,7 +39,7 @@ export type BrowseToolDefinitions = Record<BrowseAgentToolName, BrowseToolDefini
  */
 export function createBrowseToolDefinitions(slots: BrowseDescriptionSlots = {}): BrowseToolDefinitions {
   return {
-    browse_open: { description: describeBrowseOpen(slots), inputSchema: browseOpenInputSchema },
+    browse_open: { description: describeBrowseOpen(slots), inputSchema: createBrowseOpenInputSchema({ appLaunch: slots.appLaunch === true }) },
     browse_snapshot: { description: describeBrowseSnapshot(slots), inputSchema: browseSnapshotInputSchema },
     browse_screenshot: { description: describeBrowseScreenshot(slots), inputSchema: browseScreenshotInputSchema },
     browse_act: { description: describeBrowseAct(slots), inputSchema: createBrowseActInputSchema({ elementTargeting: slots.elementTargeting === true }) },

@@ -53,12 +53,17 @@ const BROWSE_ACT_NO_ELEMENT_ACTIONS = new Set([
   "viewport",
 ]);
 
+// A strict-mode placeholder: null or "" (with `trim`, a whitespace-only string too).
+function isPlaceholder(value: unknown, trim = false): boolean {
+  return value === null || value === "" || (trim && typeof value === "string" && value.trim() === "");
+}
+
 // One file of an `upload` batch: the same strict-mode placeholders ("" / null) are removed.
 function stripUploadFilePlaceholders(file: unknown): unknown {
   if (!file || typeof file !== "object" || Array.isArray(file)) return file;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(file)) {
-    if (value === null || value === "") continue;
+    if (isPlaceholder(value)) continue;
     out[key] = value;
   }
   return out;
@@ -76,7 +81,7 @@ function stripBrowseActPlaceholders(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(entry)) {
-    if (value === null || value === "") continue;
+    if (isPlaceholder(value)) continue;
     // An empty `files` array is the strict-mode placeholder for "no files".
     if (key === "files" && Array.isArray(value) && value.length === 0) continue;
     if (key === "files" && Array.isArray(value)) {
@@ -294,6 +299,54 @@ export const browseActInputSchema = createBrowseActInputSchema();
 export const browseOpenInputSchema = z.object({
   url: z.string().describe("The URL to navigate the browser tab to."),
 });
+
+export interface BrowseOpenSchemaOptions {
+  /** Let the model pass `app` (a macOS .app path) instead of `url`. Default false. */
+  appLaunch?: boolean;
+}
+
+// Strict-mode models send "" for every key they do not use, so an empty `url`
+// or `app` means "absent" (same idea as `stripBrowseActPlaceholders`).
+function stripBrowseOpenPlaceholders(entry: unknown): unknown {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return entry;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(entry)) {
+    if ((key === "url" || key === "app") && isPlaceholder(value, true)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * browse_open input. Without `appLaunch` this is exactly `browseOpenInputSchema`.
+ * With it, `url` is optional and `app` is added; exactly one of the two must be
+ * non-empty.
+ */
+export function createBrowseOpenInputSchema(opts: BrowseOpenSchemaOptions = {}): z.ZodTypeAny {
+  if (opts.appLaunch !== true) return browseOpenInputSchema;
+  return z.preprocess(
+    stripBrowseOpenPlaceholders,
+    z
+      .object({
+        url: z.string().optional().describe("The URL to navigate the browser tab to."),
+        app: z
+          .string()
+          .max(1024)
+          .optional()
+          .describe("The path of a macOS .app of an Electron desktop app to launch, for example /Applications/Orca.app. Use instead of `url`."),
+      })
+      .superRefine((value, ctx) => {
+        const hasUrl = typeof value.url === "string" && value.url.trim() !== "";
+        const hasApp = typeof value.app === "string" && value.app.trim() !== "";
+        if (hasUrl === hasApp) {
+          ctx.addIssue({
+            code: "custom",
+            message: "Provide exactly one of a non-empty `url` or a non-empty `app`.",
+          });
+        }
+      }),
+  );
+}
 
 export const browseSnapshotInputSchema = z.object({});
 

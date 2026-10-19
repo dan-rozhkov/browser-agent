@@ -70,12 +70,15 @@ export interface ExecuteBrowseToolOptions {
     commandFailed?: string;
     /** The bridge lacks `screenshot` or `tabs`. (A missing `findImages` is not guarded: the call throws and its message is the error.) */
     methodMissing?: (tool: string) => string;
+    /** browse_open got `app` but the bridge has no `launchApp`. */
+    appLaunchMissing?: string;
   };
   /** Runs after `browse_screenshot` when the input has `placeOnCanvas: true`. */
   afterScreenshot?: (ctx: AfterScreenshotContext) => Promise<string>;
 }
 
 const NOT_AVAILABLE_DEFAULT = "The browser is not available.";
+const APP_LAUNCH_MISSING_DEFAULT = "Launching a desktop app is not available in this browser.";
 const COMMAND_FAILED_DEFAULT = "Browser command failed.";
 const methodMissingDefault = (tool: string) => `${tool} is not supported by this browser.`;
 
@@ -439,6 +442,14 @@ export async function executeBrowseTool(
   switch (toolName) {
     case "browse_open": {
       if (!browser) return notAvailable();
+      const app = typeof args.app === "string" ? args.app.trim() : "";
+      if (app !== "") {
+        if (!browser.launchApp) return err(opts.texts?.appLaunchMissing ?? APP_LAUNCH_MISSING_DEFAULT);
+        const launched = await callBridge(() => browser.launchApp!({ app }), opts);
+        const parsedLaunch = parseResultObject(launched);
+        if (resultError(parsedLaunch)) return launched;
+        return JSON.stringify(await attachSnapshot(browser, parsedLaunch));
+      }
       const raw = await callBridge(() => browser.open(args as { url: string }), opts);
       const parsed = parseResultObject(raw);
       if (resultError(parsed)) return raw;

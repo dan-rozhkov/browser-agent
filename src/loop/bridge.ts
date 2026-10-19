@@ -57,6 +57,13 @@ export interface BrowserBridge {
    * makes the new tab the agent's current tab. Optional — absent on bridges
    * older than this feature.
    */
+  /**
+   * browse_open with `app` (opt-in `appLaunch` tool variant) — start a desktop
+   * app and make its window the current tab. Resolves like `open`
+   * (`{ url, title }` or `{ error }`). Optional: a bridge that cannot launch
+   * apps leaves it out, and the executor answers with a neutral error.
+   */
+  launchApp?(args: { app: string }): Promise<unknown>;
   tabs?(args: {
     action: "list" | "switch" | "close" | "new";
     tabId?: number;

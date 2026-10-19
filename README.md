@@ -374,6 +374,13 @@ What the package owns:
   (`browseScreenshotInputSchema.extend({...})`). `browse_act` has no `element`
   field in the neutral definitions: a host that resolves `element` itself passes
   `elementTargeting: true` in the slots (text and schema, in one switch).
+  Likewise `appLaunch: true` makes `browse_open` take an optional `app` (a macOS
+  .app path of an Electron app) instead of `url` (exactly one of the two), with
+  the text slot `openApp`; `createBrowseOpenInputSchema({ appLaunch })` builds
+  the schema alone. `executeBrowseTool` forwards a non-empty `app` to the optional
+  `BrowserBridge.launchApp({ app })` (the host implements it, for example with
+  `launchElectronApp`) and attaches a snapshot; without `launchApp` it answers
+  with a neutral error (`texts.appLaunchMissing`). The controller ignores `app`.
 - **Limits**: `BROWSE_AGENT_MAX_REQUESTS` (60), `BROWSE_AGENT_DEADLINE_MS`
   (14 min), answer and error caps.
 - **Session core**: `createBrowseAgentSession`. The deadline, the abort signal,
