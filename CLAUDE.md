@@ -24,7 +24,7 @@ Run lint, test and build before you call work done. Do not pipe them through
 src/controller/   BrowserController, page scripts, keys, navigation (BrowserTarget/PageHandle)
 src/policy/       decideStep / planGoal / locateTarget, step policies, schemas, DecisionClient, TextModel
 src/loop/         runBrowseTask, action cache, loop guard, BrowserBridge, BrowseBackend, KeyValueStorage
-src/adapters/     playwright, systemoneHttp, aiSdk, httpBackend, localBackend, controllerBridge
+src/adapters/     playwright, electron (launchElectronApp; reaches Playwright only through playwright.ts), systemoneHttp, aiSdk, httpBackend, localBackend, controllerBridge
 src/agent/        browse agent mode: prompt, tool definitions, session core (zod only); sessionEntry.ts = zod-free `agent/session`; execute.ts + executeEntry.ts = the one executor of the seven browse tools, zod-free `agent/execute`; aiSdk.ts = runBrowseAgent (peer ai); qaCore.ts = QA mode parts (qa_verdict hooks, executeQaVerdict, outcome, step recorder, prompt section; zod-free, exported from `agent/session` and `agent`); qa.ts = the zod schema of qa_verdict, re-exports qaCore
 src/shared/       neutral, zod-free code that both controller and agent import (QA check parser/evaluation `qaChecks.ts`, QA result types `qaTypes.ts`); the controller must not import from src/agent
 src/fixture/      PageFixture: types, parsePageFixture, applyFixture, captureFixture, network rule matcher (isomorphic, zod-free; subpath `fixture`)

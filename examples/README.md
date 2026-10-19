@@ -49,3 +49,19 @@ screenshot result stays text only here (the default). Pass
 
 It prints the run result (`status`, `answer`, `steps`) as JSON. It needs network
 access and a real key. `npm run lint` type-checks it.
+
+## run-app.ts
+
+`run-app.ts` drives an Electron desktop app: `launchElectronApp` starts it with a CDP
+port and a fresh temp profile, then `runBrowseAgent` runs with the same model and
+settings as `run-agent.ts` (no start URL). Opening URLs and new tabs is locked, so the
+agent works inside the app windows. It prints `{ status, answer, steps, ms }` and closes
+the app in `finally`.
+
+```bash
+APP=/Applications/Orca.app OPENROUTER_API_KEY=... \
+  npx tsx examples/run-app.ts "open the settings and read the first option"
+```
+
+`APP` is a `.app` bundle or an executable path. `AGENT_MODEL` works as in `run-agent.ts`.
+An app that strips `--remote-debugging-port` fails with a clear error after 30 s.

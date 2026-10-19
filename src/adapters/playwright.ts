@@ -645,12 +645,13 @@ export function redactedError(e: unknown, secret: string): Error {
 // a deployment (or test) that never opens a cloud browser never loads it.
 export async function connectOverCdp(
   cdpUrl: string,
+  controllerOptions?: ConstructorParameters<typeof BrowserController>[1],
 ): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }> {
   try {
     const { chromium } = await import("playwright-core");
     const browser = await chromium.connectOverCDP(cdpUrl);
     const context = browser.contexts()[0] ?? (await browser.newContext());
-    const controller = new BrowserController(new PlaywrightTarget(context));
+    const controller = new BrowserController(new PlaywrightTarget(context), controllerOptions);
     return {
       controller,
       close: () => browser.close(),

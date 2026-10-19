@@ -34,6 +34,10 @@
       "types": "./dist/adapters/playwright.d.ts",
       "default": "./dist/adapters/playwright.js"
     },
+    "./adapters/electron": {
+      "types": "./dist/adapters/electron.d.ts",
+      "default": "./dist/adapters/electron.js"
+    },
     "./adapters/systemone-http": {
       "types": "./dist/adapters/systemoneHttp.d.ts",
       "default": "./dist/adapters/systemoneHttp.js"
@@ -129,6 +133,9 @@
       ],
       "adapters/playwright": [
         "dist/adapters/playwright.d.ts"
+      ],
+      "adapters/electron": [
+        "dist/adapters/electron.d.ts"
       ],
       "adapters/systemone-http": [
         "dist/adapters/systemoneHttp.d.ts"

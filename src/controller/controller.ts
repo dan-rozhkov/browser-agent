@@ -869,6 +869,10 @@ function fixtureResult<T>(result: BrowserCommandResult, stage?: FixtureStage): T
   return { ok: false, ...(stage !== undefined ? { stage } : {}), error: String(result.error ?? "The fixture command failed.") } as unknown as T;
 }
 
+/** The default error of `lockNavigation` (app mode). */
+export const APP_MODE_LOCK_MESSAGE =
+  "This is a desktop app window, not a browser tab. Opening URLs and new tabs is off. Use the elements in the snapshot.";
+
 function errorResult(message: string): BrowserCommandResult {
   return { error: message };
 }
@@ -1440,6 +1444,8 @@ export class BrowserController {
     return this.cursorEnabled ? Math.min(this.timeoutMs, CURSOR_TIMEOUT_MS) : 0;
   }
 
+  private readonly lockMessage: string | undefined;
+
   constructor(
     private readonly target: BrowserTarget,
     opts?: {
@@ -1449,8 +1455,13 @@ export class BrowserController {
       cursor?: boolean | (() => boolean);
       /** CURSOR_JS motion style (see its doc comment); a getter is re-read on every move. */
       cursorMotion?: string | undefined | (() => string | undefined);
+      /** App mode (a desktop app window, not a browser tab): `open` and `tabs` "new" return
+       * `{ error }` instead of navigating or opening a tab. `true` uses `APP_MODE_LOCK_MESSAGE`; a
+       * string is the message. Switching tabs, closing, reload and back are unchanged. Default off. */
+      lockNavigation?: boolean | string;
     },
   ) {
+    this.lockMessage = opts?.lockNavigation === true ? APP_MODE_LOCK_MESSAGE : opts?.lockNavigation || undefined;
     this.timeoutMs = opts?.timeoutMs ?? BROWSER_COMMAND_TIMEOUT_MS;
     // An explicitly supplied timeoutMs bounds EVERY command including
     // open — a caller (or a test) that asks for a short budget means it.
@@ -1573,6 +1584,7 @@ export class BrowserController {
   }
 
   private async openUnlocked(args: unknown): Promise<BrowserCommandResult> {
+    if (this.lockMessage) return errorResult(this.lockMessage);
     const validated = validateOpenArgs(args);
     if (!validated.ok) return errorResult(validated.error);
     return this.withCommandTimeout(async () => {
@@ -1663,6 +1675,10 @@ export class BrowserController {
       await this.releaseFixtureUnlocked(undefined, previousInFlight).catch(() => {});
       const parsed = parsePageFixture(fixture);
       if (!parsed.ok) return { ok: false as const, stage: "validate" as const, error: parsed.error };
+      // App mode: `fresh` closes every window and loads about:blank, and `tabs` opens new windows.
+      if (this.lockMessage && (parsed.value.fresh === true || (parsed.value.tabs?.length ?? 0) > 0)) {
+        return { ok: false as const, stage: "validate" as const, error: this.lockMessage };
+      }
       let stage: FixtureStage = "validate";
       const journalSession = this.journal;
       const journalCommand = journalSession?.current ?? null;
@@ -1699,6 +1715,7 @@ export class BrowserController {
         // then loads it through the `navigate` hook (`open`), so the emulation is there before the first load.
         newTab: async (abortSignal) => {
           if (abortSignal?.aborted) return aborted;
+          if (this.lockMessage) return { ok: false, error: this.lockMessage };
           const before = (await this.listPagesSafe()).find((t) => t.current)?.tabId;
           const tab = await this.target.newPage!();
           if (abortSignal?.aborted) {
@@ -4765,6 +4782,7 @@ export class BrowserController {
     const validated = validateTabsArgs(args);
     if (!validated.ok) return errorResult(validated.error);
     const { action, tabId, url } = validated.value;
+    if (action === "new" && this.lockMessage) return errorResult(this.lockMessage);
     if (!this.target.listPages || !this.target.selectPage || !this.target.closePage || !this.target.newPage) {
       return errorResult("Tab management is not supported by this browser build.");
     }
@@ -4817,6 +4835,9 @@ export class BrowserController {
         return this.listTabsResult();
       }
       // close
+      if (this.lockMessage && (await this.target.listPages!()).length <= 1) {
+        return errorResult(`${this.lockMessage} The last window cannot be closed.`);
+      }
       const ok = await this.target.closePage!(tabId!);
       if (!ok) return errorResult(`No browser tab with id ${tabId} to close, or it is not a browser tab.`);
       return this.listTabsResult();

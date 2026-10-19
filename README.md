@@ -106,6 +106,7 @@ await close();
 | `@sideform/browser-agent/policy` | policy layer |
 | `@sideform/browser-agent/loop` | loop layer |
 | `@sideform/browser-agent/adapters/playwright` | `PlaywrightTarget`, `connectOverCdp`, `playwrightContexts` |
+| `@sideform/browser-agent/adapters/electron` | `launchElectronApp`: start an Electron app with a CDP port and drive its windows (Node only, peer: `playwright-core`) |
 | `@sideform/browser-agent/adapters/systemone-http` | `createSystemOneClient` |
 | `@sideform/browser-agent/adapters/ai-sdk` | `aiSdkTextModel` |
 | `@sideform/browser-agent/adapters/http-backend` | `createHttpBackend` |
@@ -201,6 +202,34 @@ memoryStorage(): KeyValueStorage;
 `runBrowseTaskCore`, the deadline helpers and the action-cache, effect and
 loop-guard modules.
 
+## Desktop apps (Electron)
+
+`launchElectronApp` (`@sideform/browser-agent/adapters/electron`, Node only, peer `playwright-core`)
+starts an Electron app with `--remote-debugging-port` and a profile dir, waits for the first window,
+and connects the controller over CDP. Each `BrowserWindow` is a tab; the snapshot and all page
+commands work as in a browser.
+
+```ts
+const app = await launchElectronApp({ app: "/Applications/Orca.app" });
+try {
+  const result = await runBrowseAgent(goal, { model, browser: app.browser });
+} finally {
+  await app.close();
+}
+```
+
+- `app` is a macOS `.app` bundle (the executable comes from `Info.plist`) or a direct executable path.
+  The app is spawned directly, so the launcher owns the pid. `close()` sends SIGTERM, waits 3 s, then SIGKILL.
+- **Fresh profile.** Without `userDataDir` the launcher makes a temp profile (clean state: no login, no
+  settings) and deletes it on `close()`. A `userDataDir` you pass is kept.
+- **Navigation lock.** The controller runs with `lockNavigation: true`. `open` and `tabs` `new` return
+  `{ error }` ("This is a desktop app window, not a browser tab ..."), because loading a URL in the only
+  window destroys the app UI. Switching windows, reload and back still work. Tell the model it drives a
+  desktop app, for example with `prompt: { sections: [...] }` (see `examples/run-app.ts`).
+- **Apps that block the debug port.** Some apps strip `--remote-debugging-port` (Figma is one). No port opens,
+  and the launcher kills the child and throws an error that says so after `timeoutMs` (default 30 s).
+- **Limits.** Native menus, file dialogs and other OS windows are not web content: the agent does not see them.
+
 ## API: adapters
 
 ```ts
@@ -209,6 +238,11 @@ class PlaywrightTarget implements BrowserTarget { constructor(context: BrowserCo
 connectOverCdp(cdpUrl: string): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }>;
 redactedError(e: unknown, secret: string): Error;
 playwrightContexts(browser: Browser, contextOptions?: BrowserContextOptions, controllerOptions?: ConstructorParameters<typeof BrowserController>[1]): () => Promise<OpenedBrowser>;  // a new isolated context per call, for parallel runs
+
+// adapters/electron   (Node only; peer: playwright-core)
+launchElectronApp(opts: { app: string; args?: string[]; env?: NodeJS.ProcessEnv; userDataDir?: string; port?: number; timeoutMs?: number;
+  controllerOptions?: ConstructorParameters<typeof BrowserController>[1] }, deps?: ElectronLaunchDeps):
+  Promise<{ controller: BrowserController; browser: BrowserBridge; cdpUrl: string; pid: number; close(): Promise<void> }>;
 
 // adapters/systemone-http
 createSystemOneClient(opts: { apiKey?: string; model?: string; baseUrl?: string;
