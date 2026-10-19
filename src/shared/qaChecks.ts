@@ -5,6 +5,7 @@
 import type { QaCheck, QaCheckResult, QaElementState } from "./qaTypes.js";
 
 export const QA_ASSERT_TOOL = "qa_assert";
+export const QA_VERDICT_TOOL = "qa_verdict";
 /** `qa_verdict` reason: 1 to this many chars. Every `qa.reason` stays within it. */
 export const REASON_MAX_CHARS = 500;
 /** One `qa_assert` call (and the `checks` option) takes at most this many checks. */

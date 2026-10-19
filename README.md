@@ -510,6 +510,32 @@ of `qaVerdictSchema`.
 `examples/qa-suite.ts <scenarios.json>` runs a list with OpenRouter and a small pool of its own;
 `npm run qa-smoke` runs three parallel runs with a scripted model in a real Chromium, no keys.
 
+### QA judge
+
+The model that runs the scenario also gives the verdict, so it grades its own work. Add a second
+model to review a `passed` outcome:
+
+```ts
+const result = await runBrowseAgent("Add a task and see it in the list", {
+  model, browser, url,
+  qa: { judge: { model: judgeModel, context: "The list screen is called Inbox." } },
+});
+result.qa.judge;   // { verdict: "pass" | "fail" | "inconclusive", reason } or { error }
+```
+
+The judge sees the scenario, your `context`, the steps (without the `qa_verdict` call), the checks, the
+console errors, the failed requests and the final page (URL, title and full text from one `browse_read`, with `browse_snapshot` as the fallback).
+It does not see the text, the reasoning or the verdict of the acting model. It can only lower the
+outcome: `fail` makes it `failed` and `inconclusive` makes it `inconclusive`, with the reason
+`Judge: <reason>. Agent verdict: <reason>`. It runs only for `passed`, after the final checks, so a
+failed check always wins. A judge error (timeout, provider error, invalid answer) does not fail the run:
+the outcome stays `passed` and `qa.judge` is `{ error }`. You decide if such a pass counts.
+The judge request does not delay the screenshot, the checkpoint or the fixture release. The result waits for it.
+`context` is at most 16 KiB. `timeoutMs` (an integer from 1 to 2147483647, default 60 s) is the judge's own budget, outside `deadlineMs`.
+An abort of `signal` during the judge gives `{ error }` and keeps the outcome. A bad `qa.judge` option makes the call throw before any browser command. A host on the session core uses the parts
+from `agent/session`: `QA_JUDGE_SYSTEM`, `buildQaJudgePrompt`, `parseQaJudgeVerdict`, `applyQaJudge`
+and `judgePageOf`.
+
 ## Page fixtures
 
 A `PageFixture` is the state of a browser before a task: cookies, localStorage,

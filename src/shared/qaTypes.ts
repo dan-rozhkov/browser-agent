@@ -36,7 +36,19 @@ export interface QaResult {
   failedRequestsDropped?: number;
   /** Assertion results, in order: the agent's `qa_assert` calls, then the host's final checks. Absent when none ran. */
   checks?: QaCheckRecord[];
+  /** The judge's answer (docs/specs/2026-10-19-qa-judge-design.md). Present only when the judge ran. */
+  judge?: QaJudgeResult;
 }
+
+/** The answer of the QA judge model. */
+export interface QaJudgeVerdict {
+  verdict: "pass" | "fail" | "inconclusive";
+  /** One or two sentences: what the scenario expects and what the evidence shows. */
+  reason: string;
+}
+
+/** The judge's verdict, or the error of a judge that did not run to the end (the outcome stays as it was). */
+export type QaJudgeResult = QaJudgeVerdict | { error: string };
 
 /** One deterministic check of the page (docs/specs/2026-10-18-qa-diagnostics-design.md, section 2). */
 export type QaElementState = "visible" | "hidden" | "exists" | "absent" | "enabled" | "disabled" | "checked" | "unchecked";

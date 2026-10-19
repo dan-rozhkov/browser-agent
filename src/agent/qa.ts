@@ -2,7 +2,7 @@
 // (hooks, outcome, recorder, prompt section) is the zod-free core in qaCore.ts,
 // re-exported here so `agent` keeps one QA surface. Imports `zod` (no `ai`, no `node:*`).
 import { z } from "zod";
-import type { QaVerdict } from "./qaCore.js";
+import type { QaJudgeVerdict, QaVerdict } from "./qaCore.js";
 import { QA_CHECKS_MAX, QA_CHECK_STRING_MAX_CHARS, REASON_MAX_CHARS, normalizeQaChecks } from "./qaCore.js";
 import type { QaCheck } from "./qaTypes.js";
 
@@ -17,6 +17,14 @@ export const qaVerdictSchema = z.object({
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
 type AssertTrue<T extends true> = T;
 export type QaVerdictTypesAgree = AssertTrue<Same<QaVerdict, z.infer<typeof qaVerdictSchema>>>;
+
+/** The answer of the QA judge model (`runBrowseAgent({ qa: { judge } })`). */
+export const qaJudgeSchema = z.object({
+  verdict: z.enum(["pass", "fail", "inconclusive"]).describe('"pass" when the evidence shows every expected result, "fail" when a result is absent or wrong, "inconclusive" when the evidence is not enough.'),
+  // No max: a long reason is cut by `parseQaJudgeVerdict`, not rejected, so a verbose `fail` is not lost.
+  reason: z.string().trim().min(1).describe("One or two sentences: what the scenario expects and what the evidence shows."),
+});
+export type QaJudgeTypesAgree = AssertTrue<Same<QaJudgeVerdict, z.infer<typeof qaJudgeSchema>>>;
 
 /** The description and input schema of `qa_verdict`. */
 export const qaVerdictDefinition = {

@@ -5,13 +5,13 @@
 // This is the zod-free core (exported from `agent/session` and `agent`); the zod
 // schema of `qa_verdict` is in qa.ts. Imports the session and result only.
 import { browseAgentErrorMessage, type BrowseAgentStatus } from "./result.js";
-import { QA_ASSERT_TOOL, REASON_MAX_CHARS, type QaFinalSink } from "./qaChecks.js";
+import { QA_ASSERT_TOOL, QA_VERDICT_TOOL, REASON_MAX_CHARS, type QaFinalSink } from "./qaChecks.js";
 import type { QaCheckRecord, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
 import { parseJsonObject, singleUseTool, type BrowseAgentExtraToolHooks, type BrowseAgentToolCall } from "./session.js";
 
 export * from "./qaChecks.js";
+export * from "./qaJudge.js";
 
-export const QA_VERDICT_TOOL = "qa_verdict";
 /** The principal of the QA prompt ("You are a browsing subagent working for a QA engineer"). */
 export const QA_PRINCIPAL = "a QA engineer";
 /** `qa.steps` of a result keeps this many steps (the last ones). */

@@ -8,7 +8,7 @@
 // NON-reasoning one and reasoning must be off: pass the provider's switch in
 // `providerOptions` (for example `{ openrouter: { reasoning: { effort: "none" } } }`
 // or the `reasoningEffort` of an OpenAI-compatible provider).
-import { generateText, tool, type LanguageModel, type ToolSet } from "ai";
+import { generateObject, generateText, tool, type LanguageModel, type ToolSet } from "ai";
 import type { ZodTypeAny } from "zod";
 import type { CheckpointResult, PageFixture } from "../fixture/types.js";
 import type { BrowserBridge } from "../loop/bridge.js";
@@ -21,23 +21,36 @@ import { boundedCall } from "../fixture/util.js";
 import { normalizeScreenshot } from "../policy/schemas.js";
 import {
   QA_ASSERT_TOOL,
+  QA_JUDGE_CONTEXT_MAX_CHARS,
+  QA_JUDGE_PAGE_MAX_CHARS,
+  QA_JUDGE_SYSTEM,
+  QA_JUDGE_TIMEOUT_MS,
   QA_VERDICT_FIELD,
   QA_VERDICT_TOOL,
   applyFinalChecks,
+  applyQaJudge,
+  buildQaJudgePrompt,
   createStepRecorder,
   executeQaAssert,
   executeQaVerdict,
   finalChecksApply,
+  judgePageOf,
+  parseQaJudgeVerdict,
   parseQaChecks,
+  qaJudgeApplies,
+  qaJudgeError,
   qaResultOf,
   qaVerdictHooks,
   runFinalChecks,
   type QaCheck,
+  type QaJudgePage,
+  type QaJudgeResult,
+  type QaResult,
 } from "./qaCore.js";
-import { qaAssertDefinition, qaVerdictDefinition } from "./qa.js";
+import { qaAssertDefinition, qaJudgeSchema, qaVerdictDefinition } from "./qa.js";
 import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
-import { type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
+import { browseAgentErrorMessage, type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
 import {
   createBrowseAgentSession,
   parseJsonObject,
@@ -61,6 +74,10 @@ export interface BrowseAgentExtraTool extends BrowseAgentExtraToolHooks {
 
 /** The final QA screenshot may take this long. */
 const QA_SCREENSHOT_MS = 10_000;
+/** Each page read for the QA judge may take this long. */
+const QA_JUDGE_READ_MS = 10_000;
+/** The largest delay `AbortSignal.timeout` accepts (a 32-bit signed integer of ms). */
+const QA_JUDGE_TIMEOUT_MAX_MS = 2_147_483_647;
 /** The host's `onScreenshot` may take this long. */
 const QA_SCREENSHOT_CALLBACK_MS = 15_000;
 
@@ -68,6 +85,18 @@ const QA_SCREENSHOT_CALLBACK_MS = 15_000;
 const CHECKPOINT_CALLBACK_MS = 15_000;
 /** Longest the run end waits for `clearActEmulation`. */
 const ACT_EMULATION_CLEAR_MS = 5_000;
+
+/** `qa.judge` of `runBrowseAgent`. */
+export interface QaJudgeOptions {
+  /** The judge model. Any AI SDK `LanguageModel` that supports structured output. */
+  model: LanguageModel;
+  /** App vocabulary: screen names, menu names, domain terms. Only the judge reads it. Max 16 KiB. */
+  context?: string;
+  /** Provider options for the judge request. */
+  providerOptions?: Record<string, Record<string, unknown>>;
+  /** Deadline of the judge request in ms. An integer from 1 to 2147483647. Default 60_000. It is its own budget, outside `deadlineMs`. */
+  timeoutMs?: number;
+}
 
 export interface RunBrowseAgentOptions {
   /** The chat model. Use a non-reasoning model, or switch reasoning off in `providerOptions`. */
@@ -172,10 +201,34 @@ export interface RunBrowseAgentOptions {
    * Invalid `checks` make the call throw before any browser command. With `qa` on, a host extra
    * tool named `qa_assert` makes the call throw too. The result's `qa` also lists the console
    * errors and failed requests the run saw (`consoleErrors`, `failedRequests`, deduped, at most 20).
+   * `qa.judge`: a second model reviews a `passed` outcome (docs/specs/2026-10-19-qa-judge-design.md).
+   * It runs once after the loop and the final checks, and only when the outcome is
+   * `passed` (not for `failed`, `inconclusive`, `error`, `setup_failed`, `aborted`).
+   * It sees the scenario (`goal`), your `context`, the steps (without `qa_verdict`), the checks, the console errors
+   * and failed requests, and the final page (URL, title, text). It does not see the acting
+   * model's text, reasoning or verdict. `model` must support structured output. `context` is your app vocabulary
+   * (screen names, menu names, terms): only the judge reads it, at most 16 KiB, else the call throws before any
+   * browser command. `timeoutMs` (an integer from 1 to 2147483647 ms, default 60 s) bounds the judge request.
+   * The judge can only lower the outcome:
+   * `fail` makes it `failed`, `inconclusive` makes it `inconclusive`, with reason `Judge: <reason>. Agent verdict: <reason>`.
+   * The page (final URL, title, full page text from `browse_read`, with `browse_snapshot` as the fallback) is read while
+   * the page is live. The model request starts then, but the run does not wait for it before the QA screenshot, the
+   * checkpoint capture and the fixture release: the result waits for the judge after those. The request has its own
+   * budget `timeoutMs`, outside `deadlineMs`. An abort of `signal` before or during the judge gives `judge: { error }`
+   * and leaves the outcome as it was.
+   * `qa.judge` in the result holds the judge's answer. A judge error (timeout, provider error, invalid answer, failed
+   * page read) does not fail the run: the outcome stays `passed` and `qa.judge` is `{ error }`. You decide whether
+   * a pass without a working judge counts. Without `qa.judge` nothing changes.
    * To run several scenarios in parallel, call `runBrowseAgent` several times,
    * each with its own browser: the package does not orchestrate.
    */
-  qa?: boolean | { onScreenshot?(img: { mediaType: string; base64: string }): void | Promise<void>; checks?: QaCheck[] };
+  qa?:
+    | boolean
+    | {
+        onScreenshot?(img: { mediaType: string; base64: string }): void | Promise<void>;
+        checks?: QaCheck[];
+        judge?: QaJudgeOptions;
+      };
   /**
    * Observe every tool execution: the browse tools and the host tools, also the
    * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
@@ -286,6 +339,54 @@ async function captureQaScreenshot(browser: BrowserBridge, status: string): Prom
   }
 }
 
+/** One tool call, bounded. The result string, or undefined when it failed or ran out of time. */
+async function boundedTool(opts: RunBrowseAgentOptions, name: string, args: Record<string, unknown>): Promise<string | undefined> {
+  try {
+    const out = await boundedCall(() => executeBrowseTool(opts.browser, name, args), QA_JUDGE_READ_MS);
+    return out.done ? out.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reads the final page for the judge. Never throws: a failure is `{ error }`. One command at a time (the controller
+ * serializes them): `browse_read` first, `browse_snapshot` only when the read gave no text or no URL.
+ */
+async function readJudgePage(opts: RunBrowseAgentOptions): Promise<QaJudgePage | { error: string }> {
+  if (opts.signal?.aborted) return { error: "aborted" };
+  try {
+    // The controller clamps the read to the same cap, and its `truncated` flag says when text was left out.
+    const read = await boundedTool(opts, "browse_read", { maxChars: QA_JUDGE_PAGE_MAX_CHARS });
+    const parsed = read === undefined ? {} : parseJsonObject(read);
+    const complete = typeof parsed.text === "string" && parsed.text !== "" && typeof parsed.url === "string" && parsed.url !== "";
+    const snapshot = complete ? undefined : await boundedTool(opts, "browse_snapshot", {});
+    return judgePageOf(read, snapshot);
+  } catch (error) {
+    return qaJudgeError(error);
+  }
+}
+
+/** Starts the judge request. The returned promise never rejects: a failure is `{ error }`. */
+async function askJudge(goal: string, qa: QaResult, page: QaJudgePage, judge: QaJudgeOptions, signals: (AbortSignal | undefined)[]): Promise<QaJudgeResult> {
+  try {
+    const timeout = AbortSignal.timeout(judge.timeoutMs ?? QA_JUDGE_TIMEOUT_MS);
+    const { object } = await generateObject({
+      model: judge.model,
+      schema: qaJudgeSchema,
+      system: QA_JUDGE_SYSTEM,
+      prompt: buildQaJudgePrompt({ scenario: goal, ...(judge.context ? { context: judge.context } : {}), qa, page }),
+      providerOptions: judge.providerOptions as never,
+      abortSignal: AbortSignal.any([timeout, ...signals.filter((s): s is AbortSignal => s !== undefined)]),
+    });
+    // The schema has no length cap: the hand parser cuts a long reason.
+    const parsed = parseQaJudgeVerdict(object);
+    return parsed.ok ? parsed.value : { error: browseAgentErrorMessage(`invalid judge answer: ${parsed.errors.join("; ")}`) };
+  } catch (error) {
+    return qaJudgeError(error);
+  }
+}
+
 /**
  * Run a browse task with a non-reasoning chat model driving the browse tools.
  * Resolves to the run result (never rejects for a model or browser failure:
@@ -306,6 +407,16 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   if (finalChecks) {
     const parsedChecks = parseQaChecks(finalChecks);
     if (!parsedChecks.ok) throw new Error(`runBrowseAgent: qa.checks: ${parsedChecks.errors.join("; ")}`);
+  }
+  const judge = typeof opts.qa === "object" ? opts.qa.judge : undefined;
+  if (judge) {
+    if (!judge.model) throw new Error("runBrowseAgent: qa.judge.model: required");
+    if (judge.timeoutMs !== undefined && !(Number.isInteger(judge.timeoutMs) && judge.timeoutMs >= 1 && judge.timeoutMs <= QA_JUDGE_TIMEOUT_MAX_MS)) {
+      throw new Error(`runBrowseAgent: qa.judge.timeoutMs: must be an integer from 1 to ${QA_JUDGE_TIMEOUT_MAX_MS}`);
+    }
+    if (judge.context !== undefined && (typeof judge.context !== "string" || judge.context.length > QA_JUDGE_CONTEXT_MAX_CHARS)) {
+      throw new Error(`runBrowseAgent: qa.judge.context: must be a string of at most ${QA_JUDGE_CONTEXT_MAX_CHARS} characters`);
+    }
   }
   const trail = qaOn ? createStepRecorder() : undefined;
   const extras: Record<string, BrowseAgentExtraTool> = {
@@ -383,6 +494,10 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const onCapture = opts.checkpoint?.onCapture;
   let finalStatus: { status: string; steps: number } = { status: "error", steps: 0 };
   let shot: { mediaType: string; base64: string } | undefined;
+  // Set on every path of the try block (tsc checks it). It is awaited after the `finally` work, so a judge request does not delay that work.
+  let finish: () => Promise<BrowseAgentResult>;
+  // Stops a started judge request when the `finally` work throws: nobody awaits it then.
+  const judgeAbort = new AbortController();
 
   try {
     // Before the setup or the start URL: the journal must see the page the run starts on.
@@ -421,44 +536,67 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       },
     );
     finalStatus = result;
-    if (!trail) return result;
-    // `qa` is an extra field: it goes before `error` and `setupStage`, and the verdict field is folded into it.
-    const { error, setupStage, [QA_VERDICT_FIELD]: _verdict, ...rest } = result;
-    let qa = qaResultOf(result, trail.steps(), trail.extras());
-    if (finalChecks && finalChecksApply(qa)) {
-      // The mocks live until the release in `finally`. The checks run bounded; a failure to run them fails every check.
-      const finalResults = await runFinalChecks(opts.browser, finalChecks, trail);
-      // The final assert drained more errors into the recorder: refresh the run-level lists (the steps did not change).
-      qa = applyFinalChecks({ ...qa, ...trail.extras() }, finalResults);
+    if (!trail) {
+      finish = async () => result;
+    } else {
+      // `qa` is an extra field: it goes before `error` and `setupStage`, and the verdict field is folded into it.
+      const { error, setupStage, [QA_VERDICT_FIELD]: _verdict, ...rest } = result;
+      let qa = qaResultOf(result, trail.steps(), trail.extras());
+      if (finalChecks && finalChecksApply(qa)) {
+        // The mocks live until the release in `finally`. The checks run bounded; a failure to run them fails every check.
+        const finalResults = await runFinalChecks(opts.browser, finalChecks, trail);
+        // The final assert drained more errors into the recorder: refresh the run-level lists (the steps did not change).
+        qa = applyFinalChecks({ ...qa, ...trail.extras() }, finalResults);
+      }
+      const assemble = (q: QaResult) =>
+        ({
+          ...rest,
+          qa: q,
+          ...(error !== undefined ? { error } : {}),
+          ...(setupStage !== undefined ? { setupStage } : {}),
+        }) as BrowseAgentResult;
+      if (judge && qaJudgeApplies(qa)) {
+        // The evidence is read while the mocks live and the page is as the run left it. The model request is NOT awaited
+        // here: the `finally` work (screenshot, capture, release) must not wait for it. `job` never rejects.
+        const page = await readJudgePage(opts);
+        const job: Promise<QaJudgeResult> = "error" in page ? Promise.resolve(page) : askJudge(goal, qa, page, judge, [opts.signal, judgeAbort.signal]);
+        const judged = qa;
+        finish = async () => assemble(applyQaJudge(judged, await job));
+      } else {
+        const plain = qa;
+        finish = async () => assemble(plain);
+      }
     }
-    return {
-      ...rest,
-      qa,
-      ...(error !== undefined ? { error } : {}),
-      ...(setupStage !== undefined ? { setupStage } : {}),
-    } as BrowseAgentResult;
   } finally {
-    // Capture conditions live in the helper. The order is capture, host callback, fixture release (the mocks live
-    // until the task ends, whatever the outcome), stop. The stop wait is bounded, so a hung browser cannot hold a finished run.
-    await checkpoint.finish(finalStatus, {
-      async beforeStop(captured) {
-        try {
-          // The final image first: the fixture's mocks are still live, and the page is as the run left it.
-          // The host callback waits until the release and the stop are done.
-          if (onScreenshot) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
-          // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
-          if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
-          await fixtureSetup?.release();
-        } finally {
-          // The emulation of browse_act `viewport` must not outlive the run, with or without a fixture.
-          await boundedCall(async () => opts.browser.clearActEmulation?.(), ACT_EMULATION_CLEAR_MS).catch(() => undefined);
-        }
-      },
-    });
-    if (shot && onScreenshot) {
-      const img = shot;
-      // A throw or a rejection is ignored; a slow callback is awaited for a bounded time only.
-      await boundedCall(() => onScreenshot(img), QA_SCREENSHOT_CALLBACK_MS).catch(() => undefined);
+    try {
+      // Capture conditions live in the helper. The order is capture, host callback, fixture release (the mocks live
+      // until the task ends, whatever the outcome), stop. The stop wait is bounded, so a hung browser cannot hold a finished run.
+      await checkpoint.finish(finalStatus, {
+        async beforeStop(captured) {
+          try {
+            // The final image first: the fixture's mocks are still live, and the page is as the run left it.
+            // The host callback waits until the release and the stop are done.
+            if (onScreenshot) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
+            // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
+            if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
+            await fixtureSetup?.release();
+          } finally {
+            // The emulation of browse_act `viewport` must not outlive the run, with or without a fixture.
+            await boundedCall(async () => opts.browser.clearActEmulation?.(), ACT_EMULATION_CLEAR_MS).catch(() => undefined);
+          }
+        },
+      });
+      if (shot && onScreenshot) {
+        const img = shot;
+        // A throw or a rejection is ignored; a slow callback is awaited for a bounded time only.
+        await boundedCall(() => onScreenshot(img), QA_SCREENSHOT_CALLBACK_MS).catch(() => undefined);
+      }
+    } catch (error) {
+      judgeAbort.abort();
+      // Rethrown on purpose, as before the judge existed: a failing `finally` work replaces the outcome of the try block.
+      // eslint-disable-next-line no-unsafe-finally
+      throw error;
     }
   }
+  return finish();
 }
