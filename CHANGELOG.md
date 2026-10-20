@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.29](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.28...v0.2.29) (2026-10-20)
+
+
+### Bug Fixes
+
+* **electron:** a failed launch on the user's profile does not kill the app ([3965410](https://github.com/dan-rozhkov/browser-agent/commit/396541010a70238f8ed3cba26d2082b5b754c63a))
+
 ## [0.2.28](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.27...v0.2.28) (2026-10-20)
 
 
