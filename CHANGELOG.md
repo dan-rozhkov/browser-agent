@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.1...v0.3.2) (2026-10-20)
+
+
+### Features
+
+* **agent:** browse run trace format and recorder ([bdbf4c9](https://github.com/dan-rozhkov/browser-agent/commit/bdbf4c9451b56ac86b79ac8b298d9b8b21289962))
+
 ## [0.3.1](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.0...v0.3.1) (2026-10-20)
 
 
