@@ -224,10 +224,11 @@ what to do with it.
 
 - Bump `@sideform/browser-agent` to the tag that has the trace module
   (0.3.0's breaking change is only `BrowserController.cursorMotion`, unused here).
-- `src/lib/tools/browser/browseAgent.ts`: one recorder per `browse_agent` run.
+- `src/lib/tools/browser/browseAgent.ts`: one recorder per `browse_agent` run with `qa: true` (2026-10-20: other runs keep no trace).
+  - An app run (`app`) records its launch (`browse_open { app }`, run in the session `setup`) as step 0 with a frame of the app window.
   - `capture` = `bridge.screenshot` of the run's bridge (desktop or cloud).
   - Feed it from the `executeTool` wrapper next to the QA recorder; await `end`.
-  - Labels: `{ browser: "desktop" | "cloud", mode: "qa" | "task" }`.
+  - Labels: `{ browser: "desktop" | "cloud", mode: "qa", app?: <app name> }`.
   - At the run end (both finish paths, after the judge settles), `finish(...)`,
     then store: desktop bridge present → `traces.save` over the bridge;
     otherwise (cloud) → `POST /api/browse/traces` with `splitTraceAssets`.
@@ -242,7 +243,7 @@ what to do with it.
   - Left: step list (tool, short args summary, duration, ok/error). Selecting a
     step selects its last frame.
   - Center: large frame, before/after toggle (previous step's frame vs this step's).
-  - Right: Base UI Tabs — Console, Network, QA (verdict, reason, checks, judge), Step details (args, output, error).
+  - Bottom, full width: Base UI Tabs — Console, Network, QA (verdict, reason, checks, judge). (The Step details tab was removed on 2026-10-20.)
   - Keyboard: ←/→ previous/next step.
   - States: loading, not found, invalid format.
 - `BrowseAgentIndicator`: a "View trace" button when the result has `trace`.
