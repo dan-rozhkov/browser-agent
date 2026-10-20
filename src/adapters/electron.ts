@@ -23,7 +23,8 @@ export interface LaunchElectronAppOptions {
   userDataDir?: string;
   /**
    * Use the app's own profile (its logins and data): `--user-data-dir` is not passed, no temp dir is made,
-   * and nothing is removed on `close()` or on parent exit. Cannot be combined with `userDataDir`.
+   * and nothing is removed on `close()` or on parent exit. The app is never killed: `close()` asks it to quit
+   * like Cmd+Q and leaves it running if it does not; host exit leaves it running. Cannot be combined with `userDataDir`.
    */
   useAppProfile?: boolean;
   /** Debug port. Default: a free port. */
@@ -80,7 +81,7 @@ export interface ElectronLaunchDeps {
   /** Registers the parent-exit handler; returns the remover. Default: `process.once("exit")`. */
   onParentExit?: (fn: () => void) => () => void;
   sleep?: (ms: number) => Promise<void>;
-  /** With `useAppProfile`: how long `close()` waits for a graceful quit before SIGTERM. Default 10000. */
+  /** With `useAppProfile`: how long `close()` waits for the graceful quit. Default 10000. */
   appQuitMs?: number;
   /** Sends a signal (default: `process.kill`). */
   signal?: (pid: number, sig: NodeJS.Signals) => void;
@@ -225,6 +226,8 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
     throw e;
   }
   const parentExit = () => {
+    // The user's real profile is never killed: the app keeps running (with its debug port) after the host exits.
+    if (useAppProfile) return;
     try { child.kill("SIGKILL"); } catch { /* already gone */ }
     if (ownsProfile && userDataDir !== null) { try { (deps.rmSync ?? ((p) => rmSync(p, { recursive: true, force: true })))(userDataDir); } catch { /* best effort */ } }
   };
@@ -281,8 +284,12 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
     (closing ??= (async () => {
       offParentExit();
       await conn.close().catch(() => undefined);
-      // The user's real profile: ask the app to quit (Cmd+Q) before any signal, so it can save.
-      if (useAppProfile && !exited(child) && child.pid) await quitElectronApp(child.pid, { timeoutMs: appQuitMs }, deps).catch(() => false);
+      // The user's real profile: ask the app to quit (Cmd+Q) and never send a signal. An app that does not
+      // quit (for example it shows a "save changes?" dialog) keeps running; the caller sees `pid` still alive.
+      if (useAppProfile) {
+        if (!exited(child) && child.pid) await quitElectronApp(child.pid, { timeoutMs: appQuitMs }, deps).catch(() => false);
+        return;
+      }
       await killChild(child, termGraceMs, sleep);
       await removeProfile();
     })());
@@ -376,6 +383,16 @@ function defaultIsAlive(pid: number): boolean {
 }
 
 /**
+ * The JXA script (for `osascript -l JavaScript -e`) that asks the app with this pid to quit like Cmd+Q.
+ * Prints "nil" when no running application has the pid. For hosts that must quit synchronously or from a
+ * detached process (`quitElectronApp` is async).
+ */
+export function macQuitScript(pid: number): string {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error(`Invalid pid: ${pid}`);
+  return `ObjC.import('AppKit'); var a = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${pid}); a.isNil() ? 'nil' : String(a.terminate)`;
+}
+
+/**
  * Asks an app to quit the way Cmd+Q does, then waits for the process to exit. Never kills it.
  * macOS: `NSRunningApplication.terminate`. Linux: SIGTERM. Windows: not supported (a signal there is
  * a hard kill), resolves false.
@@ -394,8 +411,7 @@ export async function quitElectronApp(pid: number, opts: { timeoutMs?: number } 
   if (platform === "win32") return false;
   try {
     if (platform === "darwin") {
-      const script = `ObjC.import('AppKit'); var a = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${pid}); a.isNil() ? 'nil' : String(a.terminate)`;
-      const out = await (deps.runOsascript ?? defaultRunOsascript)(script);
+      const out = await (deps.runOsascript ?? defaultRunOsascript)(macQuitScript(pid));
       if (out.trim() === "nil") return !isAlive(pid);
     } else {
       (deps.signal ?? ((p, sig) => process.kill(p, sig)))(pid, "SIGTERM");

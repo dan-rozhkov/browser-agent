@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { findRunningElectronApp, launchElectronApp, quitElectronApp, resolveElectronExecutable, type ElectronChild, type ElectronLaunchDeps } from "../../src/adapters/electron.js";
+import { findRunningElectronApp, launchElectronApp, macQuitScript, quitElectronApp, resolveElectronExecutable, type ElectronChild, type ElectronLaunchDeps } from "../../src/adapters/electron.js";
 import { APP_MODE_LOCK_MESSAGE, BrowserController, type BrowserPageHandle, type BrowserTarget } from "../../src/controller/index.js";
 
 /** A child process that can be told to ignore SIGTERM. */
@@ -390,12 +390,28 @@ describe("launchElectronApp useAppProfile", () => {
     expect(child.signals).toEqual([]);
   });
 
-  it("close() falls back to signals when the graceful quit times out", async () => {
+  it("close() sends no signal when the graceful quit times out (the app keeps running)", async () => {
     const child = new FakeChild();
     const { deps } = makeDeps(child);
     const app = await launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps);
     await app.close();
-    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(child.signals).toEqual([]);
+    expect(child.exitCode).toBeNull();
+  });
+
+  it("host exit does not kill the app", async () => {
+    const child = new FakeChild();
+    let exit: () => void = () => undefined;
+    const { deps } = makeDeps(child, { onParentExit: (fn) => { exit = fn; return () => undefined; } });
+    await launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps);
+    exit();
+    expect(child.signals).toEqual([]);
+  });
+
+  it("macQuitScript names the pid and rejects a bad one", () => {
+    expect(macQuitScript(77)).toContain("runningApplicationWithProcessIdentifier(77)");
+    expect(() => macQuitScript(0)).toThrow();
+    expect(() => macQuitScript(1.5)).toThrow();
   });
 
   it("a temp profile close() does not run the graceful quit", async () => {

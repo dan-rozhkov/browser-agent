@@ -248,8 +248,9 @@ const app = await launchElectronApp({ app: "/Applications/Orca.app", useAppProfi
   It resolves `true` when the process is gone, `false` when it still runs after `timeoutMs` (default 15 s,
   counted from the call), for example because of a "save changes?" dialog.
 - `useAppProfile: true` passes no `--user-data-dir`, so the app keeps its logins and data. Nothing is removed on
-  `close()`, and `close()` first asks the app to quit (up to 10 s) before SIGTERM. It cannot be combined with
-  `userDataDir`. If the host process exits without `close()`, the app still gets SIGKILL.
+  `close()`. The app is never killed: `close()` asks it to quit (up to 10 s) and leaves it running if it does not
+  (check `pid`), and a host exit leaves it running. It cannot be combined with `userDataDir`.
+- `macQuitScript(pid)` is the JXA quit script, for a host that must quit from a detached or synchronous process.
 - The debug port stays open while the app runs. When you are done, quit the app and reopen it normally.
   Deciding whether to ask the user before the restart is up to the consumer.
 
@@ -268,6 +269,7 @@ launchElectronApp(opts: { app: string; args?: string[]; env?: NodeJS.ProcessEnv;
   Promise<{ controller: BrowserController; browser: BrowserBridge; cdpUrl: string; pid: number; close(): Promise<void> }>;
 findRunningElectronApp(app: string, deps?: ElectronLaunchDeps): Promise<{ pid: number; debugPort: number | null; userDataDir: string | null }[]>;
 quitElectronApp(pid: number, opts?: { timeoutMs?: number }, deps?: ElectronLaunchDeps): Promise<boolean>;
+macQuitScript(pid: number): string;
 
 // adapters/systemone-http
 createSystemOneClient(opts: { apiKey?: string; model?: string; baseUrl?: string;
