@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.27](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.26...v0.2.27) (2026-10-20)
+
+
+### Features
+
+* **electron:** work with an app the user already has open ([db10f65](https://github.com/dan-rozhkov/browser-agent/commit/db10f651e9e18cf7b2f9fcc4a3fd15b7b7bbc301))
+
 ## [0.2.26](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.25...v0.2.26) (2026-10-19)
 
 
