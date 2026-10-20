@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.29...v0.3.0) (2026-10-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cursor:** BrowserController no longer accepts `cursorMotion`.
+
+### Features
+
+* **cursor:** one agent cursor motion ([f196795](https://github.com/dan-rozhkov/browser-agent/commit/f196795f9249678bded44b31b09ab6713d58b707))
+
 ## [0.2.29](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.28...v0.2.29) (2026-10-20)
 
 
