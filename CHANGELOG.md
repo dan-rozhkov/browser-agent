@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.0...v0.3.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* **electron:** drive the app window, not an empty service window ([6dc8618](https://github.com/dan-rozhkov/browser-agent/commit/6dc86181e1fd4f3bf1ee1bd9e2cd42a1b0705dbd))
+
 ## [0.3.0](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.29...v0.3.0) (2026-10-20)
 
 
