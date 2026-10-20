@@ -11,7 +11,8 @@ import path from "node:path";
 import { BrowserController } from "../controller/index.js";
 import type { OpenedBrowser } from "../loop/bridge.js";
 import { controllerBridge } from "./controllerBridge.js";
-import { connectOverCdp } from "./playwright.js";
+import { connectOverCdp, type PlaywrightTargetOptions } from "./playwright.js";
+import { isPlaceholderPageUrl } from "../shared/placeholderUrl.js";
 
 export interface LaunchElectronAppOptions {
   /** A macOS `.app` bundle, or a direct executable path (Windows, Linux). */
@@ -31,6 +32,11 @@ export interface LaunchElectronAppOptions {
   port?: number;
   /** How long to wait for the first page target. Default 30000. */
   timeoutMs?: number;
+  /**
+   * After the first page target appears, how long to keep waiting for a page with a real URL (not empty,
+   * `about:blank` or `data:`) before connecting anyway. Default 5000. Never runs past `timeoutMs`.
+   */
+  placeholderGraceMs?: number;
   /** Options for the `BrowserController` (navigation lock is always on). */
   controllerOptions?: ConstructorParameters<typeof BrowserController>[1];
 }
@@ -75,7 +81,7 @@ export interface ElectronLaunchDeps {
     readdir(p: string): Promise<string[]>;
   };
   /** Connects to the CDP url and returns a controller (default: `connectOverCdp`). */
-  connect?: (cdpUrl: string, controllerOptions?: LaunchElectronAppOptions["controllerOptions"]) => Promise<ElectronConnection>;
+  connect?: (cdpUrl: string, controllerOptions?: LaunchElectronAppOptions["controllerOptions"], targetOptions?: PlaywrightTargetOptions) => Promise<ElectronConnection>;
   /** Synchronous cleanup used by the parent-exit handler. */
   rmSync?: (p: string) => void;
   /** Registers the parent-exit handler; returns the remover. Default: `process.once("exit")`. */
@@ -199,6 +205,8 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
   const sleep = deps.sleep ?? realSleep;
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const pollMs = deps.pollIntervalMs ?? 200;
+  // NaN / undefined: default. Negative: no grace. Infinity is fine: it is capped by the overall deadline.
+  const placeholderGraceMs = opts.placeholderGraceMs === undefined || Number.isNaN(opts.placeholderGraceMs) ? 5000 : Math.max(0, opts.placeholderGraceMs);
   const termGraceMs = deps.termGraceMs ?? 3000;
   const appQuitMs = deps.appQuitMs ?? 10_000;
 
@@ -255,6 +263,8 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
   };
 
   const deadline = Date.now() + timeoutMs;
+  let graceEnd: number | null = null;
+  let pageSeen = false; // a transient /json/list error on a later poll must not turn "a page was seen" into "no window"
   for (;;) {
     if (spawnError) return fail(`spawn failed: ${(spawnError as Error).message}`);
     if (exited(child)) {
@@ -264,18 +274,28 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
     }
     try {
       const list = await fetchFn(`${cdpUrl}/json/list`);
-      if (Array.isArray(list) && list.some((t) => (t as { type?: string } | null)?.type === "page")) break;
+      const pages = Array.isArray(list) ? list.filter((t) => (t as { type?: string } | null)?.type === "page") : [];
+      if (pages.length > 0) {
+        pageSeen = true;
+        // A service window (empty, about:blank, data:) can open before the real one: wait a bounded time for the real one.
+        if (pages.some((t) => !isPlaceholderPageUrl((t as { url?: string }).url))) break;
+        graceEnd ??= Math.min(Date.now() + placeholderGraceMs, deadline);
+      }
     } catch {
       // Port not open yet.
     }
-    if (Date.now() >= deadline) return fail(`no window after ${timeoutMs} ms`);
+    if (graceEnd !== null && Date.now() >= graceEnd) break;
+    if (Date.now() >= deadline) {
+      if (pageSeen) break;
+      return fail(`no window after ${timeoutMs} ms`);
+    }
     await sleep(pollMs);
   }
 
   const lock = opts.controllerOptions?.lockNavigation || true;
   let conn: ElectronConnection;
   try {
-    conn = await (deps.connect ?? connectOverCdp)(cdpUrl, { ...opts.controllerOptions, lockNavigation: lock });
+    conn = await (deps.connect ?? connectOverCdp)(cdpUrl, { ...opts.controllerOptions, lockNavigation: lock }, { skipPlaceholderPages: true });
   } catch (e) {
     offParentExit();
     await stopChild();

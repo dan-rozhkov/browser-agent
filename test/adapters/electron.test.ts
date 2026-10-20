@@ -55,7 +55,7 @@ function makeDeps(child: FakeChild, over: Partial<ElectronLaunchDeps> = {}) {
     spawn,
     fetchJson: async (url: string) => {
       if (url.endsWith("/json/version")) throw new Error("ECONNREFUSED");
-      return [{ type: "page" }];
+      return [{ type: "page", url: "file:///app/index.html" }];
     },
     freePort: async () => 9333,
     readPlistExecutable: async () => "Orca Helper",
@@ -99,6 +99,97 @@ describe("resolveElectronExecutable", () => {
   });
 });
 
+describe("launchElectronApp placeholder grace", () => {
+  const PH = "data:text/html,<html><body></body></html>";
+  const REAL = "file:///Applications/Qure.app/index.html";
+  const listFetch = (lists: unknown[][]) => {
+    let n = 0;
+    const polls = { count: 0 };
+    return {
+      polls,
+      fetchJson: async (url: string) => {
+        if (url.endsWith("/json/version")) throw new Error("ECONNREFUSED");
+        polls.count++;
+        return lists[Math.min(n++, lists.length - 1)];
+      },
+    };
+  };
+
+  it("keeps polling past a placeholder page until a real page appears", async () => {
+    const f = listFetch([[{ type: "page", url: PH }], [{ type: "page", url: PH }], [{ type: "page", url: PH }, { type: "page", url: REAL }]]);
+    const connect = vi.fn(async () => ({ controller: fakeController(), close: async () => undefined, onDisconnected: () => undefined }));
+    const t = makeDeps(new FakeChild(), { fetchJson: f.fetchJson, connect });
+    await launchElectronApp({ app: "/x/Orca", placeholderGraceMs: 5000 }, t.deps);
+    expect(f.polls.count).toBe(3);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("connects anyway when only placeholders exist after the grace", async () => {
+    const f = listFetch([[{ type: "page", url: "about:blank" }]]);
+    const connect = vi.fn(async () => ({ controller: fakeController(), close: async () => undefined, onDisconnected: () => undefined }));
+    const t = makeDeps(new FakeChild(), { fetchJson: f.fetchJson, connect });
+    const start = Date.now();
+    await launchElectronApp({ app: "/x/Orca", placeholderGraceMs: 40 }, t.deps);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(35);
+    expect(f.polls.count).toBeGreaterThan(1);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes { skipPlaceholderPages: true } to the default-style connect call", async () => {
+    const connect = vi.fn(async (_u: string, _c?: unknown, _t?: unknown) => ({ controller: fakeController(), close: async () => undefined, onDisconnected: () => undefined }));
+    const t = makeDeps(new FakeChild(), { connect });
+    await launchElectronApp({ app: "/x/Orca" }, t.deps);
+    expect(connect.mock.calls[0][2]).toEqual({ skipPlaceholderPages: true });
+  });
+
+  it("treats NaN as the default grace and a negative grace as none", async () => {
+    for (const [grace, maxMs] of [[Number.NaN, 5000], [-5, 500]] as const) {
+      const f = listFetch([[{ type: "page", url: "about:blank" }]]);
+      const connect = vi.fn(async () => ({ controller: fakeController(), close: async () => undefined, onDisconnected: () => undefined }));
+      const t = makeDeps(new FakeChild(), { fetchJson: f.fetchJson, connect });
+      const start = Date.now();
+      await launchElectronApp({ app: "/x/Orca", placeholderGraceMs: grace, timeoutMs: 800 }, t.deps);
+      expect(connect).toHaveBeenCalledTimes(1);
+      if (grace < 0) expect(Date.now() - start).toBeLessThan(maxMs);
+      else expect(f.polls.count).toBeGreaterThan(5); // kept polling: a grace, not zero
+    }
+  });
+
+  it("connects, not fails, when a page was seen and the last polls error out", async () => {
+    let n = 0;
+    const connect = vi.fn(async () => ({ controller: fakeController(), close: async () => undefined, onDisconnected: () => undefined }));
+    const t = makeDeps(new FakeChild(), {
+      connect,
+      fetchJson: async (url: string) => {
+        if (url.endsWith("/json/version")) throw new Error("ECONNREFUSED");
+        if (n++ === 0) return [{ type: "page", url: "about:blank" }];
+        throw new Error("transient");
+      },
+    });
+    await launchElectronApp({ app: "/x/Orca", placeholderGraceMs: 30, timeoutMs: 2000 }, t.deps);
+    expect(connect).toHaveBeenCalledTimes(1);
+    const t2 = makeDeps(new FakeChild(), {
+      connect,
+      fetchJson: async (url: string) => {
+        if (url.endsWith("/json/version")) throw new Error("ECONNREFUSED");
+        if (n++ % 1000 === 0) return [{ type: "page", url: "about:blank" }];
+        throw new Error("transient");
+      },
+    });
+    n = 0;
+    await launchElectronApp({ app: "/x/Orca", placeholderGraceMs: 60_000, timeoutMs: 40 }, t2.deps);
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("never waits past the overall deadline", async () => {
+    const f = listFetch([[{ type: "page", url: PH }]]);
+    const t = makeDeps(new FakeChild(), { fetchJson: f.fetchJson });
+    const start = Date.now();
+    await launchElectronApp({ app: "/x/Orca", timeoutMs: 30, placeholderGraceMs: 60_000 }, t.deps);
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+});
+
 describe("launchElectronApp", () => {
   it("spawns the executable with the debug port, a fresh profile and extra args", async () => {
     const child = new FakeChild();
@@ -132,7 +223,7 @@ describe("launchElectronApp", () => {
         calls++;
         if (calls === 1) throw new Error("ECONNREFUSED");
         if (calls === 2) return [{ type: "service_worker" }];
-        return [{ type: "service_worker" }, { type: "page" }];
+        return [{ type: "service_worker" }, { type: "page", url: "file:///app/index.html" }];
       },
     });
     const app = await launchElectronApp({ app: "/bin/app" }, t.deps);
@@ -201,7 +292,7 @@ describe("launchElectronApp", () => {
       const connect = vi.fn(async () => ({ controller: fakeController(), close: async () => undefined, onDisconnected: () => undefined }));
       const t = makeDeps(child, { connect });
       const app = await launchElectronApp({ app: "/bin/app", controllerOptions: given ? { lockNavigation: given } : undefined }, t.deps);
-      expect(connect).toHaveBeenCalledWith("http://127.0.0.1:9333", expect.objectContaining({ lockNavigation: want }));
+      expect(connect).toHaveBeenCalledWith("http://127.0.0.1:9333", expect.objectContaining({ lockNavigation: want }), { skipPlaceholderPages: true });
       await app.close();
     }
   });

@@ -3,6 +3,7 @@
 // there is no launch path: no Chromium runs on this host.
 // Implemented optional methods: getCookies/setCookies/routeRequests/resetSession (PageFixture), isVisible, capture, fetchText, sendCdp, drainDialogs, drainConsoleErrors,
 // onNavigationEvent, networkStats, listFrames, executeJavaScriptInFrame, listPages/selectPage/closePage/newPage/pageHandles.
+import { isPlaceholderPageUrl } from "../shared/placeholderUrl.js";
 import type { Browser, BrowserContext, BrowserContextOptions, Page, CDPSession, Frame, Route } from "playwright-core";
 import { promises as dns } from "node:dns";
 import http from "node:http";
@@ -183,7 +184,7 @@ class PwPage implements BrowserPageHandle {
   }
 
   private fireNav() {
-    this.titleDirty = true;
+    this.markTitleDirty();
     for (const cb of this.navCbs) {
       try { cb(); } catch { /* ignore */ }
     }
@@ -272,11 +273,51 @@ class PwPage implements BrowserPageHandle {
   // real Steel session (a perform is ~10 scripts, ~0.3-0.5 s per trip). fireNav() — every
   // main-frame navigation, same-document ones included — marks the cached title stale.
   private titleDirty = true;
-  private async refreshTitle(): Promise<void> {
-    this.titleDirty = false;
-    try {
-      this.title = await this.page.title();
-    } catch { /* navigating / closed: keep the last known title */ }
+  /** Bumped by every navigation: a read that started before a newer navigation must not write its title. */
+  private titleGen = 0;
+  /** The one title read in flight for this page, and the `titleGen` it started at. */
+  private titleRead: Promise<void> | null = null;
+  private titleReadGen = -1;
+  private markTitleDirty(): void {
+    this.titleGen += 1;
+    this.titleDirty = true;
+  }
+  /** One read at a time: a running read is reused while no navigation happened since it started. */
+  private refreshTitle(): Promise<void> {
+    if (this.titleRead && this.titleReadGen === this.titleGen) return this.titleRead;
+    const gen = this.titleGen;
+    const read: Promise<void> = (async () => {
+      try {
+        const title = await this.page.title();
+        // A read that a navigation overtook is abandoned: it must not overwrite a fresher title.
+        if (gen === this.titleGen) { this.title = title; this.titleDirty = false; }
+      } catch { /* navigating / closed: keep the last known title */ }
+    })().finally(() => { if (this.titleRead === read) this.titleRead = null; });
+    this.titleRead = read;
+    this.titleReadGen = gen;
+    return read;
+  }
+  /** Await a refresh only when the title is stale and no read is already running (a running read never blocks a command). */
+  private async refreshIfIdle(): Promise<void> {
+    if (this.titleDirty && !this.titleRead) await this.refreshTitle();
+  }
+  /**
+   * The title for a tab list: re-read when stale, at most `maxWaitMs` (a busy page keeps the cached title).
+   * Without it a page no command touched yet (an Electron window, a popup) is listed with an empty title.
+   */
+  async listedTitle(maxWaitMs = 1000): Promise<string> {
+    if (this.titleDirty) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.refreshTitle(),
+          new Promise<void>((r) => { timer = setTimeout(r, maxWaitMs); timer.unref?.(); }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return this.title;
   }
   private mainFrameId = "";
 
@@ -314,7 +355,7 @@ class PwPage implements BrowserPageHandle {
     try {
       return await this.page.evaluate(code);
     } finally {
-      if (this.titleDirty) await this.refreshTitle();
+      await this.refreshIfIdle();
     }
   }
   getURL() { return this.page.url(); }
@@ -440,8 +481,30 @@ const MAX_SEEN_ORIGINS = 500;
 /** How many origins `resetSession` clears at once. */
 const RESET_CLEAR_CONCURRENCY = 16;
 
+export { isPlaceholderPageUrl };
+
+export interface PlaywrightTargetOptions {
+  /**
+   * App mode: pages with a placeholder URL (see `isPlaceholderPageUrl`) never take the current tab from a real page,
+   * and become current only when no real page exists. A current placeholder gives way when a page navigates to a real URL.
+   * Default false: every new page becomes current (a popup that starts at `about:blank` is the page the agent wants).
+   */
+  skipPlaceholderPages?: boolean;
+  /** Clock for the late-window rule; tests inject one. */
+  now?: () => number;
+}
+
+/** How long after it appeared a placeholder page may still take over by loading real content. */
+const AWAITING_MS = 10_000;
+
 export class PlaywrightTarget implements BrowserTarget {
   private readonly ctx: BrowserContext;
+  private readonly skipPlaceholders: boolean;
+  /** App mode: placeholder pages that appeared while a real page was current, with the time they did. Their first real navigation, within AWAITING_MS and with nothing pinned, makes them current. */
+  private awaiting = new Map<number, number>();
+  private readonly now: () => number;
+  /** The page the agent made current on purpose (selectPage / newPage): the placeholder hand-off does not displace it. */
+  private explicitId: number | null = null;
   private pages = new Map<number, PwPage>();
   private ids = new Map<Page, number>();
   private seq = 1;
@@ -449,10 +512,16 @@ export class PlaywrightTarget implements BrowserTarget {
   /** Origins the main frame of any page navigated to, oldest first: `resetSession` clears their storage. */
   private seenOrigins = new Set<string>();
 
-  constructor(existing: BrowserContext) {
+  constructor(existing: BrowserContext, opts: PlaywrightTargetOptions = {}) {
     this.ctx = existing;
+    this.skipPlaceholders = opts.skipPlaceholderPages === true;
     existing.on("page", (p) => this.register(p));
+    this.now = opts.now ?? Date.now;
     for (const p of existing.pages()) this.register(p);
+    // A placeholder that sits beside a real current page (a main window still at about:blank) may load later.
+    if (this.skipPlaceholders && !this.isPlaceholderId(this.currentId)) {
+      for (const id of this.pages.keys()) if (id !== this.currentId && this.isPlaceholderId(id)) this.awaiting.set(id, this.now());
+    }
   }
 
   private noteOrigin(url: string) {
@@ -467,7 +536,21 @@ export class PlaywrightTarget implements BrowserTarget {
   private drop(id: number, p: Page) {
     this.pages.delete(id);
     this.ids.delete(p);
-    if (this.currentId === id) this.currentId = [...this.pages.keys()].pop() ?? null;
+    this.awaiting.delete(id);
+    if (this.explicitId === id) this.explicitId = null;
+    if (this.currentId === id) this.currentId = this.pickCurrent();
+  }
+  private isPlaceholderId(id: number | null): boolean {
+    const h = id === null ? undefined : this.pages.get(id);
+    return !h || isPlaceholderPageUrl(h.page.url());
+  }
+  /** The newest page; in app mode the newest real page, else the newest page. */
+  private pickCurrent(): number | null {
+    const ids = [...this.pages.keys()];
+    if (this.skipPlaceholders) {
+      for (let i = ids.length - 1; i >= 0; i--) if (!this.isPlaceholderId(ids[i])) return ids[i];
+    }
+    return ids.pop() ?? null;
   }
   private register(p: Page): PwPage {
     const existing = this.ids.get(p);
@@ -476,11 +559,28 @@ export class PlaywrightTarget implements BrowserTarget {
     const h = new PwPage(p, this.ctx);
     this.pages.set(id, h);
     this.ids.set(p, id);
-    this.currentId = id; // popups / new pages become current
+    // Popups / new pages become current. App mode: a placeholder only takes over from nothing or another placeholder.
+    const placeholder = isPlaceholderPageUrl(p.url());
+    if (!this.skipPlaceholders || !placeholder || this.isPlaceholderId(this.currentId)) {
+      this.currentId = id;
+    } else {
+      this.awaiting.set(id, this.now());
+    }
     p.on("close", () => this.drop(id, p));
     this.noteOrigin(p.url());
     // Only the main frame: an ad iframe's origin has no storage the next run could notice, and would crowd the list.
-    p.on("framenavigated", (frame: Frame) => { if (frame === p.mainFrame()) this.noteOrigin(frame.url()); });
+    p.on("framenavigated", (frame: Frame) => {
+      if (frame !== p.mainFrame()) return;
+      this.noteOrigin(frame.url());
+      if (!this.skipPlaceholders || isPlaceholderPageUrl(frame.url())) return;
+      const since = this.awaiting.get(id);
+      if (since !== undefined) {
+        this.awaiting.delete(id);
+        if (this.explicitId === null && this.now() - since <= AWAITING_MS) this.currentId = id;
+      } else if (this.currentId !== id && this.isPlaceholderId(this.currentId) && this.explicitId !== this.currentId) {
+        this.currentId = id;
+      }
+    });
     // A page whose CDP init failed is unusable: forget it (ensurePage makes a fresh one).
     h.ready.catch(() => this.drop(id, p));
     return h;
@@ -496,13 +596,17 @@ export class PlaywrightTarget implements BrowserTarget {
     return h;
   }
   currentPage() { return this.currentId ? this.pages.get(this.currentId) ?? null : null; }
-  async listPages(): Promise<BrowserTabInfo[]> {
-    return [...this.pages].map(([tabId, h]) => ({ tabId, url: h.getURL(), title: h.getTitle(), current: tabId === this.currentId }));
+  async listPages(opts?: { freshTitles?: boolean }): Promise<BrowserTabInfo[]> {
+    const entries = [...this.pages];
+    // Live titles cost a page.title() round trip per stale page: only the tab list the agent reads asks for them.
+    const titles = opts?.freshTitles ? await Promise.all(entries.map(([, h]) => h.listedTitle())) : entries.map(([, h]) => h.getTitle());
+    return entries.map(([tabId, h], i) => ({ tabId, url: h.getURL(), title: titles[i], current: tabId === this.currentId }));
   }
   async selectPage(tabId: number) {
     const h = this.pages.get(tabId);
     if (!h) return false;
     this.currentId = tabId;
+    this.explicitId = tabId;
     await h.page.bringToFront().catch(() => {});
     return true;
   }
@@ -516,6 +620,9 @@ export class PlaywrightTarget implements BrowserTarget {
     const ctx = this.ctx;
     const p = await ctx.newPage();
     const h = this.register(p);
+    // The agent opened this tab on purpose: it is current even in app mode, so a follow-up open loads into it.
+    const newId = this.ids.get(p);
+    if (newId !== undefined) { this.currentId = newId; this.explicitId = newId; this.awaiting.delete(newId); }
     await h.ready;
     if (url) await h.loadURL(url).catch(() => {});
     const tabId = this.ids.get(p)!;
@@ -646,12 +753,13 @@ export function redactedError(e: unknown, secret: string): Error {
 export async function connectOverCdp(
   cdpUrl: string,
   controllerOptions?: ConstructorParameters<typeof BrowserController>[1],
+  targetOptions?: PlaywrightTargetOptions,
 ): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }> {
   try {
     const { chromium } = await import("playwright-core");
     const browser = await chromium.connectOverCDP(cdpUrl);
     const context = browser.contexts()[0] ?? (await browser.newContext());
-    const controller = new BrowserController(new PlaywrightTarget(context), controllerOptions);
+    const controller = new BrowserController(new PlaywrightTarget(context, targetOptions), controllerOptions);
     return {
       controller,
       close: () => browser.close(),

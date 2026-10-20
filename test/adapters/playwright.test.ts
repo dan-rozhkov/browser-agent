@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import zlib from "node:zlib";
 import { Readable } from "node:stream";
 import type { IncomingMessage } from "node:http";
-import { PlaywrightTarget, connectOverCdp, fetchStylesheet, guardedLookup, playwrightContexts } from "../../src/adapters/playwright.js";
+import { PlaywrightTarget, connectOverCdp, isPlaceholderPageUrl, fetchStylesheet, guardedLookup, playwrightContexts } from "../../src/adapters/playwright.js";
 
 vi.mock("playwright-core", () => ({
   chromium: {
@@ -710,5 +710,264 @@ describe("playwrightContexts", () => {
     const browser = { newContext: async () => ({ newPage: async () => { throw new Error("no page"); }, close: async () => { closed = true; } }) };
     await expect(playwrightContexts(browser as never)()).rejects.toThrow("no page");
     expect(closed).toBe(true);
+  });
+});
+
+describe("PlaywrightTarget placeholder pages (app mode)", () => {
+  function urlPage(initial: string) {
+    const page = new EventEmitter() as EventEmitter & Record<string, unknown>;
+    const main = { childFrames: () => [], url: () => state.url };
+    const state = { url: initial };
+    Object.assign(page, {
+      url: () => state.url,
+      title: async () => "",
+      bringToFront: async () => {},
+      mainFrame: () => main,
+      navigate(u: string) { state.url = u; page.emit("framenavigated", main); },
+    });
+    return page as unknown as EventEmitter & { navigate(u: string): void };
+  }
+  const currentUrl = async (t: PlaywrightTarget) => (await t.listPages()).find((p) => p.current)?.url;
+  const PLACEHOLDER = "data:text/html,<html><body></body></html>";
+  const REAL = "file:///Applications/Qure.app/index.html";
+
+  it("isPlaceholderPageUrl matches empty, about:blank and data: (case-insensitive)", () => {
+    for (const u of ["", "about:blank", "ABOUT:BLANK", "data:text/html,x", "DATA:text/html,x", undefined]) expect(isPlaceholderPageUrl(u)).toBe(true);
+    for (const u of [REAL, "https://a.test/", "app://x"]) expect(isPlaceholderPageUrl(u)).toBe(false);
+  });
+
+  it("a placeholder registered last does not become current when a real page exists", async () => {
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [urlPage(REAL), urlPage(PLACEHOLDER)]) as never, { skipPlaceholderPages: true });
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("a placeholder opened later does not steal current from a real page", async () => {
+    const ctx = fakeContext(async () => new FakeCdp(), [urlPage(REAL)]);
+    const t = new PlaywrightTarget(ctx as never, { skipPlaceholderPages: true });
+    ctx.emit("page", urlPage("about:blank"));
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("lists the live title of a page no command touched yet", async () => {
+    const page = urlPage(REAL) as unknown as Record<string, unknown>;
+    page.title = async () => "Qure";
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [page as never]) as never, { skipPlaceholderPages: true });
+    expect((await t.listPages({ freshTitles: true }))[0].title).toBe("Qure");
+  });
+
+  it("a page whose title read hangs is listed with the cached title after the wait cap", async () => {
+    vi.useFakeTimers();
+    try {
+      const page = urlPage(REAL) as unknown as Record<string, unknown>;
+      page.title = () => new Promise<string>(() => {});
+      const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [page as never]) as never);
+      const listed = t.listPages({ freshTitles: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await listed)[0].title).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("isPlaceholderPageUrl matches any about: URL but not chrome-error://", () => {
+    for (const u of ["about:blank#x", "about:blank?x", "about:srcdoc", "  About:Blank "]) expect(isPlaceholderPageUrl(u)).toBe(true);
+    expect(isPlaceholderPageUrl("chrome-error://chromewebdata/")).toBe(false);
+  });
+
+  it("a window opened later at about:blank becomes current on its first real navigation, then is forgotten", async () => {
+    const ctx = fakeContext(async () => new FakeCdp(), [urlPage(REAL)]);
+    const t = new PlaywrightTarget(ctx as never, { skipPlaceholderPages: true });
+    const late = urlPage("about:blank");
+    ctx.emit("page", late);
+    expect(await currentUrl(t)).toBe(REAL);
+    late.navigate("about:blank#x");
+    expect(await currentUrl(t)).toBe(REAL);
+    late.navigate("app://second/");
+    expect(await currentUrl(t)).toBe("app://second/");
+    await t.selectPage((await t.listPages())[0].tabId);
+    late.navigate("app://second/b");
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("a placeholder present at construction beside a real page takes over when it loads within 10 s", async () => {
+    let clock = 0;
+    const ph = urlPage(PLACEHOLDER);
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [urlPage(REAL), ph]) as never, { skipPlaceholderPages: true, now: () => clock });
+    clock = 9_000;
+    ph.navigate("app://other/");
+    expect(await currentUrl(t)).toBe("app://other/");
+  });
+
+  it("an awaiting placeholder that loads after 10 s does not take over, and is forgotten", async () => {
+    let clock = 0;
+    const ctx = fakeContext(async () => new FakeCdp(), [urlPage(REAL)]);
+    const t = new PlaywrightTarget(ctx as never, { skipPlaceholderPages: true, now: () => clock });
+    const late = urlPage("about:blank");
+    ctx.emit("page", late);
+    clock = 10_001;
+    late.navigate("app://slow/");
+    expect(await currentUrl(t)).toBe(REAL);
+    clock = 10_002;
+    late.navigate("app://slow/b");
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("an awaiting placeholder does not take over while the agent has pinned a page", async () => {
+    const ctx = fakeContext(async () => new FakeCdp(), [urlPage(REAL)]);
+    const t = new PlaywrightTarget(ctx as never, { skipPlaceholderPages: true });
+    const late = urlPage("about:blank");
+    ctx.emit("page", late);
+    await t.selectPage((await t.listPages())[0].tabId);
+    late.navigate("app://late/");
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("newPage makes the new page current in app mode", async () => {
+    const created = urlPage("about:blank");
+    const ctx = fakeContext(async () => new FakeCdp(), [urlPage(REAL)]);
+    ctx.newPage = async () => created;
+    const t = new PlaywrightTarget(ctx as never, { skipPlaceholderPages: true });
+    const info = await t.newPage();
+    expect(info.current).toBe(true);
+    expect(await currentUrl(t)).toBe("about:blank");
+  });
+
+  it("a placeholder the agent selected is not displaced by the hand-off", async () => {
+    const a = urlPage(PLACEHOLDER);
+    const b = urlPage("about:blank");
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [a, b]) as never, { skipPlaceholderPages: true });
+    const tabs = await t.listPages();
+    await t.selectPage(tabs[0].tabId);
+    b.navigate(REAL);
+    expect(await currentUrl(t)).toBe(PLACEHOLDER);
+  });
+
+  it("listPages reads live titles only when asked", async () => {
+    const title = vi.fn(async () => "T");
+    const page = urlPage(REAL) as unknown as Record<string, unknown>;
+    page.title = title;
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [page as never]) as never);
+    await tick();
+    const before = title.mock.calls.length;
+    await t.listPages();
+    await t.listPages();
+    expect(title.mock.calls.length).toBe(before);
+    expect((await t.listPages({ freshTitles: true }))[0].title).toBe("T");
+  });
+
+  it("a timed-out title read keeps the page dirty, clears its timer, and the late read updates the title", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveTitle: (v: string) => void = () => {};
+      const page = urlPage(REAL) as unknown as Record<string, unknown>;
+      page.title = () => new Promise<string>((r) => { resolveTitle = r; });
+      const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [page as never]) as never);
+      const first = t.listPages({ freshTitles: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await first)[0].title).toBe("");
+      expect(vi.getTimerCount()).toBe(0);
+      // Dirty again: a second list starts a new read; the late first read lands and is used.
+      const second = t.listPages({ freshTitles: true });
+      resolveTitle("Late");
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await second)[0].title).toBe("Late");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("one title read at a time: repeated lists reuse the in-flight read", async () => {
+    vi.useFakeTimers();
+    try {
+      const title = vi.fn(() => new Promise<string>(() => {}));
+      const page = urlPage(REAL) as unknown as Record<string, unknown>;
+      page.title = title;
+      const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [page as never]) as never);
+      for (let i = 0; i < 3; i++) {
+        const listed = t.listPages({ freshTitles: true });
+        await vi.advanceTimersByTimeAsync(1000);
+        await listed;
+      }
+      expect(title).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a hung title read does not block later scripts", async () => {
+    vi.useFakeTimers();
+    try {
+      const page = urlPage(REAL) as unknown as Record<string, unknown>;
+      page.title = () => new Promise<string>(() => {});
+      page.evaluate = async () => 1;
+      const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [page as never]) as never);
+      const h = await t.ensurePage();
+      const listed = t.listPages({ freshTitles: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      await listed;
+      // The read is still running: the page stays dirty, but a script does not wait for it.
+      await h.executeJavaScript("1");
+      await h.executeJavaScript("2");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a read overtaken by a navigation does not overwrite the fresher title", async () => {
+    vi.useFakeTimers();
+    try {
+      const resolvers: Array<(v: string) => void> = [];
+      const cdp = new FakeCdp();
+      const page = urlPage(REAL) as unknown as Record<string, unknown>;
+      page.title = () => new Promise<string>((r) => { resolvers.push(r); });
+      const t = new PlaywrightTarget(fakeContext(async () => cdp, [page as never]) as never);
+      const h = await t.ensurePage();
+      const first = t.listPages({ freshTitles: true });
+      await vi.advanceTimersByTimeAsync(1000);
+      await first;
+      cdp.emit("Page.navigatedWithinDocument", {});
+      const second = t.listPages({ freshTitles: true });
+      expect(resolvers.length).toBe(2);
+      resolvers[1]("New");
+      expect((await second)[0].title).toBe("New");
+      resolvers[0]("Old");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.getTitle()).toBe("New");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("with only placeholders, a placeholder is current", async () => {
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [urlPage(PLACEHOLDER), urlPage("about:blank")]) as never, { skipPlaceholderPages: true });
+    expect(await currentUrl(t)).toBe("about:blank");
+  });
+
+  it("a current placeholder gives way when a page navigates to a real URL", async () => {
+    const a = urlPage(PLACEHOLDER);
+    const b = urlPage("about:blank");
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [a, b]) as never, { skipPlaceholderPages: true });
+    expect(await currentUrl(t)).toBe("about:blank");
+    a.navigate(REAL);
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("closing the current page picks the newest real page", async () => {
+    const real = urlPage(REAL);
+    const ph = urlPage(PLACEHOLDER);
+    const other = urlPage("https://a.test/");
+    const t = new PlaywrightTarget(fakeContext(async () => new FakeCdp(), [real, other, ph]) as never, { skipPlaceholderPages: true });
+    expect(await currentUrl(t)).toBe("https://a.test/");
+    other.emit("close");
+    expect(await currentUrl(t)).toBe(REAL);
+  });
+
+  it("normal mode is unchanged: the last page and a new about:blank page become current", async () => {
+    const ctx = fakeContext(async () => new FakeCdp(), [urlPage(REAL), urlPage(PLACEHOLDER)]);
+    const t = new PlaywrightTarget(ctx as never);
+    expect(await currentUrl(t)).toBe(PLACEHOLDER);
+    ctx.emit("page", urlPage("about:blank"));
+    expect(await currentUrl(t)).toBe("about:blank");
   });
 });

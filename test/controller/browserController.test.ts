@@ -2695,6 +2695,44 @@ describe("tabs", () => {
     };
   }
 
+  it("every tabs action asks for fresh titles", async () => {
+    const tabsData = [
+      { tabId: 1, url: "https://a.example/", title: "A", current: false },
+      { tabId: 2, url: "https://b.example/", title: "B", current: true },
+    ];
+    const target = makeTabsTarget(makeFakePage(), tabsData);
+    const controller = new BrowserController(target);
+    await controller.tabs({ action: "list" });
+    expect(target.listPages).toHaveBeenLastCalledWith({ freshTitles: true });
+    target.listPages.mockClear();
+    await controller.tabs({ action: "switch", tabId: 1 });
+    expect(target.listPages).toHaveBeenLastCalledWith({ freshTitles: true });
+  });
+
+  it("app mode: the only real window cannot be closed while a service window exists", async () => {
+    const tabsData = [
+      { tabId: 1, url: "app://main/", title: "Main", current: true },
+      { tabId: 2, url: "data:text/html,<html></html>", title: "", current: false },
+    ];
+    const target = makeTabsTarget(makeFakePage(), tabsData);
+    const controller = new BrowserController(target, { lockNavigation: true });
+    expect(await controller.tabs({ action: "close", tabId: 1 })).toHaveProperty("error", expect.stringMatching(/last window cannot be closed/));
+    expect(target.closePage).not.toHaveBeenCalled();
+    const ok = await controller.tabs({ action: "close", tabId: 2 });
+    expect(ok).not.toHaveProperty("error");
+    expect(target.closePage).toHaveBeenCalledWith(2);
+  });
+
+  it("app mode: a real window can be closed when another real window exists", async () => {
+    const tabsData = [
+      { tabId: 1, url: "app://main/", title: "Main", current: true },
+      { tabId: 2, url: "app://second/", title: "Second", current: false },
+    ];
+    const target = makeTabsTarget(makeFakePage(), tabsData);
+    const controller = new BrowserController(target, { lockNavigation: true });
+    expect(await controller.tabs({ action: "close", tabId: 1 })).not.toHaveProperty("error");
+  });
+
   it("rejects an unknown action", async () => {
     const controller = new BrowserController(makeFakeTarget(makeFakePage()));
     const result = await controller.tabs({ action: "teleport" });

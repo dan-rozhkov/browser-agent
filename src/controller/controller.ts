@@ -53,6 +53,7 @@ import {
   v1Shape,
 } from "./captureCss.js";
 import { validateUploadFiles, type UploadPayloadFile } from "./uploadFiles.js";
+import { isPlaceholderPageUrl } from "../shared/placeholderUrl.js";
 import { parseKeySpec, resolveNamedKey, keyDispatchOptions, dispatchKeyPair as dispatchKeyPairShared } from "./keys.js";
 import {
   ARGS_MARKER,
@@ -813,7 +814,8 @@ export interface BrowserTarget {
    * over TabManager) — `tabs()` reports "not supported" up front if any is
    * missing, rather than failing action-by-action.
    */
-  listPages?(): Promise<BrowserTabInfo[]>;
+  /** `freshTitles`: re-read stale titles from the live pages (slower; every `tabs` action result asks). Other targets ignore it. */
+  listPages?(opts?: { freshTitles?: boolean }): Promise<BrowserTabInfo[]>;
   selectPage?(tabId: number): Promise<boolean>;
   closePage?(tabId: number): Promise<boolean>;
   newPage?(url?: string): Promise<BrowserTabInfo>;
@@ -4819,8 +4821,14 @@ export class BrowserController {
         return this.listTabsResult();
       }
       // close
-      if (this.lockMessage && (await this.target.listPages!()).length <= 1) {
-        return errorResult(`${this.lockMessage} The last window cannot be closed.`);
+      if (this.lockMessage) {
+        const all = await this.target.listPages!();
+        // Service windows (empty, about:blank, data:) do not count: closing the only real window would leave the app without UI.
+        const real = all.filter((t) => !isPlaceholderPageUrl(t.url));
+        const target = all.find((t) => t.tabId === tabId);
+        if (all.length <= 1 || (target && !isPlaceholderPageUrl(target.url) && real.length <= 1)) {
+          return errorResult(`${this.lockMessage} The last window cannot be closed.`);
+        }
       }
       const ok = await this.target.closePage!(tabId!);
       if (!ok) return errorResult(`No browser tab with id ${tabId} to close, or it is not a browser tab.`);
@@ -4829,7 +4837,7 @@ export class BrowserController {
   }
 
   private async listTabsResult(): Promise<BrowserCommandResult> {
-    const pages = await this.target.listPages!();
+    const pages = await this.target.listPages!({ freshTitles: true });
     const tabsOut = pages.map((p) => ({ tabId: p.tabId, url: p.url, title: p.title, current: p.current }));
     const current = pages.find((p) => p.current)?.tabId ?? null;
     return { tabs: tabsOut, current };

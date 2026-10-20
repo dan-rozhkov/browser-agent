@@ -226,6 +226,12 @@ try {
   `{ error }` ("This is a desktop app window, not a browser tab ..."), because loading a URL in the only
   window destroys the app UI. Switching windows, reload and back still work. Tell the model it drives a
   desktop app, for example with `prompt: { sections: [...] }` (see `examples/run-app.ts`).
+- **Service windows.** Some apps keep an empty window (a `data:` URL, `about:blank` or no URL) beside the real one. The
+  launcher keeps polling for a page with a real URL for up to `placeholderGraceMs` (default 5000, never past
+  `timeoutMs`), then connects anyway. The controller never makes such a window the current tab while a real window
+  exists, and switches to a real window when a page navigates to a real URL. An app with only empty windows still
+  launches. A service window that appears while a real window is current (or already exists at connect time) becomes current on its first real navigation, but only within 10 s of appearing and only while the agent has not picked a tab itself. The last real window cannot be closed even when a service window exists. `isPlaceholderPageUrl` (`adapters/playwright`; empty, any `about:` URL, `data:`; not `chrome-error://`) is the test; `PlaywrightTarget` takes
+  `{ skipPlaceholderPages: true }` and `connectOverCdp` takes it as a third argument, and the launcher passes it to `deps.connect` too. Normal browser mode is unchanged.
 - **Apps that block the debug port.** Some apps strip `--remote-debugging-port` (Figma is one). No port opens,
   and the launcher kills the child and throws an error that says so after `timeoutMs` (default 30 s).
 - **Limits.** Native menus, file dialogs and other OS windows are not web content: the agent does not see them.
@@ -258,13 +264,14 @@ const app = await launchElectronApp({ app: "/Applications/Orca.app", useAppProfi
 
 ```ts
 // adapters/playwright   (peer: playwright-core)
-class PlaywrightTarget implements BrowserTarget { constructor(context: BrowserContext) }
-connectOverCdp(cdpUrl: string): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }>;
+class PlaywrightTarget implements BrowserTarget { constructor(context: BrowserContext, opts?: { skipPlaceholderPages?: boolean }) }
+isPlaceholderPageUrl(url: string | null | undefined): boolean;
+connectOverCdp(cdpUrl: string, controllerOptions?, targetOptions?: { skipPlaceholderPages?: boolean }): Promise<{ controller: BrowserController; close(): Promise<void>; onDisconnected(cb: () => void): void }>;
 redactedError(e: unknown, secret: string): Error;
 playwrightContexts(browser: Browser, contextOptions?: BrowserContextOptions, controllerOptions?: ConstructorParameters<typeof BrowserController>[1]): () => Promise<OpenedBrowser>;  // a new isolated context per call, for parallel runs
 
 // adapters/electron   (Node only; peer: playwright-core)
-launchElectronApp(opts: { app: string; args?: string[]; env?: NodeJS.ProcessEnv; userDataDir?: string; useAppProfile?: boolean; port?: number; timeoutMs?: number;
+launchElectronApp(opts: { app: string; args?: string[]; env?: NodeJS.ProcessEnv; userDataDir?: string; useAppProfile?: boolean; port?: number; timeoutMs?: number; placeholderGraceMs?: number;
   controllerOptions?: ConstructorParameters<typeof BrowserController>[1] }, deps?: ElectronLaunchDeps):
   Promise<{ controller: BrowserController; browser: BrowserBridge; cdpUrl: string; pid: number; close(): Promise<void> }>;
 findRunningElectronApp(app: string, deps?: ElectronLaunchDeps): Promise<{ pid: number; debugPort: number | null; userDataDir: string | null }[]>;

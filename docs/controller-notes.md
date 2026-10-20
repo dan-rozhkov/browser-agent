@@ -1835,3 +1835,23 @@ v2 review rounds (2026-10-15):
 - Leftover `@charset` / `@import` (data:) / `@namespace` are hoisted to the top of the sheet, outside wrappers.
 - Rewritten root compounds keep exact specificity: `:is(:where(:root,:host),C:not(*))` for `html`/`:root`, `:is(C,:where(:root,:host))` for classless C.
 - Budget: no new fetch under 8 s left, pending ones aborted at deadline - 3 s; the page query is checked before each 5000-selector chunk and raced against deadline - 2 s (unpruned CSS otherwise). Any CSS-phase throw or an over-cap document falls back to the v1 shape.
+
+## Electron service windows (2026-10-20)
+
+Bug: an Electron app (Qure) had a service window with the URL `data:text/html,<html><body></body></html>`.
+`PlaywrightTarget` made the last registered page current, so the agent read the empty window and reported
+"no data". Fix, app mode only: `launchElectronApp` connects with `skipPlaceholderPages: true`. A placeholder URL is
+empty, `about:blank` or `data:*` (`isPlaceholderPageUrl`). With the option on, a placeholder is current only when no
+real page exists, a placeholder never takes the current tab from a real page, closing the current page picks the
+newest real page, and a page that navigates to a real URL replaces a current placeholder. The launcher also waits up
+to `placeholderGraceMs` (default 5000, never past `timeoutMs`) for a real page in `/json/list` before it connects.
+Normal browser mode is unchanged: a popup that starts at `about:blank` still becomes current.
+
+Review fixes (same day): a placeholder window that appears beside a real current page (also at construction) becomes current on its first
+real main-frame navigation, if that happens within 10 s and the agent has not pinned a tab; `newPage` and `selectPage` pin the current tab against the placeholder hand-off;
+the app-mode close guard (`src/shared/placeholderUrl.ts`, shared with the adapter) refuses to close the only real window;
+`isPlaceholderPageUrl` matches empty, any `about:` URL and `data:` (not `chrome-error://`). `BrowserTarget.listPages(opts?)`
+takes `{ freshTitles: true }`; every `tabs` action result passes it; click detection does not, so it does no `page.title()` round trips.
+Each page has one title read in flight: lists reuse it, a read that a navigation overtook writes nothing, and a running read never blocks a script. The launcher passes `{ skipPlaceholderPages: true }`
+to an injected `deps.connect` as the third argument, clamps `placeholderGraceMs` (NaN/undefined: 5000, negative: 0), and
+connects instead of failing when a page was seen but the last polls errored.
