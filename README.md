@@ -230,6 +230,29 @@ try {
   and the launcher kills the child and throws an error that says so after `timeoutMs` (default 30 s).
 - **Limits.** Native menus, file dialogs and other OS windows are not web content: the agent does not see them.
 
+### An app that is already open
+
+The debug port is set only when an app starts, so you cannot attach to a running instance. To work with the
+app the user already has open: find it, quit it gracefully, and relaunch it with its own profile.
+
+```ts
+const [running] = await findRunningElectronApp("/Applications/Orca.app");
+if (running && !(await quitElectronApp(running.pid))) throw new Error("The app did not quit (a dialog may be open).");
+const app = await launchElectronApp({ app: "/Applications/Orca.app", useAppProfile: true });
+```
+
+- `findRunningElectronApp(app)` lists the main processes of the app (`pid`, `debugPort`, `userDataDir`; Chromium
+  helpers are skipped; `[]` if `ps` fails).
+- `quitElectronApp(pid, { timeoutMs })` quits like Cmd+Q (macOS: `NSRunningApplication.terminate`; Linux:
+  SIGTERM) and never kills. On Windows a signal is a hard kill, so it does nothing there and resolves `false`.
+  It resolves `true` when the process is gone, `false` when it still runs after `timeoutMs` (default 15 s,
+  counted from the call), for example because of a "save changes?" dialog.
+- `useAppProfile: true` passes no `--user-data-dir`, so the app keeps its logins and data. Nothing is removed on
+  `close()`, and `close()` first asks the app to quit (up to 10 s) before SIGTERM. It cannot be combined with
+  `userDataDir`. If the host process exits without `close()`, the app still gets SIGKILL.
+- The debug port stays open while the app runs. When you are done, quit the app and reopen it normally.
+  Deciding whether to ask the user before the restart is up to the consumer.
+
 ## API: adapters
 
 ```ts
@@ -240,9 +263,11 @@ redactedError(e: unknown, secret: string): Error;
 playwrightContexts(browser: Browser, contextOptions?: BrowserContextOptions, controllerOptions?: ConstructorParameters<typeof BrowserController>[1]): () => Promise<OpenedBrowser>;  // a new isolated context per call, for parallel runs
 
 // adapters/electron   (Node only; peer: playwright-core)
-launchElectronApp(opts: { app: string; args?: string[]; env?: NodeJS.ProcessEnv; userDataDir?: string; port?: number; timeoutMs?: number;
+launchElectronApp(opts: { app: string; args?: string[]; env?: NodeJS.ProcessEnv; userDataDir?: string; useAppProfile?: boolean; port?: number; timeoutMs?: number;
   controllerOptions?: ConstructorParameters<typeof BrowserController>[1] }, deps?: ElectronLaunchDeps):
   Promise<{ controller: BrowserController; browser: BrowserBridge; cdpUrl: string; pid: number; close(): Promise<void> }>;
+findRunningElectronApp(app: string, deps?: ElectronLaunchDeps): Promise<{ pid: number; debugPort: number | null; userDataDir: string | null }[]>;
+quitElectronApp(pid: number, opts?: { timeoutMs?: number }, deps?: ElectronLaunchDeps): Promise<boolean>;
 
 // adapters/systemone-http
 createSystemOneClient(opts: { apiKey?: string; model?: string; baseUrl?: string;

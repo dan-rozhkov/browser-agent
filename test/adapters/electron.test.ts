@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { launchElectronApp, resolveElectronExecutable, type ElectronChild, type ElectronLaunchDeps } from "../../src/adapters/electron.js";
+import { findRunningElectronApp, launchElectronApp, quitElectronApp, resolveElectronExecutable, type ElectronChild, type ElectronLaunchDeps } from "../../src/adapters/electron.js";
 import { APP_MODE_LOCK_MESSAGE, BrowserController, type BrowserPageHandle, type BrowserTarget } from "../../src/controller/index.js";
 
 /** A child process that can be told to ignore SIGTERM. */
@@ -64,6 +64,11 @@ function makeDeps(child: FakeChild, over: Partial<ElectronLaunchDeps> = {}) {
     onParentExit: () => () => undefined,
     pollIntervalMs: 1,
     termGraceMs: 15,
+    // Never reach a real process: the graceful quit sees the fake child only.
+    platform: "darwin",
+    isAlive: () => child.exitCode === null && child.signalCode === null,
+    runOsascript: async () => "true",
+    appQuitMs: 15,
     ...over,
   };
   return { deps, spawn, disconnect, removed: f.removed, fs: f.fs };
@@ -355,5 +360,163 @@ describe("lockNavigation", () => {
     expect(page.loadURL).toHaveBeenCalledWith("https://example.com");
     expect(await controller.tabs({ action: "new" })).not.toHaveProperty("error");
     expect(target.newPage).toHaveBeenCalled();
+  });
+});
+
+describe("launchElectronApp useAppProfile", () => {
+  it("spawns without --user-data-dir, makes no temp dir and removes nothing", async () => {
+    const child = new FakeChild();
+    const { deps, spawn, fs, removed } = makeDeps(child);
+    const app = await launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps);
+    const args = spawn.mock.calls[0][1];
+    expect(args).toEqual(["--remote-debugging-port=9333"]);
+    expect(fs.mkdtemp).not.toHaveBeenCalled();
+    await app.close();
+    expect(removed).toEqual([]);
+    expect(fs.rm).not.toHaveBeenCalled();
+  });
+
+  it("close() asks the app to quit before any signal", async () => {
+    const child = new FakeChild();
+    const runOsascript = vi.fn(async (script: string) => {
+      expect(script).toContain("runningApplicationWithProcessIdentifier(4242)");
+      child.die(null, 0);
+      return "true";
+    });
+    const { deps } = makeDeps(child, { runOsascript });
+    const app = await launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps);
+    await app.close();
+    expect(runOsascript).toHaveBeenCalledTimes(1);
+    expect(child.signals).toEqual([]);
+  });
+
+  it("close() falls back to signals when the graceful quit times out", async () => {
+    const child = new FakeChild();
+    const { deps } = makeDeps(child);
+    const app = await launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps);
+    await app.close();
+    expect(child.signals).toEqual(["SIGTERM"]);
+  });
+
+  it("a temp profile close() does not run the graceful quit", async () => {
+    const child = new FakeChild();
+    const runOsascript = vi.fn(async () => "true");
+    const { deps } = makeDeps(child, { runOsascript });
+    const app = await launchElectronApp({ app: "/x/Orca" }, deps);
+    await app.close();
+    expect(runOsascript).not.toHaveBeenCalled();
+  });
+
+  it("an empty userDataDir is passed as is, not read as the app profile", async () => {
+    const child = new FakeChild();
+    const { deps, spawn } = makeDeps(child);
+    await launchElectronApp({ app: "/x/Orca", userDataDir: "" }, deps);
+    expect(spawn.mock.calls[0][1]).toContain("--user-data-dir=");
+    await expect(launchElectronApp({ app: "/x/Orca", useAppProfile: true, userDataDir: "" }, makeDeps(new FakeChild()).deps)).rejects.toThrow(/cannot be used together/);
+  });
+
+  it("removes nothing on parent exit", async () => {
+    const child = new FakeChild();
+    let exit: () => void = () => undefined;
+    const rmSync = vi.fn();
+    const { deps } = makeDeps(child, { onParentExit: (fn) => { exit = fn; return () => undefined; }, rmSync });
+    await launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps);
+    exit();
+    expect(rmSync).not.toHaveBeenCalled();
+  });
+
+  it("throws with userDataDir before spawning", async () => {
+    const { deps, spawn } = makeDeps(new FakeChild());
+    await expect(launchElectronApp({ app: "/x/Orca", useAppProfile: true, userDataDir: "/p" }, deps)).rejects.toThrow(/cannot be used together/);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+});
+
+describe("findRunningElectronApp", () => {
+  const exe = "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
+  const find = (procs: { pid: number; args: string }[]) =>
+    findRunningElectronApp("/Applications/Visual Studio Code.app", { readPlistExecutable: async () => "Electron", listProcesses: async () => procs });
+
+  it("matches the main process, skips helpers, --type= and its own pid", async () => {
+    const res = await find([
+      { pid: 10, args: exe },
+      { pid: 11, args: `${exe} --remote-debugging-port=9222 --user-data-dir=/Users/a b/Profile --foo` },
+      { pid: 12, args: `${exe} --type=renderer --remote-debugging-port=9222` },
+      { pid: 13, args: "/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Helper.app/Contents/MacOS/Electron Helper" },
+      { pid: 14, args: `${exe}-other` },
+      { pid: process.pid, args: exe },
+    ]);
+    expect(res).toEqual([
+      { pid: 10, debugPort: null, userDataDir: null },
+      { pid: 11, debugPort: 9222, userDataDir: "/Users/a b/Profile" },
+    ]);
+  });
+
+  it("returns [] when ps fails", async () => {
+    const res = await findRunningElectronApp("/x/App", {
+      listProcesses: async () => { throw new Error("no ps"); },
+    });
+    expect(res).toEqual([]);
+  });
+});
+
+describe("quitElectronApp", () => {
+  function setup(opts: { platform?: NodeJS.Platform; aliveFor?: number; alive?: boolean } = {}) {
+    let polls = 0;
+    const runOsascript = vi.fn(async () => "true");
+    const isAlive = vi.fn(() => {
+      if (opts.alive !== undefined) return opts.alive;
+      return ++polls <= (opts.aliveFor ?? 0);
+    });
+    return { runOsascript, isAlive, deps: { platform: opts.platform ?? "darwin", runOsascript, isAlive, sleep: async () => undefined, pollIntervalMs: 1 } as ElectronLaunchDeps };
+  }
+
+  it("on darwin runs osascript with the pid and waits for exit", async () => {
+    const s = setup({ aliveFor: 3 });
+    expect(await quitElectronApp(321, {}, s.deps)).toBe(true);
+    expect(s.runOsascript).toHaveBeenCalledTimes(1);
+    const script = (s.runOsascript.mock.calls[0] as unknown as [string])[0];
+    expect(script).toContain("runningApplicationWithProcessIdentifier(321)");
+    expect(script).toContain("terminate");
+  });
+
+  it("returns false when the app is still alive after the timeout", async () => {
+    const s = setup({ alive: true });
+    expect(await quitElectronApp(321, { timeoutMs: 20 }, { ...s.deps, sleep: (ms) => new Promise((r) => setTimeout(r, ms + 5)) })).toBe(false);
+  });
+
+  it("uses SIGTERM on Linux", async () => {
+    const signal = vi.fn();
+    const s = setup({ platform: "linux", aliveFor: 2 });
+    expect(await quitElectronApp(321, {}, { ...s.deps, signal })).toBe(true);
+    expect(signal).toHaveBeenCalledWith(321, "SIGTERM");
+    expect(s.runOsascript).not.toHaveBeenCalled();
+  });
+
+  it("does nothing on Windows, where a signal is a hard kill", async () => {
+    const signal = vi.fn();
+    const s = setup({ platform: "win32", alive: true });
+    expect(await quitElectronApp(321, {}, { ...s.deps, signal })).toBe(false);
+    expect(signal).not.toHaveBeenCalled();
+    expect(s.runOsascript).not.toHaveBeenCalled();
+  });
+
+  it("returns false at once when macOS has no running application for the pid", async () => {
+    const s = setup({ alive: true });
+    const sleep = vi.fn(async () => undefined);
+    expect(await quitElectronApp(321, {}, { ...s.deps, runOsascript: async () => "nil", sleep })).toBe(false);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid pid", async () => {
+    const s = setup({ alive: true });
+    for (const pid of [0, -5, 1.5, Number.NaN]) expect(await quitElectronApp(pid, {}, s.deps)).toBe(false);
+    expect(s.runOsascript).not.toHaveBeenCalled();
+  });
+
+  it("returns true at once for a pid that is already gone", async () => {
+    const s = setup({ alive: false });
+    expect(await quitElectronApp(321, {}, s.deps)).toBe(true);
+    expect(s.runOsascript).not.toHaveBeenCalled();
   });
 });
