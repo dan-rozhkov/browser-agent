@@ -4887,8 +4887,7 @@ export const SIGNATURE_JS = `(() => {
  * The pure motion planner behind CURSOR_JS (cua-derived, MIT): constants,
  * easing/profile/path math, `planMove`, `sampleAt`, `velocityAt`. No DOM, no
  * `args`. CURSOR_JS embeds it the way it embeds FIND_BY_TEXT_JS, and
- * test/controller/cursorPlan.test.ts evaluates this fragment directly. Only
- * `window.__penCursorBowSign` (classic's bow alternation) is touched.
+ * test/controller/cursorPlan.test.ts evaluates this fragment directly.
  */
 export const CURSOR_PLAN_JS = `
   var DT_MS = 1000 / 120; // cua DT_MS: planning sample step
@@ -4916,18 +4915,12 @@ export const CURSOR_PLAN_JS = `
   // visible tip sits within ~1px of it.
   var ARROW_PIVOT = { x: 0, y: 0 };
   var ARROW_POINTS = "2.2,1.6 17.6,8.5 10.8,12.4 6.2,17.7";
-  // cua motion.rs default_effects, per style. rotates: the tip turns toward the
-  // direction of travel (cua heading Tangent); false = fixed, never chases a heading.
-  // Every style is fixed on purpose: the turning arrow read as distracting, the
-  // user wants plain movement. Flip a style back to true to re-enable it.
-  var STYLE_EFFECTS = {
-    signature_arc: { trail: false, glow: true, magnet: false, ripple: true, squish: true, rotates: false },
-    spring_settle: { trail: false, glow: true, magnet: false, ripple: false, squish: true, rotates: false },
-    magnetic: { trail: false, glow: false, magnet: true, ripple: true, squish: false, rotates: false },
-    comet_swoop: { trail: true, glow: false, magnet: false, ripple: true, squish: false, rotates: false },
-    classic: { trail: false, glow: false, magnet: false, ripple: true, squish: true, rotates: false }
-  };
-  var NO_EFFECTS = { trail: false, glow: false, magnet: false, ripple: false, squish: false, rotates: false };
+  // cua motion.rs default_effects for the one motion (signature_arc).
+  // rotates: the tip turns toward the direction of travel (cua heading
+  // Tangent); false = fixed. Fixed on purpose: the turning arrow read as
+  // distracting, the user wants plain movement.
+  var MOTION_EFFECTS = { glow: true, ripple: true, squish: true, rotates: false };
+  var NO_EFFECTS = { glow: false, ripple: false, squish: false, rotates: false };
 
   function clamp(v, lo, hi) {
     return Math.max(lo, Math.min(hi, v));
@@ -4946,14 +4939,8 @@ export const CURSOR_PLAN_JS = `
     return "rotate(" + rot + "rad) scale(" + scale + ")";
   }
 
-  function easeInOutCubic(t) {
-    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-  }
   function minJerk(t) {
     return t * t * t * (10 - 15 * t + 6 * t * t);
-  }
-  function smootherstep(t) {
-    return t * t * t * (t * (6 * t - 15) + 10);
   }
   function easeOut(k) {
     return 1 - Math.pow(1 - k, 3);
@@ -4978,20 +4965,6 @@ export const CURSOR_PLAN_JS = `
     }
     return function (tau) {
       return base(tau) + over * bump(tau, overAt);
-    };
-  }
-
-  // wobble_profile: damped wobble around the end from "start" on.
-  function wobbleProfile(base, amp, cycles, decay, start) {
-    return function (tau) {
-      if (tau <= start) return base(tau);
-      var u = (tau - start) / (1 - start);
-      var ramp = smootherstep(Math.min(u / 0.18, 1));
-      var norm = Math.max(Math.exp(-decay * 0.12) * 0.77, 1e-6);
-      return (
-        base(tau) +
-        (amp * ramp * Math.exp(-decay * u) * Math.sin(2 * Math.PI * cycles * u) * Math.pow(1 - u, 2)) / norm
-      );
     };
   }
 
@@ -5061,22 +5034,6 @@ export const CURSOR_PLAN_JS = `
     }, 256);
   }
 
-  // Gentle single-sided quadratic curve (paths.bow).
-  function bowPath(a, b, amount) {
-    var d = dist(a, b);
-    var un = unitVec(a, b);
-    var nx = -un.y;
-    var ny = un.x;
-    var c = { x: (a.x + b.x) / 2 + nx * amount * d, y: (a.y + b.y) / 2 + ny * amount * d };
-    return makePath(function (u) {
-      var v = 1 - u;
-      return {
-        x: v * v * a.x + 2 * v * u * c.x + u * u * b.x,
-        y: v * v * a.y + 2 * v * u * c.y + u * u * b.y
-      };
-    }, 256);
-  }
-
   // Chord side that bends paths upward for horizontal moves (naturalSide).
   function naturalSide(a, b) {
     return unitVec(a, b).x >= 0 ? -1 : 1;
@@ -5115,70 +5072,6 @@ export const CURSOR_PLAN_JS = `
     return clamp(150 + 120 * Math.log(d / w + 1) / Math.LN2, 300, 1000) * scale;
   }
 
-  // magnetic(): bow 0.04, capture radius min(40, len/2), pull 0.45, enter
-  // speed 300. Returns the samples and the lock-on time in ms.
-  function magneticSamples(from, aim) {
-    var path = bowPath(from, aim, 0.04 * naturalSide(from, aim));
-    var len = path.length;
-    var radius = Math.min(40, len * 0.5);
-    var pull = 0.45;
-    var enterSpeed = 300;
-    var out = [{ t: 0, x: from.x, y: from.y }];
-    var s = 0;
-    var v = 0;
-    var t = 0;
-    var snapT = null;
-    var dt = DT_MS / 1000;
-    while (s < len && t < 4) {
-      var rem = len - s;
-      if (rem > radius) {
-        v = Math.min(1500, v + 7000 * dt, enterSpeed + 5.5 * (rem - radius));
-      } else {
-        if (snapT === null) snapT = t * 1000;
-        v += 26000 * pull * (radius / Math.max(rem, 6)) * dt;
-      }
-      s = Math.min(len, s + v * dt);
-      t += dt;
-      var q = path.at(s / len);
-      out.push({ t: t * 1000, x: q.x, y: q.y });
-    }
-    if (out.length < 2) out.push({ t: DT_MS, x: aim.x, y: aim.y });
-    return { samples: pinEnds(out, from, aim), snapT: snapT === null ? t * 1000 : snapT };
-  }
-
-  // The old behaviour, kept as the escape hatch: bowed quadratic, eased with
-  // easeInOutCubic, a tiny overshoot corrected a frame later.
-  function classicSamples(from, aim, d) {
-    var duration = Math.min(900, Math.max(260, 90 + d * 0.7));
-    var dx = aim.x - from.x;
-    var dy = aim.y - from.y;
-    var dd = d || 0.0001;
-    window.__penCursorBowSign = -(window.__penCursorBowSign || -1);
-    var bow = dd * (0.08 + Math.random() * 0.04) * window.__penCursorBowSign;
-    var midX = (from.x + aim.x) / 2 - (dy / dd) * bow;
-    var midY = (from.y + aim.y) / 2 + (dx / dd) * bow;
-    var over = Math.min(6, dd * 0.03);
-    var out = sampleTimed(function (tau) {
-      var e = easeInOutCubic(tau);
-      var m = 1 - e;
-      return {
-        x: m * m * from.x + 2 * m * e * midX + e * e * aim.x,
-        y: m * m * from.y + 2 * m * e * midY + e * e * aim.y
-      };
-    }, duration);
-    pinEnds(out, from, aim);
-    // The overshoot/correction samples are NOT part of the timed path: planMove
-    // appends them AFTER retiming, so scaling cannot squash them below one
-    // 60 Hz frame (8ms / 25ms after the last path sample, as in the cua timing).
-    return {
-      samples: out,
-      tail: [
-        { dt: 8, x: aim.x + (dx / dd) * over, y: aim.y + (dy / dd) * over },
-        { dt: 25, x: aim.x, y: aim.y }
-      ]
-    };
-  }
-
   function arrivalIndex(samples, to) {
     for (var i = 0; i < samples.length; i++) {
       if (dist(samples[i], to) <= ARRIVAL_TOLERANCE) return i;
@@ -5201,7 +5094,7 @@ export const CURSOR_PLAN_JS = `
   // TIP_ANGLE + PI and spins on carried headings. After the last sample a
   // settle tail eases rot home along the shortest arc (<= a half-turn) at
   // DT_MS steps, only if rot has not reached 0 by the last sample; it only
-  // extends playback AFTER arrival. Styles with rotates:false never chase a
+  // extends playback AFTER arrival. A motion with rotates:false never chases a
   // heading: a carried rot0 just eases toward 0 during the move.
   function applyHeading(samples, rotates, rot0, arrivalT) {
     var n = samples.length;
@@ -5210,7 +5103,7 @@ export const CURSOR_PLAN_JS = `
       var step = i > 0 ? (samples[i].t - samples[i - 1].t) / 1000 : 0;
       var kStep = 1 - Math.exp(-step * HEADING_RATE);
       if (!rotates) {
-        // Fixed style: no heading, so a carried rot just eases toward 0
+        // Fixed heading: no chase, so a carried rot just eases toward 0
         // during the move (same shortest-arc chase, target 0).
         rot = wrapAngle(rot + wrapAngle(0 - rot) * kStep);
       } else if (samples[i].t <= arrivalT) {
@@ -5239,20 +5132,15 @@ export const CURSOR_PLAN_JS = `
     samples[samples.length - 1].rot = 0;
   }
 
-  // Plans the whole move. opts: { style, from, to, w (target box smaller
+  // Plans the whole move. opts: { from, to, w (target box smaller
   // side, or null for a bare point), reduce }.
   function planMove(opts) {
     var from = opts.from;
     var to = opts.to;
     var d = dist(from, to);
     var w = Math.max(4, opts.w === null || opts.w === undefined ? DEFAULT_TARGET_PT : opts.w);
-    var style = Object.prototype.hasOwnProperty.call(STYLE_EFFECTS, opts.style) ? opts.style : "signature_arc";
     var samples;
-    var snapT = null;
-    var tail = null;
-    var effects = STYLE_EFFECTS[style];
-    var side = naturalSide(from, to);
-    var big = Math.max(d, 1);
+    var effects = MOTION_EFFECTS;
 
     if (opts.reduce) {
       // cua REDUCED_MOTION_MS: a short straight glide, no effects.
@@ -5261,34 +5149,12 @@ export const CURSOR_PLAN_JS = `
       }, 8);
       samples = glide(from, to, line, minJerk, REDUCED_MOTION_MS);
       effects = NO_EFFECTS;
-    } else if (style === "classic") {
-      var cl = classicSamples(from, to, d);
-      samples = cl.samples;
-      tail = cl.tail;
-    } else if (style === "magnetic") {
-      var mag = magneticSamples(from, to);
-      samples = mag.samples;
-      snapT = mag.snapT;
-    } else if (style === "spring_settle") {
-      var spPath = cuaPath(from, to, { startHandle: 0.3, endHandle: 0.3, arcSize: 0.12 * side, arcFlow: 0 });
-      var amp = Math.min(0.05, 6 / big);
-      var spProfile = wobbleProfile(
-        function (t) {
-          return minJerk(Math.min(t / 0.68, 1));
-        },
-        amp,
-        1.3,
-        2.6,
-        0.55
-      );
-      samples = glide(from, to, spPath, spProfile, dcMs(d, w, 1.35));
-    } else if (style === "comet_swoop") {
-      var coPath = cuaPath(from, to, { startHandle: 0.3, endHandle: 0.3, arcSize: 0.24 * side, arcFlow: 0.2 });
-      samples = glide(from, to, coPath, easeInOutCubic, dcMs(d, w, 1.15));
     } else {
-      var sgPath = cuaPath(from, to, { startHandle: 0.3, endHandle: 0.3, arcSize: 0.16 * side, arcFlow: 0.15 });
+      var side = naturalSide(from, to);
+      var big = Math.max(d, 1);
+      var arc = cuaPath(from, to, { startHandle: 0.3, endHandle: 0.3, arcSize: 0.16 * side, arcFlow: 0.15 });
       var over = Math.min(0.018, 8 / big);
-      samples = glide(from, to, sgPath, bumpProfile(minJerk, over, 0.82), dcMs(d, w, 1.1));
+      samples = glide(from, to, arc, bumpProfile(minJerk, over, 0.82), dcMs(d, w, 1.1));
     }
 
     // One retime: the cua timing x MOTION_TIME_SCALE, squeezed further only if
@@ -5297,24 +5163,15 @@ export const CURSOR_PLAN_JS = `
     if (!opts.reduce) {
       var k = Math.min(MOTION_TIME_SCALE, ARRIVAL_CAP_MS / Math.max(arrivalT, 1e-6));
       retime(samples, k);
-      if (snapT !== null) snapT *= k;
       arrivalT *= k;
     }
-    if (tail) {
-      var endT = samples[samples.length - 1].t;
-      for (var ti = 0; ti < tail.length; ti++) {
-        samples.push({ t: endT + tail[ti].dt, x: tail[ti].x, y: tail[ti].y });
-      }
-    }
-    // End of the motion proper (before the rotation settle tail): trail/glow
+    // End of the motion proper (before the rotation settle tail): glow
     // lifetimes key off this, not off the tail.
     var motionEndMs = samples[samples.length - 1].t;
     // Reduced motion never rotates: a carried rot snaps to 0, no tail.
     applyHeading(samples, effects.rotates, opts.reduce ? 0 : opts.rot0, arrivalT);
     return {
-      style: style,
       samples: samples,
-      snapT: snapT,
       arrivalT: arrivalT,
       motionEndMs: motionEndMs,
       effects: effects
@@ -5381,8 +5238,7 @@ export const CURSOR_PLAN_JS = `
  *
  * Motion: the move is planned once as timed samples (120 Hz) and every
  * animation frame interpolates by elapsed time, so it is frame-rate
- * independent. `args.style` picks signature_arc (default), spring_settle,
- * comet_swoop, magnetic or classic; the math is derived from trycua/cua's
+ * independent. The motion is cua's signature_arc, derived from trycua/cua's
  * cursor-overlay trajectory.rs (MIT). The Promise resolves at *arrival* (the
  * first sample within 1px of the target, capped at 300ms; every move is
  * pre-scaled by MOTION_TIME_SCALE = 0.4, i.e. 2.5x faster than cua), while the
@@ -5406,13 +5262,11 @@ export const CURSOR_JS = `(() => {
   // (https://github.com/trycua/cua): the whole move is planned once as timed
   // samples (120 Hz), then every animation frame interpolates by elapsed time.
   var args = ${ARGS_MARKER};
-  var CURSOR_VERSION = "6";
+  var CURSOR_VERSION = "7";
 
   ${FIND_BY_TEXT_JS}
 
-  var TRAIL_MS = 240;
   var RIPPLE_MS = 380;
-  var MAGNET_MS = 700 * 0.4; // 700ms of cua timing x MOTION_TIME_SCALE (0.4), so the magnet halo does not outlive the faster move
   var PRESS_HOLD_MS = 90;
   var PRESS_IN_MS = 50;
   var PRESS_OUT_MS = 220;
@@ -5446,15 +5300,6 @@ export const CURSOR_JS = `(() => {
     root.style.cssText =
       "position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;" +
       "pointer-events:none;";
-
-    // Magnet: outline of the target rect when magnetic locks on.
-    var magnet = document.createElement("div");
-    magnet.setAttribute("data-pen-cursor-magnet", "1");
-    magnet.style.cssText =
-      "position:absolute;left:0;top:0;box-sizing:border-box;border-radius:16px;" +
-      "border:4px solid rgba(159,215,255,.9);box-shadow:0 0 40px rgba(13,153,255,.8);" +
-      "pointer-events:none;opacity:0;z-index:2147483647;";
-    root.appendChild(magnet);
 
     // Glow: a soft radial fog behind the arrow (100px, scaled per frame).
     var glow = document.createElement("div");
@@ -5542,8 +5387,6 @@ export const CURSOR_JS = `(() => {
       svg: svg,
       ring: ring,
       glow: glow,
-      magnet: magnet,
-      canvas: null,
       pos: priorPos,
       hideTimer: null,
       token: 0,
@@ -5637,78 +5480,6 @@ export const CURSOR_JS = `(() => {
       return (textMatch && textMatch.el) || findBySelector(args.target);
     }
     return null;
-  }
-
-  // Trail: anchored at the arrow's BODY, not its tip — the arrow is painted
-  // after the trail, so the body covers the start and the tip stays clean.
-  // The offset follows velocity, ramped in by speed (clamp((speed-40)/260)).
-  var TRAIL_BACK_PX = 10; // roughly the distance from the tip to the arrow body's centre
-  function drawTrail(state, samples, tEl) {
-    var canvas = state.canvas;
-    if (!canvas) {
-      // Created lazily, only for a style that draws a trail: ONE canvas,
-      // behind everything else in the overlay root.
-      canvas = document.createElement("canvas");
-      canvas.setAttribute("data-pen-cursor-trail", "1");
-      canvas.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;z-index:2147483647;";
-      state.root.insertBefore(canvas, state.root.firstChild);
-      state.canvas = canvas;
-    }
-    var dpr = clamp(window.devicePixelRatio || 1, 1, 2);
-    var w = window.innerWidth;
-    var h = window.innerHeight;
-    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-      canvas.width = Math.round(w * dpr);
-      canvas.height = Math.round(h * dpr);
-      canvas.style.width = w + "px";
-      canvas.style.height = h + "px";
-    }
-    var g = canvas.getContext("2d");
-    if (!g) return;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, w, h);
-    var total = samples[samples.length - 1].t;
-    var steps = 26;
-    var pts = [];
-    var len = 0;
-    for (var i = 0; i <= steps; i++) {
-      var tt = clamp(tEl - TRAIL_MS + (TRAIL_MS * i) / steps, 0, total);
-      var q = sampleAt(samples, tt);
-      var v = velocityAt(samples, tt);
-      var sp = Math.sqrt(v.x * v.x + v.y * v.y);
-      var wgt = clamp((sp - 40) / 260, 0, 1);
-      var p =
-        sp > 1
-          ? { x: q.x - (v.x / sp) * TRAIL_BACK_PX * wgt, y: q.y - (v.y / sp) * TRAIL_BACK_PX * wgt }
-          : { x: q.x, y: q.y };
-      if (i) len += dist(p, pts[i - 1]);
-      pts.push(p);
-    }
-    var fade = Math.min(1, len / 60); // a very short trail (start, landing) fades out
-    if (fade <= 0) return;
-    g.lineCap = "round";
-    var prev = pts[0];
-    for (var j = 1; j <= steps; j++) {
-      var cur = pts[j];
-      var k = j / steps;
-      if (dist(prev, cur) > 0.3) {
-        g.strokeStyle = "rgba(159,215,255," + 0.45 * k * k * fade + ")";
-        g.lineWidth = 1.5 + 8 * k;
-        g.beginPath();
-        g.moveTo(prev.x, prev.y);
-        g.lineTo(cur.x, cur.y);
-        g.stroke();
-      }
-      prev = cur;
-    }
-  }
-
-  // Frees the backing store: a zero-sized canvas holds no pixel buffer.
-  function clearTrail(state) {
-    var c = state.canvas;
-    if (!c) return;
-    c.width = 0;
-    c.height = 0;
   }
 
   return new Promise(function (resolve) {
@@ -5859,8 +5630,6 @@ export const CURSOR_JS = `(() => {
       // it snaps at its first sample.)
       state.svg.style.transform = arrowTransform(state.rot || 0, 1);
       state.ring.style.opacity = "0";
-      state.magnet.style.opacity = "0";
-      clearTrail(state);
       place(state, startX, startY);
 
       if (hasPoint) {
@@ -5872,7 +5641,6 @@ export const CURSOR_JS = `(() => {
 
       function animateTo(targetX, targetY, rect) {
         var plan = planMove({
-          style: args.style,
           from: { x: startX, y: startY },
           to: { x: targetX, y: targetY },
           rot0: state.rot,
@@ -5891,29 +5659,18 @@ export const CURSOR_JS = `(() => {
         var squash = isClick ? 0.12 : isType ? 0.06 : 0;
         var doRipple = fx.ripple && isClick;
         var doSquish = fx.squish && squash > 0;
-        var doMagnet = fx.magnet && plan.snapT !== null && !!rect;
 
-        state.glowOn = fx.glow || fx.magnet; // cua fogs the magnet style too
+        state.glowOn = fx.glow;
         if (!state.glowOn) state.glow.style.opacity = "0";
-        if (doMagnet) {
-          var ms = state.magnet.style;
-          ms.left = rect.left - 6 + "px";
-          ms.top = rect.top - 6 + "px";
-          ms.width = rect.width + 12 + "px";
-          ms.height = rect.height + 12 + "px";
-        }
         state.ring.style.transform = "translate3d(" + targetX + "px," + targetY + "px,0) scale(0.4)";
 
         var endMs = total;
-        if (fx.trail) endMs = Math.max(endMs, motionEnd + TRAIL_MS);
         if (doRipple) endMs = Math.max(endMs, arrivalT + RIPPLE_MS);
         if (doSquish) endMs = Math.max(endMs, arrivalT + PRESS_HOLD_MS + PRESS_OUT_MS);
-        if (doMagnet) endMs = Math.max(endMs, plan.snapT + MAGNET_MS);
 
         var t0 = null;
         var arrived = false;
         var glowRested = false;
-        var trailCleared = false;
         function frame(ts) {
           state.raf = 0;
           if (state.token !== myToken) return;
@@ -5938,7 +5695,7 @@ export const CURSOR_JS = `(() => {
           }
 
           state.carrier.style.transform = "translate3d(" + s.x + "px," + s.y + "px,0)";
-          // Glow and trail follow the motion only; the rotation tail extends
+          // Glow follows the motion only; the rotation tail extends
           // just the arrow transform.
           if (state.glowOn) {
             if (elapsed <= motionEnd) {
@@ -5948,14 +5705,6 @@ export const CURSOR_JS = `(() => {
               drawGlow(state, targetX, targetY, 0, 0);
             }
           }
-          if (fx.trail) {
-            if (elapsed <= motionEnd + TRAIL_MS) drawTrail(state, samples, tm);
-            else if (!trailCleared) {
-              trailCleared = true;
-              clearTrail(state);
-            }
-          }
-
           if (doRipple) {
             var rk = (elapsed - arrivalT) / RIPPLE_MS;
             if (rk >= 0 && rk <= 1) {
@@ -5966,11 +5715,6 @@ export const CURSOR_JS = `(() => {
             } else {
               state.ring.style.opacity = "0";
             }
-          }
-
-          if (doMagnet) {
-            var mg = Math.max(0, 1 - (elapsed - plan.snapT) / MAGNET_MS);
-            state.magnet.style.opacity = elapsed >= plan.snapT ? String(mg) : "0";
           }
 
           var pk = 0;
@@ -5994,9 +5738,7 @@ export const CURSOR_JS = `(() => {
             state.raf = requestAnimationFrame(frame);
           } else {
             state.ring.style.opacity = "0";
-            state.magnet.style.opacity = "0";
             resetRot();
-            if (fx.trail) clearTrail(state);
             place(state, targetX, targetY);
             if (!arrived) finish({ moved: true, x: targetX, y: targetY });
           }
@@ -6524,7 +6266,7 @@ export const REMOVE_MARKS_JS = `(() => {
 })()`;
 
 /** Hides (or restores) the agent-cursor overlay root so a screenshot never
- * shows its glow/trail/ripple. `changed` is true only when the overlay exists
+ * shows its glow/ripple. `changed` is true only when the overlay exists
  * and its visibility actually flipped. Never throws. */
 export const CURSOR_VISIBILITY_JS = `(() => {
   var args = ${ARGS_MARKER};

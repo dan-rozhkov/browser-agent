@@ -5493,42 +5493,11 @@ describe("late click effects", () => {
   });
 });
 
-describe("human cursor motion style and live settings", () => {
+describe("human cursor live settings", () => {
   const cursorCodes = (page: BrowserPageHandle) =>
     (page.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls
       .map((c) => c[0] as string)
       .filter((code) => isCursorCall(code));
-
-  it("passes the configured style through in the CURSOR_JS args", async () => {
-    const page = makeFakePage();
-    const controller = new BrowserController(makeFakeTarget(page), { cursorMotion: "comet_swoop" });
-    await controller.act({ action: "click", target: "Buy now" });
-    expect(cursorCodes(page)[0]).toContain(
-      JSON.stringify({ action: "click", target: "Buy now", from: null, style: "comet_swoop" }),
-    );
-  });
-
-  it("omits style entirely when none is configured", async () => {
-    const page = makeFakePage();
-    const controller = new BrowserController(makeFakeTarget(page));
-    await controller.act({ action: "click", target: "Buy now" });
-    expect(cursorCodes(page)[0]).not.toContain('"style"');
-  });
-
-  it("re-reads a style getter on every move", async () => {
-    const page = makeFakePage();
-    let style: string | undefined = "magnetic";
-    const controller = new BrowserController(makeFakeTarget(page), { cursorMotion: () => style });
-    await controller.act({ action: "click", target: "One" });
-    style = "classic";
-    await controller.act({ action: "click", target: "Two" });
-    style = undefined;
-    await controller.act({ action: "click", target: "Three" });
-    const codes = cursorCodes(page);
-    expect(codes[0]).toContain('"style":"magnetic"');
-    expect(codes[1]).toContain('"style":"classic"');
-    expect(codes[2]).not.toContain('"style"');
-  });
 
   it("reads the enabled getter ONCE per command: a flip mid-command cannot desync budget and cursor step", async () => {
     // true on the first read, false on any later one. A command that read it

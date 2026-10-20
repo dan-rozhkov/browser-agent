@@ -757,24 +757,18 @@ time: `planMove` builds an array of `{t(ms), x, y}` samples at 120 Hz (cua
 `DT_MS`) and every `requestAnimationFrame` frame interpolates by elapsed time,
 so the motion is frame-rate independent. The math is derived from
 **trycua/cua** (MIT) `cursor-overlay/src/trajectory.rs` (`cua_path`,
-`bow_path`, `natural_side`, `bump_profile`, `wobble_profile`, the arc-length
-`Path`, `glide`, `magnetic`, `dc_ms`) and `motion.rs` (`default_effects`);
-`CURSOR_JS` carries a credit comment. `args.style` picks the style
-(unknown/absent → `signature_arc`):
-
-| style | path / profile | duration | default effects |
-| --- | --- | --- | --- |
-| `signature_arc` (default) | cua bezier, arc 0.16 × natural side, flow 0.15, handles 0.3/0.3; min-jerk + late overshoot bump (`min(0.018, 8/D)` at 0.82) | `dc_ms` ×1.1 | glow + ripple + squish |
-| `spring_settle` | arc 0.12, flow 0; wobble profile (amp `min(0.05, 6/D)`, 1.3 cycles, decay 2.6, from 0.55) | `dc_ms` ×1.35 | glow + squish |
-| `comet_swoop` | arc 0.24, flow 0.2, easeInOutCubic | `dc_ms` ×1.15 | trail + ripple |
-| `magnetic` | bow 0.04, capture radius `min(40, len/2)`, pull 0.45, enter speed 300; records the lock-on time | physics-driven | magnet + ripple |
-| `classic` | the pre-engine look: bowed quadratic, easeInOutCubic, tiny overshoot | `90 + 0.7·D`, 260–900ms | ripple + squish |
+`natural_side`, `bump_profile`, the arc-length
+`Path`, `glide`, `dc_ms`) and `motion.rs` (`default_effects`);
+`CURSOR_JS` carries a credit comment. The cursor has one motion (cua's
+`signature_arc`; the other four styles and the `cursorMotion` option were
+removed): cua bezier, arc 0.16 × natural side, flow 0.15, handles 0.3/0.3;
+min-jerk + late overshoot bump (`min(0.018, 8/D)` at 0.82); duration `dc_ms`
+×1.1; effects glow + ripple + squish.
 
 **Heading rotation (cua "heading Tangent") — OFF by default since 2026-10-11.**
-Every style has `rotates:false` in `STYLE_EFFECTS`: the arrow only moves, it
+The motion has `rotates:false` in `MOTION_EFFECTS`: the arrow only moves, it
 never turns (the user found the turning distracting). The math below is kept
-for re-enabling, and its tests force `rotates:true` on the three tangent
-styles; a separate test pins that no style rotates by default.
+for re-enabling, and its tests force `rotates:true`; a separate test pins that it does not rotate by default.
 `planMove` adds a `rot` (radians)
 to every sample (`applyHeading` in `CURSOR_PLAN_JS`, derived from cua
 `trajectory.rs finish()` / motion-lab `applyHeading`, MIT). The arrow art rests
@@ -787,21 +781,18 @@ below 40 px/s, and after arrival, `rot` is held. cua instead scales
 `wrapAngle(h - TIP_ANGLE)` by a speed ramp, which flips sign at `TIP_ANGLE + π`
 (moving down-right) and spins the arrow on carried headings; that ramp (and the
 unwrap patches we tried on it) is gone. Guarantees, all enforced by the sweep
-test (8 directions × rot0 ∈ {−3,−2.5,0,2.5,3} × the three tangent styles ×
+test (8 directions × rot0 ∈ {−3,−2.5,0,2.5,3} ×
 600/80px): |rot| ≤ π always; |Δrot| per sample ≤ 0.55 (shortest arc); the arrow
 keeps pointing along travel until arrival (tip leads); the total rotation is
 the turn into the heading plus the turn home plus the arc's bow (the travel
-heading itself swings across an arc, so the test budgets a per-style slack:
-1.45 / 1.1 / 2.1 rad for signature_arc / spring_settle / comet_swoop). After the
+heading itself swings across an arc, so the test budgets a slack of 1.45 rad). After the
 last sample a settle tail (120 Hz, ≤36 samples, until |rot| < 0.002; none if
 rot is already ~0) eases rot home along the shortest arc — at most a half-turn
 — and the final sample is exactly 0. The tail only extends playback after
 arrival: arrival is still the first sample within 1px of the target and still
-≤300ms (`ARRIVAL_CAP_MS`), and the plan's `motionEndMs` is the pre-tail end that trail/glow
-lifetimes key off (the tail extends only the arrow transform; the trail canvas
-is cleared once its redraw window ends). When re-enabled, `signature_arc`,
-`spring_settle`, `comet_swoop` rotate (`tangent`); `magnetic` and `classic` never
-chase a heading (`rotates:false` in `STYLE_EFFECTS`): a carried rot0 eases toward 0
+≤300ms (`ARRIVAL_CAP_MS`), and the plan's `motionEndMs` is the pre-tail end that glow
+lifetimes key off (the tail extends only the arrow transform). With
+`rotates:false` (the default) the motion never chases a heading: a carried rot0 eases toward 0
 from sample 0 during the move (same shortest-arc chase, target 0), and the tail
 exists only if rot has not reached 0 by the last sample; reduced
 motion plans rot 0 (`planMove`'s `opts.reduce ? 0 : rot0`, the single place),
@@ -810,7 +801,7 @@ arc. `CURSOR_JS` sets one composed transform `rotate(rot rad) scale(squish)` on
 the arrow SVG (`arrowTransform`), with `transform-origin` = `ARROW_PIVOT` =
 (0,0) of the 22×26 viewBox: the hotspot that lands on the target. The "within
 1px" pivot guarantee covers the blue fill's rounded tip
-(`pen-editor-desktop/test/cursorMotion.test.ts` checks it, and that the pivot is fixed under
+(`test/controller/cursorPlan.test.ts` checks it, and that the pivot is fixed under
 rotate+scale); the white rim's rounded tip extends ~1.5–2px past it, as it
 always did. The drop-shadow filter sits on the non-rotating carrier so the
 shadow always falls downward. The current rot is stored on
@@ -827,24 +818,20 @@ leaves a move that has already *arrived* (only its settle tail playing,
 as usual; either way it resolves `{moved:false}` at a point where the cursor
 actually rests, never mid-path. Target lookup before the cancel cannot throw
 (null on error), and the outer catch resets rot only if the call owns the
-animation. `sampleAt` wraps the interpolated rot so `state.rot` stays in (-π, π]. Glow and trail stay velocity-based
+animation. `sampleAt` wraps the interpolated rot so `state.rot` stays in (-π, π]. Glow stays velocity-based
 (offset back along the velocity, as in cua), independent of rot.
-`CURSOR_VERSION` is `"6"`.
+`CURSOR_VERSION` is `"7"`.
 
 **Agent speed.** Every non-reduced plan is multiplied by `MOTION_TIME_SCALE` = 0.4
 (2.5× faster than the cua timings; the cursor used to cost ~0.8s of a ~1.2s
 action because the action awaits arrival). `planMove` does one retime with
-`k = min(MOTION_TIME_SCALE, ARRIVAL_CAP_MS / arrivalT)`. `MAGNET_MS` is scaled by
-the same factor; `TRAIL_MS`, `RIPPLE_MS` and the press timings are unchanged.
-Classic's overshoot samples are appended after the retime (+8ms/+25ms).
+`k = min(MOTION_TIME_SCALE, ARRIVAL_CAP_MS / arrivalT)`. `RIPPLE_MS` and the press timings are unchanged.
 
 `dc_ms = clamp(150 + 120·log2(D/W + 1), 300, 1000) × scale`, W = the target
 rect's smaller side (min 4), or a 24px box for an `args.point` (Fitts-aware:
 small targets slower, big ones faster). There is no duration override
-(`args.durationMs` was removed; no caller sent it). **Hard cap: whatever the
-style, the *arrival* moment is retimed to ≤300ms** (`ARRIVAL_CAP_MS`), so the 600ms backstop (itself under `CURSOR_TIMEOUT_MS` = 900ms) never wins in a visible tab (two rAFs for
-`scrollIntoView` come before the move). The magnetic style also fogs
-(glow) like cua's renderer does.
+(`args.durationMs` was removed; no caller sent it). **Hard cap: the *arrival* moment is retimed to ≤300ms** (`ARRIVAL_CAP_MS`), so the 600ms backstop (itself under `CURSOR_TIMEOUT_MS` = 900ms) never wins in a visible tab (two rAFs for
+`scrollIntoView` come before the move).
 
 **Early arrival and cancellation.** The Promise resolves through `finish()`
 with `{moved:true, x, y}` at the first sample whose hotspot is within 1px of
@@ -867,16 +854,10 @@ back to the current position. The backstop also cancels the pending animation
 tab cannot replay the stale move when it becomes visible.
 
 **Effects** (all pre-created in `ensureOverlay()` under `[data-pen-cursor]`,
-`pointer-events:none`, never DOM inserted per frame; the trail canvas is the one
-exception — created lazily the first time a trail style draws): `trail` — one viewport
-`<canvas>` (sized only while a trail draws; `clearTrail` sets its width/height to
-0 to free the backing store; styles without a trail never allocate it), ~240ms of history anchored at the arrow's *body* (offset back
-along velocity, weight `clamp((speed-40)/260, 0, 1)`), width growing to the
-head, opacity k²·0.45, faded out when shorter than 60px; `glow` — one radial
+`pointer-events:none`, never DOM inserted per frame): `glow` — one radial
 gradient div offset against velocity, radius/alpha growing with speed
 (alpha is ramped by speed so it is exactly 0 at rest — no lingering halo);
-`magnet` — outline of the target rect when magnetic locks on, fades over
-`MAGNET_MS` = 700 × `MOTION_TIME_SCALE` = 280ms; `ripple` — the pre-engine click pulse, deliberately quiet: a 24px
+`ripple` — the pre-engine click pulse, deliberately quiet: a 24px
 ring, 2px white border with a 1px dark outline, scaled 0.4→1.6 over 380ms
 (ease-out), opacity 0.9→0 (click/select). The cua ring (bright blue, 8→52px,
 5px line) was replaced on 2026-10-11 as too loud; `squish` — arrow scales to 0.88 over 50ms then springs
@@ -896,43 +877,36 @@ Unticking "Show Agent Cursor" calls `BrowserController.hideCursorOverlay()`
 (same script, best effort, outside the command queue) to hide the overlay on
 the current page at once.
 
-**Settings: env vars and the View menu.** Style:
-`PEN_DESKTOP_BROWSER_CURSOR_MOTION` = one of `signature_arc | spring_settle |
-magnetic | comet_swoop | classic` (`config.ts`'s `resolveBrowserCursorMotion`:
-trimmed, lower-cased). On/off: `PEN_DESKTOP_BROWSER_CURSOR=off` (also
+**Settings: env vars and the View menu.** On/off: `PEN_DESKTOP_BROWSER_CURSOR=off` (also
 `0`/`false`, case-insensitive — `resolveBrowserCursorEnabled`). **An empty or
-whitespace-only value of either var counts as UNSET** (no menu lock, the saved
-setting applies); an unknown motion value is ignored (the menu/saved setting
-applies, unlocked) with one `console.warn` per process (macOS `activate`
-re-creates the window). The user can also choose in the native menu **View ▸
-Agent Cursor Motion** (five radio items plus a "Show Agent Cursor" checkbox;
-`menu.ts`). The choice is saved to `cursor-settings.json` in
-`app.getPath("userData")` as `{ "motion": "<style>", "enabled": true }`
+whitespace-only value counts as UNSET** (no menu lock, the saved setting
+applies). The user can also choose in the native menu **View ▸ Show Agent
+Cursor** (checkbox; `menu.ts`). The choice is saved to `cursor-settings.json` in
+`app.getPath("userData")` as `{ "enabled": true }`
 (`src/main/cursorSettings.ts`, pure path-taking read/write helpers;
-missing/corrupt file or invalid style → defaults). **Precedence** lives in the
+missing/corrupt file → defaults). **Precedence** lives in the
 pure `resolveCursorSettings(env, saved)` (`cursorSettings.ts`, unit-tested):
-a set env var wins and its menu items render `enabled: false` so the user can
+a set env var wins and its menu item renders `enabled: false` so the user can
 see why the choice does not change; otherwise the saved setting applies.
-`window.ts` only wires it: it passes getters (`cursor: () => boolean`,
-`cursorMotion: () => string | undefined`) to `new BrowserController(...)`,
-which reads them on every move / command, so a menu change applies without a
+`window.ts` only wires it: it passes a getter (`cursor: () => boolean`) to `new BrowserController(...)`,
+which reads it on every command, so a menu change applies without a
 restart. The controller latches the enabled flag on its FIRST read in a
 command (the budget read at command entry); the latch is reset inside the
 queued function (after any overrun from a timed-out command has settled) and
 when the command ends,
 so `cursorBudgetMs` and the cursor step always agree even if the user flips the
-setting mid-command. `controller.ts` forwards the style to CURSOR_JS as
-`args.style` (omitted when unset). Keep `controller.ts` / `pageScripts.ts` (now in the package) free
+setting mid-command. Keep `controller.ts` / `pageScripts.ts` (now in the package) free
 of electron imports. Tests:
 `CURSOR_PLAN_JS` is the pure planner (constants, easing/path math, `planMove`,
 `sampleAt`, `velocityAt`) that `pageScripts.ts` exports as its own fragment and
 CURSOR_JS embeds the way it embeds `FIND_BY_TEXT_JS`. Production CURSOR_JS has
-no test hook. `test/controller/cursorPlan.test.ts` evaluates it and covers ONLY
-`planMove` timing: arrival ≤ `ARRIVAL_CAP_MS` (300ms) per style, `MOTION_TIME_SCALE`
-(0.4) being applied to an under-cap move, classic's overshoot samples staying a
-frame apart, and reduced motion keeping its 120ms glide. The pivot, `sampleAt`,
-`velocityAt`, heading and rotation tests live in
-`pen-editor-desktop/test/cursorMotion.test.ts`.
+no test hook. `test/controller/cursorPlan.test.ts` evaluates it and covers `planMove` timing
+(arrival ≤ `ARRIVAL_CAP_MS` (300ms), `MOTION_TIME_SCALE` (0.4) applied to an
+under-cap move, reduced motion keeping its 120ms glide), the default
+`signature_arc` path (endpoints, bow off the chord, zero-length move, Fitts-aware
+duration, 24px bare-point box, no effects and no rotation under reduced
+motion/default), and — forcing `rotates:true` — the heading, `wrapAngle`,
+`sampleAt` and arrow-pivot/hotspot checks.
 
 ### Full browser use (2026-09-23)
 

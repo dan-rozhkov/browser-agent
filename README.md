@@ -129,7 +129,7 @@ The policy's versions stay available from `@sideform/browser-agent/policy`.
 ```ts
 class BrowserController {
   constructor(target: BrowserTarget, opts?: { timeoutMs?: number; openTimeoutMs?: number;
-    cursor?: boolean | (() => boolean); cursorMotion?: string | undefined | (() => string | undefined); /* ... */ });
+    cursor?: boolean | (() => boolean); /* ... */ });
   open(args: unknown): Promise<BrowserCommandResult>;
   act(args: unknown): Promise<BrowserCommandResult>;
   read(args: unknown): Promise<BrowserCommandResult>;

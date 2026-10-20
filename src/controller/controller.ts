@@ -1400,10 +1400,9 @@ export class BrowserController {
   // start point every command. Updated only when a cursor call reports
   // finite numeric x/y; a failed or no-op cursor call leaves it as-is.
   private cursorPosition: { x: number; y: number } | null = null;
-  // Both options may be getters so a settings menu can change them at
-  // runtime: they are read per move / per command, never cached.
+  // May be a getter so a settings menu can change it at runtime:
+  // it is read per command, never cached.
   private readonly cursorEnabledSource: boolean | (() => boolean);
-  private readonly cursorMotionSource: string | undefined | (() => string | undefined);
 
   // The enabled flag is latched on its FIRST read in a command (the budget
   // read at command entry) and cleared when the command ends, so the budget
@@ -1425,16 +1424,6 @@ export class BrowserController {
     return value;
   }
 
-  private get cursorMotion(): string | undefined {
-    const src = this.cursorMotionSource;
-    try {
-      const v = typeof src === "function" ? src() : src;
-      return typeof v === "string" && v !== "" ? v : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
   /** The cursor step runs inside the command closure `withCommandTimeout`
    * bounds, so its own bound is added to that command's budget rather than
    * taken out of it — a cosmetic overlay must never be what pushes a
@@ -1453,8 +1442,6 @@ export class BrowserController {
       openTimeoutMs?: number;
       /** Cursor overlay on/off; a getter is re-read on every command. */
       cursor?: boolean | (() => boolean);
-      /** CURSOR_JS motion style (see its doc comment); a getter is re-read on every move. */
-      cursorMotion?: string | undefined | (() => string | undefined);
       /** App mode (a desktop app window, not a browser tab): `open` and `tabs` "new" return
        * `{ error }` instead of navigating or opening a tab. `true` uses `APP_MODE_LOCK_MESSAGE`; a
        * string is the message. Switching tabs, closing, reload and back are unchanged. Default off. */
@@ -1469,7 +1456,6 @@ export class BrowserController {
     this.openTimeoutMs =
       opts?.openTimeoutMs ?? opts?.timeoutMs ?? BROWSER_OPEN_TIMEOUT_MS;
     this.cursorEnabledSource = opts?.cursor ?? true;
-    this.cursorMotionSource = opts?.cursorMotion;
   }
 
   /** Runs CURSOR_JS to move the built-in browser's visible cursor overlay
@@ -1507,9 +1493,7 @@ export class BrowserController {
     if (!this.cursorEnabled) return;
     if (page.isVisible?.() === false) return;
     try {
-      const style = this.cursorMotion;
-      // `style` is omitted entirely when unset so CURSOR_JS applies its own default.
-      const scriptArgs = { ...spec, from: this.cursorPosition, ...(style ? { style } : {}) };
+      const scriptArgs = { ...spec, from: this.cursorPosition };
       // Bounded by the smaller of CURSOR_TIMEOUT_MS and this controller's
       // own configured timeoutMs — same convention as
       // settleWhileTargetBusy/waitForUrlChange/waitForLoadStop above, so a
