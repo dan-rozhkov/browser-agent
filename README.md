@@ -611,6 +611,99 @@ An abort of `signal` during the judge gives `{ error }` and keeps the outcome. A
 from `agent/session`: `QA_JUDGE_SYSTEM`, `buildQaJudgePrompt`, `parseQaJudgeVerdict`, `applyQaJudge`
 and `judgePageOf`.
 
+## Run trace
+
+A trace is a recorded run that a viewer can replay: steps with timing, a screenshot per
+step, console errors, failed requests and the QA result. It is our own JSON format
+(`sideform.browse-trace`, version 1), not Playwright's `trace.zip`, and it has no DOM
+snapshots. The package builds the object only; storage and UI are the host's job.
+Design: `docs/specs/2026-10-20-browse-run-trace-design.md`.
+
+```ts
+// Light, zod-free entry (also exported from `/agent`):
+import { createBrowseTraceRecorder, splitTraceAssets, mapTraceFrames, parseBrowseTrace,
+  redactTraceArgs, BROWSE_TRACE_ID, BROWSE_TRACE_ASSET_PATH } from "@sideform/browser-agent/agent/session";
+```
+
+With `runBrowseAgent`, turn it on with `trace`:
+
+```ts
+const r = await runBrowseAgent(goal, {
+  model, browser, qa: true,
+  trace: {
+    labels: { browser: "cloud" },
+    onTrace: async (trace) => {                      // once, after the run ends; frames are data URLs
+      const { manifest, assets } = splitTraceAssets(trace);   // manifest.frames[].src = "frames/<id>.<ext>"
+      await store(manifest, assets);
+    },
+  },
+});
+JSON.stringify(r);                    // the string for the model: no trace in it
+```
+
+The trace is not a field of the result. `onTrace` runs after the fixture release and the journal stop,
+like `qa.onScreenshot`: a throw or a rejection is ignored, and an async callback is awaited for at most
+15 s. It is not called when `runBrowseAgent` throws. `trace.capture: false` records no frames. In QA
+mode the final screenshot (the one `qa.onScreenshot` gets; taken once) is added as a `"final"` frame.
+
+On the session core, build the recorder yourself and feed it from the same place as the QA
+step recorder. Await the function it returns before the result goes back to the model, so
+the step frame shows the page right after the step:
+
+```ts
+const rec = createBrowseTraceRecorder({
+  goal,
+  // dialogs: every controller command, a screenshot too, drains the pending JS dialogs. Hand them back.
+  capture: async () => { const s = await browser.screenshot?.({}); return s ? { imageData: s.imageData, dialogs: s.dialogs } : undefined; },
+});
+// in executeTool:
+const end = rec.onToolCall(call, { signal });
+const output = await run(call);
+const carried = await end({ output });   // never rejects; { dialogs? }
+return mergeCarriedDialogs(output, carried.dialogs);   // the model sees the dialogs as without tracing
+// when the run ends:
+const trace = rec.finish({ status: result.status, answer: result.answer, qa: result.qa });
+```
+
+Format (`BrowseTrace`): `format`, `version`, `id` (`BROWSE_TRACE_ID`), `goal`, `startedAt`,
+`endedAt`, `status`, `answer?`, `error?`, `labels?`, `steps[]`, `frames[]`, `console[]`,
+`network[]`, `qa?`, `dropped?`.
+
+- `steps`: `{ index (0-based, call order), tool, args, startedAt, endedAt, ok, error?, output? }`.
+  `args` are redacted: the value of a key that matches `/pass(word)?|secret|token|api[-_]?key|otp|cvv|card/i`
+  becomes `"[redacted]"`, recursively, and strings over 2000 chars are cut. Pass `redactArgs`
+  to use your own rule. Typed text is redacted too: for `browse_act` `type`/`fill` (also each entry of `actions`),
+  `text` becomes `"[redacted]"` when the target (`target`, `element`, `label`, `selector`) matches
+  `/pass|pwd|secret|otp|one.?time|code|pin|cvv|cvc|card|token|key|ssn/i`, or when `inputType`/`type` is `"password"`.
+  The match is wide on purpose. The default redaction remembers the last `click`/`focus` target, so a `type` without a
+  target after a click on a secret field is redacted. A call that names the field only by `index` (the click too)
+  has no word to match, so its text stays visible: use a custom `redactArgs` if you need more. `output` has the image data removed and is cut at 4000 chars.
+- `frames`: `{ id, at, stepIndex?, kind: "step" | "screenshot" | "final", src, width?, height? }`.
+  A `"step"` frame is taken with `capture` after a successful `browse_open`, a successful `browse_act`
+  (not a lone `wait`) and a successful `browse_tabs` `switch`, `close` or `new` (not `list`); `captureAfter`
+  changes this. A step whose typed text was redacted gets no frame (it would show the secret). A `browse_screenshot` result becomes a `"screenshot"`
+  frame (raw base64 is turned into a data URL). A capture that throws gives no frame and no error. A capture that
+  takes more than `captureTimeoutMs` (4000) also gives no frame, and it stops all later step captures of the run (the
+  screenshot may still hold the browser). No step capture is taken after the run is aborted, and an abort during
+  a capture ends the wait at once. Every capture lost
+  or skipped this way is counted in `dropped.frames`. `src` is a data URL in memory.
+- `console` / `network`: `{ at, stepIndex?, text }`, from the `consoleErrors` and `failedRequests`
+  of tool outputs (also the entries of a batched `browse_act`) and from `qa`; deduped over the whole run. The controller's own `consoleErrorsDropped` / `failedRequestsDropped` counts
+  are added to `dropped.console` / `dropped.network`.
+- Caps (`maxSteps` 300, `maxFrames` 150, `maxLogEntries` 300 per log): the oldest frames go first
+  (the first frame stays); steps and log entries past the cap are dropped. Counts are in `dropped`.
+- Calls still pending at `finish(...)` become steps with `ok: false` and `error: "unfinished"`. Steps are in call
+  order; a call takes its slot when it starts.
+- `finish(...)` is idempotent and never throws. The recorder never throws into the host.
+
+Helpers: `splitTraceAssets(trace)` moves data-URL frames out of the manifest (`frames/<id>.<jpg|png|webp>`,
+for upload); `mapTraceFrames(trace, resolve)` maps each `frame.src` (for a stored manifest);
+`mergeCarriedDialogs(output, dialogs)` puts dialogs that a capture drained back into the tool output the model gets
+(same rule as the controller: the output's own `dialogs` first, the carried ones after). `parseBrowseTrace(value)` is the structural check at a trust boundary and returns `{ trace }` or `{ error }`.
+A `frame.src` must be an image data URL (jpeg, png, webp), an asset path, an `https:` URL or `http://localhost`
+(or `127.0.0.1`); anything else is an error.
+`BROWSE_TRACE_ASSET_PATH` is the pattern of a valid asset path.
+
 ## Page fixtures
 
 A `PageFixture` is the state of a browser before a task: cookies, localStorage,

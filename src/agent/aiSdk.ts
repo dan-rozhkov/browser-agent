@@ -18,7 +18,7 @@ import {
   type BuildBrowseAgentPromptOptions,
 } from "./prompt.js";
 import { boundedCall } from "../fixture/util.js";
-import { normalizeScreenshot } from "../policy/schemas.js";
+import { normalizeScreenshot } from "../shared/image.js";
 import {
   QA_ASSERT_TOOL,
   QA_JUDGE_CONTEXT_MAX_CHARS,
@@ -48,6 +48,9 @@ import {
   type QaResult,
 } from "./qaCore.js";
 import { qaAssertDefinition, qaJudgeSchema, qaVerdictDefinition } from "./qa.js";
+import { mergeCarriedDialogs } from "../shared/dialogs.js";
+import { createBrowseTraceRecorder, type BrowseTraceRecorder } from "./traceRecorder.js";
+import type { BrowseTrace } from "../shared/trace.js";
 import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup } from "./fixtureSetup.js";
 import { browseAgentErrorMessage, type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
@@ -80,6 +83,11 @@ const QA_JUDGE_READ_MS = 10_000;
 const QA_JUDGE_TIMEOUT_MAX_MS = 2_147_483_647;
 /** The host's `onScreenshot` may take this long. */
 const QA_SCREENSHOT_CALLBACK_MS = 15_000;
+
+/** The screenshot of a trace step may take this long (the recorder's own timeout is shorter and stops waiting first). */
+const TRACE_CAPTURE_MS = 10_000;
+/** The host's `onTrace` may take this long. */
+const TRACE_CALLBACK_MS = 15_000;
 
 /** The host's `onCapture` may take this long before the result is returned without it. */
 const CHECKPOINT_CALLBACK_MS = 15_000;
@@ -230,6 +238,20 @@ export interface RunBrowseAgentOptions {
         judge?: QaJudgeOptions;
       };
   /**
+   * Record the run as a trace (docs/specs/2026-10-20-browse-run-trace-design.md).
+   * When the run has ended, `onTrace` is called ONCE with a `BrowseTrace`: steps with timing and redacted args,
+   * a screenshot after `browse_open`, `browse_act` and `browse_tabs` calls (taken with `browser.screenshot`,
+   * bounded to 4 s; a failure gives no frame; after one timeout no more step screenshots; none after an abort),
+   * every `browse_screenshot` result as a frame, console errors and failed requests. In QA mode the final
+   * screenshot is added as a "final" frame (the same image `qa.onScreenshot` gets; it is taken once). The trace is
+   * NOT a field of the result: `JSON.stringify(result)`, the string for the model, cannot carry it. The host stores it
+   * (`splitTraceAssets` moves the frames out). It comes after the fixture release and the journal stop, like
+   * `qa.onScreenshot`: a throw or a rejection is ignored; an async callback is awaited for at most 15 s. It is not
+   * called when the run throws. `labels` are free-form host labels. `capture: false` records no step frames and no
+   * final frame. Without `browser.screenshot` the trace has no step frames.
+   */
+  trace?: { labels?: Record<string, string>; capture?: boolean; onTrace?(trace: BrowseTrace): void | Promise<void> };
+  /**
    * Observe every tool execution: the browse tools and the host tools, also the
    * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
    * execution STARTS with the model's tool name and input; the function it
@@ -325,18 +347,30 @@ function reservedFieldsDropped(hooks: BrowseAgentExtraToolHooks): BrowseAgentExt
   };
 }
 
-/** The final QA image. Never throws; bounded; undefined for statuses where it would not help or when the image is not jpeg, png or webp. */
-async function captureQaScreenshot(browser: BrowserBridge, status: string): Promise<{ mediaType: string; base64: string } | undefined> {
-  // After a timeout the controller may still hold its lock.
-  if (status === "setup_failed" || status === "aborted" || status === "timeout" || !browser.screenshot) return undefined;
+/** A normalized page screenshot: a data URL (jpeg, png or webp), the size when known, and the JS dialogs the command drained. Bounded; undefined for anything else. Never throws. */
+async function takeScreenshot(browser: BrowserBridge, ms: number): Promise<{ imageData: string; width?: number; height?: number; dialogs?: unknown[] } | undefined> {
+  if (!browser.screenshot) return undefined;
   try {
-    const out = await boundedCall(() => browser.screenshot!({}), QA_SCREENSHOT_MS);
+    const out = await boundedCall(() => browser.screenshot!({}), ms);
     if (!out.done) return undefined;
-    const match = IMAGE_DATA_URL.exec(normalizeScreenshot((out.value as { imageData?: unknown } | null | undefined)?.imageData as string | undefined) ?? "");
-    return match ? { mediaType: match[1]!, base64: match[2]! } : undefined;
+    const value = out.value as { imageData?: string; width?: unknown; height?: unknown; dialogs?: unknown } | null | undefined;
+    const imageData = normalizeScreenshot(value?.imageData);
+    if (!imageData) return undefined;
+    return {
+      imageData,
+      ...(typeof value?.width === "number" ? { width: value.width } : {}),
+      ...(typeof value?.height === "number" ? { height: value.height } : {}),
+      ...(Array.isArray(value?.dialogs) && value.dialogs.length > 0 ? { dialogs: value.dialogs } : {}),
+    };
   } catch {
     return undefined;
   }
+}
+
+/** The final QA image: after a timeout the controller may still hold its lock, so no image then. */
+async function captureQaScreenshot(browser: BrowserBridge, status: string): Promise<string | undefined> {
+  if (status === "setup_failed" || status === "aborted" || status === "timeout") return undefined;
+  return (await takeScreenshot(browser, QA_SCREENSHOT_MS))?.imageData;
 }
 
 /** One tool call, bounded. The result string, or undefined when it failed or ran out of time. */
@@ -419,6 +453,14 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     }
   }
   const trail = qaOn ? createStepRecorder() : undefined;
+  const traceCapture = opts.trace !== undefined && opts.trace.capture !== false && !!opts.browser.screenshot;
+  const recorder: BrowseTraceRecorder | undefined = opts.trace
+    ? createBrowseTraceRecorder({
+        goal,
+        ...(opts.trace.labels ? { labels: opts.trace.labels } : {}),
+        ...(traceCapture ? { capture: () => takeScreenshot(opts.browser, TRACE_CAPTURE_MS) } : {}),
+      })
+    : undefined;
   const extras: Record<string, BrowseAgentExtraTool> = {
     ...opts.extraTools,
     ...(qaOn && trail
@@ -439,6 +481,13 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         // Ignored.
       }
     }
+    // The recorder's end is async (the step frame): it is awaited before the result goes back. It never rejects.
+    let traceEnd: ReturnType<BrowseTraceRecorder["onToolCall"]> | undefined;
+    try {
+      traceEnd = recorder?.onToolCall(call, { signal: ctx.signal });
+    } catch {
+      // Ignored.
+    }
     const ended = (result: { output?: string; error?: unknown }) => {
       for (const f of finishers) {
         try {
@@ -454,9 +503,12 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         ? await extra.execute(call.input, { toolCallId: call.toolCallId, signal: ctx.signal })
         : await executeBrowseTool(opts.browser, call.toolName, call.input);
       ended({ output });
-      return output;
+      // The trace screenshot drained the page's JS dialogs: the model gets them in this output, as without tracing.
+      const carried = await traceEnd?.({ output }).catch(() => undefined);
+      return carried?.dialogs ? mergeCarriedDialogs(output, carried.dialogs) : output;
     } catch (error) {
       ended({ error });
+      await traceEnd?.({ error }).catch(() => undefined);
       throw error;
     }
   };
@@ -493,7 +545,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   });
   const onCapture = opts.checkpoint?.onCapture;
   let finalStatus: { status: string; steps: number } = { status: "error", steps: 0 };
-  let shot: { mediaType: string; base64: string } | undefined;
+  let shot: string | undefined;
   // Set on every path of the try block (tsc checks it). It is awaited after the `finally` work, so a judge request does not delay that work.
   let finish: () => Promise<BrowseAgentResult>;
   // Stops a started judge request when the `finally` work throws: nobody awaits it then.
@@ -576,7 +628,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
           try {
             // The final image first: the fixture's mocks are still live, and the page is as the run left it.
             // The host callback waits until the release and the stop are done.
-            if (onScreenshot) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
+            if (onScreenshot || (recorder && qaOn && traceCapture)) shot = await captureQaScreenshot(opts.browser, finalStatus.status);
             // A rejecting async callback must not become an unhandled rejection; a slow one is awaited for a bounded time only.
             if (captured && onCapture) await boundedCall(() => onCapture(captured), CHECKPOINT_CALLBACK_MS).catch(() => undefined);
             await fixtureSetup?.release();
@@ -586,8 +638,9 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
           }
         },
       });
-      if (shot && onScreenshot) {
-        const img = shot;
+      const match = shot && onScreenshot ? IMAGE_DATA_URL.exec(shot) : null;
+      if (match && onScreenshot) {
+        const img = { mediaType: match[1]!, base64: match[2]! };
         // A throw or a rejection is ignored; a slow callback is awaited for a bounded time only.
         await boundedCall(() => onScreenshot(img), QA_SCREENSHOT_CALLBACK_MS).catch(() => undefined);
       }
@@ -598,5 +651,17 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       throw error;
     }
   }
-  return finish();
+  const result = await finish();
+  if (recorder) {
+    if (shot && qaOn && traceCapture) recorder.addFrame({ imageData: shot, kind: "final" });
+    const trace: BrowseTrace = recorder.finish({
+      status: result.status,
+      answer: result.answer,
+      ...(typeof result.error === "string" ? { error: result.error } : {}),
+      ...(result.qa ? { qa: result.qa } : {}),
+    });
+    const onTrace = opts.trace?.onTrace;
+    if (onTrace) await boundedCall(() => onTrace(trace), TRACE_CALLBACK_MS).catch(() => undefined);
+  }
+  return result;
 }

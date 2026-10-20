@@ -9,4 +9,7 @@ export * from "./limits.js";
 export * from "./qaCore.js";
 export * from "./result.js";
 export * from "./session.js";
+export * from "./traceRecorder.js";
+export * from "../shared/trace.js";
+export { mergeCarriedDialogs } from "../shared/dialogs.js";
 export { BROWSE_AGENT_TOOL_NAMES, type BrowseAgentToolName } from "./toolNames.js";

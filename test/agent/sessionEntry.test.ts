@@ -60,6 +60,14 @@ describe("agent/session entry", () => {
     expect(sessionEntry).not.toHaveProperty("qaAssertDefinition");
   });
 
+  it("exports the trace format and recorder, zod-free", () => {
+    for (const n of ["createBrowseTraceRecorder", "splitTraceAssets", "mapTraceFrames", "parseBrowseTrace", "redactTraceArgs", "BROWSE_TRACE_ID", "BROWSE_TRACE_ASSET_PATH", "BROWSE_TRACE_FORMAT", "BROWSE_TRACE_VERSION"]) {
+      expect(sessionEntry, n).toHaveProperty(n);
+    }
+    expect(names).toContain("traceRecorder.ts");
+    expect([...files].some((f) => f.endsWith("/shared/trace.ts"))).toBe(true);
+  });
+
   it("a successful qa_verdict ends the run: continueRequest is false; a failed one does not", async () => {
     const { createBrowseAgentSession, qaVerdictHooks, executeQaVerdict } = sessionEntry;
     const s = createBrowseAgentSession({ extraTools: { qa_verdict: { ...qaVerdictHooks() } }, executeTool: async (c) => executeQaVerdict(c.input) });

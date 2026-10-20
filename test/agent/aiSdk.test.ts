@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { BrowserBridge } from "../../src/loop/bridge.js";
 import { runBrowseAgent, screenshotToModelOutput } from "../../src/agent/aiSdk.js";
 import { singleUseTool } from "../../src/agent/index.js";
+import type { BrowseTrace } from "../../src/shared/trace.js";
 
 const usage = {
   inputTokens: { total: 3, noCache: 3, cacheRead: undefined, cacheWrite: undefined },
@@ -256,5 +257,138 @@ describe("runBrowseAgent: onToolCall", () => {
     const { model: m2 } = scripted([{ calls: [{ name: "host_tool", input: {} }] }, { text: "done" }]);
     await runBrowseAgent("goal", { model: m2, browser: fakeBrowser(), extraTools: { host_tool: extra }, onToolCall: () => (res) => { ends.push((res.error as Error).message); } });
     expect(ends).toEqual(["tool broke"]);
+  });
+});
+
+describe("runBrowseAgent: trace", () => {
+  const JPG_BASE64 = "QUJD".repeat(40);
+  const ACT = { action: "click", target: "x" };
+  const shotBrowser = (log: string[] = []): BrowserBridge => ({
+    ...fakeBrowser(),
+    open: async (a) => ({ url: a.url, title: "A" }),
+    act: async () => ({ changed: true, consoleErrors: ["TypeError: x"] }),
+    screenshot: async () => {
+      log.push("screenshot");
+      return { imageData: `data:image/jpeg;base64,${JPG_BASE64}`, width: 10, height: 20 };
+    },
+  });
+  /** Runs with `trace` and returns the result and the trace that onTrace got. */
+  async function traced(steps: Step[], browser: BrowserBridge, extra: Record<string, unknown> = {}, trace: Record<string, unknown> = {}) {
+    const got: BrowseTrace[] = [];
+    const r = await runBrowseAgent("goal", { model: scripted(steps).model, browser, ...extra, trace: { ...trace, onTrace: (t: BrowseTrace) => { got.push(t); } } });
+    expect(got).toHaveLength(1);
+    return { r, t: got[0]! };
+  }
+
+  it("calls onTrace once with steps and frames; the model-facing JSON is the same as without trace", async () => {
+    const steps: Step[] = [{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }];
+    const plain = await runBrowseAgent("goal", { model: scripted(steps).model, browser: shotBrowser(), url: "https://a.test/" });
+    const { r, t } = await traced(steps, shotBrowser(), { url: "https://a.test/" }, { labels: { browser: "test" } });
+    expect(JSON.stringify(r)).toBe(JSON.stringify(plain));
+    expect("trace" in r).toBe(false);
+    expect(JSON.stringify(r)).not.toContain("base64");
+    expect(t.format).toBe("sideform.browse-trace");
+    expect(t.goal).toBe("goal");
+    expect(t.status).toBe("done");
+    expect(t.answer).toBe("done");
+    expect(t.labels).toEqual({ browser: "test" });
+    expect(t.steps.map((s) => s.tool)).toEqual(["browse_open", "browse_act"]);
+    expect(t.steps[1]!.args).toEqual(ACT);
+    expect(t.frames.map((f) => [f.kind, f.stepIndex, f.width, f.height])).toEqual([["step", 0, 10, 20], ["step", 1, 10, 20]]);
+    expect(t.frames[0]!.src).toBe(`data:image/jpeg;base64,${JPG_BASE64}`);
+    expect(t.console.map((e) => e.text)).toEqual(["TypeError: x"]);
+  });
+
+  it("the trace is not in the prompt the model gets", async () => {
+    const { model, seen } = scripted([{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }]);
+    await runBrowseAgent("goal", { model, browser: shotBrowser(), trace: {} });
+    expect(JSON.stringify(seen.prompts)).not.toContain(JPG_BASE64);
+  });
+
+  it("an onTrace that throws, rejects or hangs does not break the run", async () => {
+    const steps: Step[] = [{ text: "done" }];
+    for (const onTrace of [() => { throw new Error("x"); }, async () => { throw new Error("x"); }]) {
+      const r = await runBrowseAgent("g", { model: scripted(steps).model, browser: shotBrowser(), trace: { onTrace } });
+      expect(r.status).toBe("done");
+    }
+  });
+
+  it("capture: false and a browser without screenshot give a trace without step frames", async () => {
+    const log: string[] = [];
+    const steps: Step[] = [{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }];
+    const off = await traced(steps, shotBrowser(log), {}, { capture: false });
+    expect(off.t.steps).toHaveLength(1);
+    expect(off.t.frames).toEqual([]);
+    expect(log).toEqual([]);
+    const none = await traced(steps, { ...shotBrowser(), screenshot: undefined });
+    expect(none.t.frames).toEqual([]);
+  });
+
+  it("a failing screenshot does not fail the run", async () => {
+    const browser: BrowserBridge = { ...shotBrowser(), screenshot: async () => { throw new Error("no gpu"); } };
+    const { r, t } = await traced([{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }], browser);
+    expect(r.status).toBe("done");
+    expect(t.frames).toEqual([]);
+    expect(t.steps[0]!.ok).toBe(true);
+  });
+
+  it("a browse_screenshot call becomes a screenshot frame, also for raw base64; its stored output has no image", async () => {
+    const raw: BrowserBridge = { ...shotBrowser(), screenshot: async () => ({ imageData: `/9j/${JPG_BASE64}`, width: 1, height: 1 }) };
+    const { t } = await traced([{ calls: [{ name: "browse_screenshot", input: {} }] }, { text: "done" }], raw, {}, { capture: false });
+    expect(t.frames.map((f) => [f.kind, f.src.slice(0, 22)])).toEqual([["screenshot", "data:image/jpeg;base64"]]);
+    expect(t.steps[0]!.output).not.toContain(JPG_BASE64);
+  });
+
+  it("QA: the final screenshot is a final frame and is taken once, shared with onScreenshot", async () => {
+    const log: string[] = [];
+    const got: unknown[] = [];
+    const steps: Step[] = [{ calls: [{ name: "qa_verdict", input: { verdict: "pass", reason: "ok" } }] }];
+    const { r, t } = await traced(steps, shotBrowser(log), { qa: { onScreenshot: (img: unknown) => { got.push(img); } } });
+    expect(log).toEqual(["screenshot"]);
+    expect(got).toHaveLength(1);
+    expect(t.frames.at(-1)).toMatchObject({ kind: "final", src: `data:image/jpeg;base64,${JPG_BASE64}` });
+    expect(t.qa?.outcome).toBe("passed");
+    expect(t.steps.map((s) => s.tool)).toEqual(["qa_verdict"]);
+    expect("trace" in r).toBe(false);
+    // Without onScreenshot the trace still gets the final frame.
+    const log2: string[] = [];
+    const r2 = await traced(steps, shotBrowser(log2), { qa: true });
+    expect(log2).toEqual(["screenshot"]);
+    expect(r2.t.frames.at(-1)!.kind).toBe("final");
+  });
+
+  it("without trace there is no screenshot for QA without onScreenshot", async () => {
+    const log: string[] = [];
+    await runBrowseAgent("g", { model: scripted([{ calls: [{ name: "qa_verdict", input: { verdict: "pass", reason: "ok" } }] }]).model, browser: shotBrowser(log), qa: true });
+    expect(log).toEqual([]);
+  });
+
+  it("a dialog the trace screenshot drained is still in the output the model gets", async () => {
+    const dialog = { type: "alert", message: "Saved!" };
+    const browser: BrowserBridge = {
+      ...shotBrowser(),
+      screenshot: async () => ({ imageData: `data:image/jpeg;base64,${JPG_BASE64}`, dialogs: [dialog] }),
+    };
+    const steps: Step[] = [{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }];
+    const withTrace = scripted(steps);
+    await runBrowseAgent("goal", { model: withTrace.model, browser, trace: {} });
+    // Without tracing the act result carries the dialog itself; with tracing it arrives through the carry.
+    const without = scripted(steps);
+    await runBrowseAgent("goal", { model: without.model, browser: { ...browser, act: async () => ({ changed: true, consoleErrors: ["TypeError: x"], dialogs: [dialog] }) } });
+    const secondPrompt = (m: typeof withTrace) => JSON.stringify(m.seen.prompts[1]);
+    expect(secondPrompt(withTrace)).toContain("Saved!");
+    expect(secondPrompt(without)).toContain("Saved!");
+    expect(secondPrompt(withTrace).split("Saved!")).toHaveLength(2);
+    // Same dialog entry, same text; only the position of the key in the result may differ.
+    expect(secondPrompt(withTrace)).toContain('\\"dialogs\\":[{\\"type\\":\\"alert\\",\\"message\\":\\"Saved!\\"}]');
+  });
+
+  it("no step screenshot after an abort", async () => {
+    const ac = new AbortController();
+    const log: string[] = [];
+    const browser: BrowserBridge = { ...shotBrowser(log), act: async () => { ac.abort(); return { changed: true }; } };
+    const { t } = await traced([{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }], browser, { signal: ac.signal });
+    expect(log).toEqual([]);
+    expect(t.status).toBe("aborted");
   });
 });

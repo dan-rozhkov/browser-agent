@@ -7,6 +7,7 @@
 import { browseAgentErrorMessage, type BrowseAgentStatus } from "./result.js";
 import { QA_ASSERT_TOOL, QA_VERDICT_TOOL, REASON_MAX_CHARS, type QaFinalSink } from "./qaChecks.js";
 import type { QaCheckRecord, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
+import { createSeenList, harvestDiagnostics } from "../shared/diagnostics.js";
 import { parseJsonObject, singleUseTool, type BrowseAgentExtraToolHooks, type BrowseAgentToolCall } from "./session.js";
 
 export * from "./qaChecks.js";
@@ -156,56 +157,6 @@ export interface StepRecorder extends QaFinalSink {
   extras(): QaRunExtras;
 }
 
-/** A deduped, first-seen-order list of strings. */
-function createSeenList() {
-  const seen = new Set<string>();
-  const list: string[] = [];
-  let lost = 0;
-  return {
-    add(entries: unknown): void {
-      if (!Array.isArray(entries)) return;
-      for (const entry of entries) {
-        if (typeof entry !== "string" || seen.has(entry)) continue;
-        if (list.length >= DIAGNOSTICS_MEMORY) {
-          lost += 1;
-          continue;
-        }
-        seen.add(entry);
-        list.push(entry);
-      }
-    },
-    /** Adds the count of entries the controller left out of its own drain (`...Dropped`). */
-    lose(n: unknown): void {
-      if (typeof n === "number" && Number.isInteger(n) && n > 0) lost += n;
-    },
-    list: (): readonly string[] => list,
-    kept: (): string[] => list.slice(0, QA_RESULT_MAX_DIAGNOSTICS),
-    dropped: (): number => Math.max(0, list.length - QA_RESULT_MAX_DIAGNOSTICS) + lost,
-  };
-}
-
-type SeenList = ReturnType<typeof createSeenList>;
-
-/**
- * Takes `consoleErrors` and `failedRequests` (and their `...Dropped` counters) from a tool output. A batched `browse_act`
- * (`actions`) has them in each entry of `results` (the executor's `{ results, completed, ... }`),
- * so the entries are read too.
- */
-function harvestDiagnostics(output: Record<string, unknown>, consoleErrors: SeenList, failedRequests: SeenList): void {
-  const take = (o: Record<string, unknown>) => {
-    consoleErrors.add(o.consoleErrors);
-    consoleErrors.lose(o.consoleErrorsDropped);
-    failedRequests.add(o.failedRequests);
-    failedRequests.lose(o.failedRequestsDropped);
-  };
-  take(output);
-  if (!Array.isArray(output.results)) return;
-  for (const entry of output.results) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    take(entry as Record<string, unknown>);
-  }
-}
-
 /**
  * The trail of a run: one step per tool the model called. It holds what the
  * MODEL asked (tool name and input), not the bridge calls the tool made, and
@@ -215,8 +166,8 @@ function harvestDiagnostics(output: Record<string, unknown>, consoleErrors: Seen
 export function createStepRecorder(now: () => number = Date.now): StepRecorder {
   // One record per call, in call order: the step, when it started, and whether it is still running.
   const slots: { step: QaStep; started: number; open: boolean }[] = [];
-  const consoleErrors = createSeenList();
-  const failedRequests = createSeenList();
+  const consoleErrors = createSeenList(DIAGNOSTICS_MEMORY, QA_RESULT_MAX_DIAGNOSTICS);
+  const failedRequests = createSeenList(DIAGNOSTICS_MEMORY, QA_RESULT_MAX_DIAGNOSTICS);
   const checks: QaCheckRecord[] = [];
   return {
     seenConsoleErrors: () => consoleErrors.list(),
