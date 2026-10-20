@@ -23,8 +23,8 @@ export interface LaunchElectronAppOptions {
   userDataDir?: string;
   /**
    * Use the app's own profile (its logins and data): `--user-data-dir` is not passed, no temp dir is made,
-   * and nothing is removed on `close()` or on parent exit. The app is never killed: `close()` asks it to quit
-   * like Cmd+Q and leaves it running if it does not; host exit leaves it running. Cannot be combined with `userDataDir`.
+   * and nothing is removed on `close()` or on parent exit. The app is never killed: `close()` and a failed launch ask
+   * it to quit like Cmd+Q and leave it running if it does not; host exit leaves it running. Cannot be combined with `userDataDir`.
    */
   useAppProfile?: boolean;
   /** Debug port. Default: a free port. */
@@ -235,9 +235,14 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
   let spawnError: Error | null = null;
   child.once("error", (e) => { spawnError = e; });
 
+  // The user's real profile is never killed, not even on a failed launch: ask it to quit (Cmd+Q) and leave it.
+  const stopChild = async () => {
+    if (!useAppProfile) return killChild(child, termGraceMs, sleep);
+    if (!exited(child) && child.pid) await quitElectronApp(child.pid, { timeoutMs: appQuitMs }, deps).catch(() => false);
+  };
   const fail = async (why: string, cleanExit = false): Promise<never> => {
     offParentExit();
-    await killChild(child, termGraceMs, sleep);
+    await stopChild();
     await removeProfile();
     if (cleanExit) {
       throw new Error(
@@ -273,7 +278,7 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
     conn = await (deps.connect ?? connectOverCdp)(cdpUrl, { ...opts.controllerOptions, lockNavigation: lock });
   } catch (e) {
     offParentExit();
-    await killChild(child, termGraceMs, sleep);
+    await stopChild();
     await removeProfile();
     throw e;
   }
@@ -284,13 +289,9 @@ export async function launchElectronApp(opts: LaunchElectronAppOptions, deps: El
     (closing ??= (async () => {
       offParentExit();
       await conn.close().catch(() => undefined);
-      // The user's real profile: ask the app to quit (Cmd+Q) and never send a signal. An app that does not
-      // quit (for example it shows a "save changes?" dialog) keeps running; the caller sees `pid` still alive.
-      if (useAppProfile) {
-        if (!exited(child) && child.pid) await quitElectronApp(child.pid, { timeoutMs: appQuitMs }, deps).catch(() => false);
-        return;
-      }
-      await killChild(child, termGraceMs, sleep);
+      // The user's real profile: an app that does not quit (for example it shows a "save changes?"
+      // dialog) keeps running; the caller sees `pid` still alive.
+      await stopChild();
       await removeProfile();
     })());
 

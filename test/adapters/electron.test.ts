@@ -399,6 +399,28 @@ describe("launchElectronApp useAppProfile", () => {
     expect(child.exitCode).toBeNull();
   });
 
+  it("a failed launch asks the app to quit and sends no signal", async () => {
+    const child = new FakeChild();
+    const runOsascript = vi.fn(async () => "true");
+    const { deps } = makeDeps(child, {
+      runOsascript,
+      fetchJson: async (url: string) => {
+        if (url.endsWith("/json/version")) throw new Error("ECONNREFUSED");
+        return [];
+      },
+    });
+    await expect(launchElectronApp({ app: "/x/Orca", useAppProfile: true, timeoutMs: 5 }, deps)).rejects.toThrow(/did not open a CDP port/);
+    expect(runOsascript).toHaveBeenCalledTimes(1);
+    expect(child.signals).toEqual([]);
+  });
+
+  it("a failed connect asks the app to quit and sends no signal", async () => {
+    const child = new FakeChild();
+    const { deps } = makeDeps(child, { connect: async () => { throw new Error("connect failed"); } });
+    await expect(launchElectronApp({ app: "/x/Orca", useAppProfile: true }, deps)).rejects.toThrow(/connect failed/);
+    expect(child.signals).toEqual([]);
+  });
+
   it("host exit does not kill the app", async () => {
     const child = new FakeChild();
     let exit: () => void = () => undefined;
