@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.28](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.27...v0.2.28) (2026-10-20)
+
+
+### Bug Fixes
+
+* **electron:** never kill an app that runs on the user's profile ([7682a45](https://github.com/dan-rozhkov/browser-agent/commit/7682a45b6ff8b22db3347c3e4fceea4d8ae78959))
+
 ## [0.2.27](https://github.com/dan-rozhkov/browser-agent/compare/v0.2.26...v0.2.27) (2026-10-20)
 
 
