@@ -99,23 +99,6 @@ const DEEP_QUERY_HELPER_JS = `
  * budget limits how many ELEMENT subtrees are entered, but direct text nodes
  * are always collected ("<button><svg>…3500 nodes…</svg>Download</button>").
  */
-/**
- * One definition of "this field is named like a password", shared by SNAPSHOT_JS (value rule) and ASSERT_JS
- * (value check). A "show password" eye flips type=password to type=text, so the type alone no longer
- * protects the value. Matches the name or id: password, passwd, passcode, passphrase, pwd, парол*, and
- * "pass" or "pw" (optionally with digits: pass1, pw2) only as a whole token (start/end, a non-alphanumeric delimiter, or a
- * camelCase boundary: userPass).
- * "passenger", "passport" and "compass" are not password fields.
- */
-const PASSWORD_NAME_JS = `
-  function penIsPasswordNamed(el) {
-    var raw = String(el.getAttribute("name") || "") + " " + String(el.getAttribute("id") || "");
-    if (/password|passwd|passcode|passphrase|pwd|парол/i.test(raw)) return true;
-    var spaced = raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
-    return /(^|[^a-z0-9])(pass|pw)\\d*($|[^a-z0-9])/i.test(spaced);
-  }
-`;
-
 const TEXT_CLEAN_JS = `
   var PEN_NON_TEXT_TAGS = { STYLE: 1, SCRIPT: 1, NOSCRIPT: 1, TEMPLATE: 1 };
   function penCleanText(root) {
@@ -3311,7 +3294,6 @@ export const SCROLL_JS = `(() => {
  */
 export const SNAPSHOT_JS = `(() => {
   var args = ${ARGS_MARKER};
-  ${PASSWORD_NAME_JS}
   var snapshotId = args.snapshotId;
   var maxElements = args.maxElements;
   // Per-document token: FIND_BY_SNAPSHOT_JS relocates a re-mounted node only
@@ -3618,15 +3600,10 @@ export const SNAPSHOT_JS = `(() => {
         autocomplete === "one-time-code" ||
         autocomplete === "current-password" ||
         autocomplete === "new-password";
-      // A "show password" eye flips type=password to type=text, so the type
-      // alone no longer protects the value: a field named like a password
-      // (name or id, see PASSWORD_NAME_JS) is sensitive whatever its type.
-      var passwordLikeName = penIsPasswordNamed(el);
       // A range value is a bare number the model needs to see (where the
       // slider currently sits), never user-entered text.
       var valueEligible =
         !isPassword &&
-        !passwordLikeName &&
         (inputType === "text" || inputType === "search" || inputType === "textarea" || inputType === "range") &&
         !sensitiveAutocomplete;
       var rawValue = el.value || "";
@@ -6790,7 +6767,6 @@ export const BOT_CHECK_JS = `(() => {
  * canvases turned into images, open shadow roots flattened.
  */
 export const CAPTURE_JS = `(() => {
-  ${PASSWORD_NAME_JS}
   ${FIND_BY_SNAPSHOT_JS}
   var args = ${ARGS_MARKER};
   try {
@@ -7189,7 +7165,7 @@ export const CAPTURE_JS = `(() => {
         if (type === "checkbox" || type === "radio") {
           if (n.checked) c.setAttribute("checked", "");
           else c.removeAttribute("checked");
-        } else if (type !== "file" && type !== "password" && !penIsPasswordNamed(n)) {
+        } else if (type !== "file" && type !== "password") {
           c.setAttribute("value", n.value);
         } else {
           c.removeAttribute("value");
@@ -7200,7 +7176,7 @@ export const CAPTURE_JS = `(() => {
       }
 
       if (tag === "textarea") {
-        if (!penIsPasswordNamed(n)) c.textContent = n.value;
+        c.textContent = n.value;
         return c;
       }
 
@@ -7574,7 +7550,6 @@ export const DOC_MARKER_JS = `(() => {
  */
 export const ASSERT_JS = `(() => {
   var args = ${ARGS_MARKER};
-  ${PASSWORD_NAME_JS}
 
   ${LOCATE_TARGET_JS}
 
@@ -7634,9 +7609,7 @@ export const ASSERT_JS = `(() => {
     var el = r.el;
     if (!el) return { passed: false, actual: "not found" };
     if (typeof el.value !== "string") return { passed: false, error: "The element has no value." };
-    var secret =
-      (el.getAttribute("type") || "").toLowerCase() === "password" ||
-      penIsPasswordNamed(el);
+    var secret = (el.getAttribute("type") || "").toLowerCase() === "password";
     var v = el.value;
     var ok = true;
     if (check.equals !== undefined && v !== check.equals) ok = false;

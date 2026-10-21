@@ -1,8 +1,7 @@
 // Browse run trace, format v1 (docs/specs/2026-10-20-browse-run-trace-design.md):
-// types, constants and pure helpers. Zod-free, imports only types and ./secrets.js (also zod-free), so the
+// types, constants and pure helpers. Zod-free, no imports except types, so the
 // zod-free `agent/session` entry and any consumer (viewer, backend, desktop
 // main) can use them. The recorder is in src/agent/traceRecorder.ts.
-import { hasSecretPlaceholder } from "./secrets.js";
 import type { QaResult } from "./qaTypes.js";
 
 export const BROWSE_TRACE_FORMAT = "sideform.browse-trace";
@@ -182,15 +181,9 @@ export function redactTraceArgsTracked(args: unknown, state: TraceRedactionState
     }
     const out: Record<string, unknown> = {};
     for (const [key, v] of Object.entries(record)) {
-      const isText = (key === "text" || key === "value") && typeof v === "string";
-      if (secretField && isText) {
-        // Checked first: a literal (or a placeholder) typed into a secret-looking field stays hidden.
+      if (secretField && (key === "text" || key === "value") && typeof v === "string") {
         typedSecret = true;
         out[key] = "[redacted]";
-      } else if (isText && hasSecretPlaceholder(v as string)) {
-        // A placeholder is not a secret and stays readable, but the real value was typed into the page: no frame.
-        typedSecret = true;
-        out[key] = capTraceText(v as string, BROWSE_TRACE_ARG_STRING_MAX_CHARS);
       } else {
         out[key] = SECRET_KEY.test(key) ? "[redacted]" : visit(v, depth + 1);
       }

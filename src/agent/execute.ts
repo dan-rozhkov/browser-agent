@@ -6,7 +6,6 @@
 // zod-free (entry: `agent/execute`); ../shared/* is zod-free too, which is what the
 // boundary allows next to ../loop/*.
 import type { BrowserBridge } from "../loop/bridge.js";
-import { createSecretRedactor, hasSecretPlaceholder, resolveSecretPlaceholders, type SecretRedactor } from "../shared/secrets.js";
 import { parseViewportArgs } from "../shared/viewport.js";
 import { resultError, takeSnapshot, type SnapshotResult } from "../loop/shared.js";
 
@@ -74,28 +73,8 @@ export interface ExecuteBrowseToolOptions {
     /** browse_open got `app` but the bridge has no `launchApp`. */
     appLaunchMissing?: string;
   };
-  /**
-   * The host's secrets, `{ name: value }`, read once per `executeBrowseTool` call. With it, the `text` of a
-   * `type` action may hold `{{secret:<name>}}`: the executor puts the value in right before the bridge call
-   * (after validation and `element` locating, so a locator never gets it), and every string the call returns
-   * is redacted of all values. Without it, a placeholder is refused. A placeholder in any other field, or in
-   * another action, is never substituted.
-   */
-  secrets?: () => Readonly<Record<string, string>>;
   /** Runs after `browse_screenshot` when the input has `placeOnCanvas: true`. */
   afterScreenshot?: (ctx: AfterScreenshotContext) => Promise<string>;
-}
-
-/** The options plus the redactor the public entry point built once for the whole call. */
-interface InternalOptions extends ExecuteBrowseToolOptions {
-  redactor?: SecretRedactor;
-}
-
-/** Freezes the secrets and builds the one redactor of a call; undefined without `secrets`. */
-function withRedactor(opts: ExecuteBrowseToolOptions): InternalOptions & { redactor?: SecretRedactor } {
-  if (!opts.secrets) return opts;
-  const secrets = opts.secrets();
-  return { ...opts, secrets: () => secrets, redactor: createSecretRedactor(secrets) };
 }
 
 const NOT_AVAILABLE_DEFAULT = "The browser is not available.";
@@ -164,7 +143,7 @@ async function resolveByElement(
   action: string,
   element: string,
   rest: Record<string, unknown>,
-  opts: InternalOptions,
+  opts: ExecuteBrowseToolOptions,
 ): Promise<string> {
   const snapshotResult = await takeSnapshot(browser);
   if ("error" in snapshotResult) {
@@ -174,9 +153,7 @@ async function resolveByElement(
 
   let located: ElementLocateOutcome;
   try {
-    // The locator (the host's model call) never sees a secret value that the page echoes into the snapshot.
-    const forLocator = opts.redactor ? opts.redactor.value(snapshot) : snapshot;
-    located = await locate({ element, action, snapshot: forLocator });
+    located = await locate({ element, action, snapshot });
   } catch (e) {
     return err(
       `browse_act: element lookup failed while resolving "${element}" (${e instanceof Error ? e.message : String(e)}). Use target or index instead.`,
@@ -192,9 +169,7 @@ async function resolveByElement(
   }
 
   if (located.outcome === "found" && typeof located.index === "number") {
-    const substituted = substituteSecrets(rest, opts);
-    if (!substituted.ok) return err(substituted.error);
-    const actArgs: Record<string, unknown> = { ...substituted.args, action, index: located.index, snapshotId: snapshot.snapshotId };
+    const actArgs: Record<string, unknown> = { ...rest, action, index: located.index, snapshotId: snapshot.snapshotId };
     delete actArgs.target;
 
     const result = await callBridge(() => browser.act(actArgs), opts);
@@ -231,36 +206,13 @@ async function resolveByElement(
   );
 }
 
-/** Refusal text when `text` holds a placeholder that may not be used here; null when it is fine or absent. */
-function checkPlaceholder(entry: Record<string, unknown>, opts: ExecuteBrowseToolOptions): string | null {
-  if (typeof entry.text !== "string" || !hasSecretPlaceholder(entry.text)) return null;
-  if (entry.action !== "type") return 'browse_act: a {{secret:...}} placeholder can only be used in the text of a "type" action.';
-  if (!opts.secrets) return "browse_act: secret placeholders are not available here.";
-  return null;
-}
-
-/** `rest` with the placeholders in `text` replaced by the secret values. Only called after `checkPlaceholder`. */
-function substituteSecrets(
-  rest: Record<string, unknown>,
-  opts: ExecuteBrowseToolOptions,
-): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
-  if (typeof rest.text !== "string" || !hasSecretPlaceholder(rest.text) || !opts.secrets) return { ok: true, args: rest };
-  const resolved = resolveSecretPlaceholders(rest.text, opts.secrets());
-  if (!resolved.ok) return { ok: false, error: `browse_act: ${resolved.error}` };
-  return { ok: true, args: { ...rest, text: resolved.text } };
-}
-
 /** One action entry, a top-level call or one entry of a batch. */
 async function performOne(
   browser: BrowserBridge | undefined,
   entryArgs: Record<string, unknown>,
-  opts: InternalOptions,
+  opts: ExecuteBrowseToolOptions,
 ): Promise<string> {
   const { element, ...rest } = entryArgs;
-
-  // A placeholder is resolved last, right before `browser.act`; here it is only checked.
-  const placeholderRefusal = checkPlaceholder(rest, opts);
-  if (placeholderRefusal) return err(placeholderRefusal);
 
   if (routesToElement(entryArgs)) {
     if (!opts.locateElement) return err(ELEMENT_UNAVAILABLE);
@@ -284,9 +236,7 @@ async function performOne(
     if (refusal) return err(refusal);
   }
   if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
-  const direct = substituteSecrets(rest, opts);
-  if (!direct.ok) return err(direct.error);
-  return callBridge(() => browser.act(direct.args), opts);
+  return callBridge(() => browser.act(rest), opts);
 }
 
 /**
@@ -369,19 +319,6 @@ export async function runActionsBatch(
   now?: () => number,
   opts: ExecuteBrowseToolOptions = {},
 ): Promise<string> {
-  if (!opts.secrets) return runActionsBatchRaw(browser, actions, topSnapshotId, now, opts);
-  // Public entry that can substitute secrets: it redacts its own result (secrets read and redactor built once).
-  const inner = withRedactor(opts);
-  return inner.redactor!.output(await runActionsBatchRaw(browser, actions, topSnapshotId, now, inner));
-}
-
-async function runActionsBatchRaw(
-  browser: BrowserBridge | undefined,
-  actions: unknown[],
-  topSnapshotId: string | undefined,
-  now: (() => number) | undefined,
-  opts: InternalOptions,
-): Promise<string> {
   // One clock: the positional `now`, else `opts.now`, else Date.now.
   const clock = now ?? opts.now ?? (() => Date.now());
   if (actions.length === 0) return err('browse_act: "actions" must contain at least 1 entry.');
@@ -449,11 +386,11 @@ async function runActionsBatchRaw(
 async function browseAct(
   browser: BrowserBridge | undefined,
   input: Record<string, unknown>,
-  opts: InternalOptions,
+  opts: ExecuteBrowseToolOptions,
 ): Promise<string> {
   const { actions, ...top } = input;
   if (Array.isArray(actions)) {
-    return runActionsBatchRaw(browser, actions, typeof top.snapshotId === "string" ? top.snapshotId : undefined, opts.now, opts);
+    return runActionsBatch(browser, actions, typeof top.snapshotId === "string" ? top.snapshotId : undefined, opts.now, opts);
   }
   const action = typeof input.action === "string" ? input.action : "";
   const resultStr = await performOne(browser, input, opts);
@@ -498,18 +435,6 @@ export async function executeBrowseTool(
   toolName: string,
   input: unknown,
   opts: ExecuteBrowseToolOptions = {},
-): Promise<string> {
-  if (!opts.secrets) return executeBrowseToolRaw(browser, toolName, input, opts);
-  // Read once per call: every entry of a batch and the redaction see the same secrets; one redactor.
-  const inner = withRedactor(opts);
-  return inner.redactor!.output(await executeBrowseToolRaw(browser, toolName, input, inner));
-}
-
-async function executeBrowseToolRaw(
-  browser: BrowserBridge | undefined,
-  toolName: string,
-  input: unknown,
-  opts: ExecuteBrowseToolOptions,
 ): Promise<string> {
   const args: Record<string, unknown> =
     input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};

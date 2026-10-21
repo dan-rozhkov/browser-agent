@@ -13,4 +13,3 @@ export * from "./traceRecorder.js";
 export * from "../shared/trace.js";
 export { mergeCarriedDialogs } from "../shared/dialogs.js";
 export { BROWSE_AGENT_TOOL_NAMES, type BrowseAgentToolName } from "./toolNames.js";
-export * from "../shared/secrets.js";
