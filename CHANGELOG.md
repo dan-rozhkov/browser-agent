@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.5...v0.3.6) (2026-10-21)
+
+
+### Bug Fixes
+
+* **controller:** a revealed password never reaches the model ([78e6dfe](https://github.com/dan-rozhkov/browser-agent/commit/78e6dfee33d4fe333f0c8636c89efa33869043fe))
+
 ## [0.3.5](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.4...v0.3.5) (2026-10-21)
 
 
