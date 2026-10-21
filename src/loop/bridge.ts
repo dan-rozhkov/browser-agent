@@ -125,6 +125,13 @@ export interface BrowserBridge {
   startJournal?(opts?: CheckpointJournalOptions): string | void | Promise<string | void>;
   stopJournal?(token?: string): unknown;
   captureCheckpoint?(token?: string): Promise<unknown>;
+  /**
+   * Run trace request log (docs/specs/2026-10-20-browse-run-trace-design.md, "v1 additions"): drains the requests
+   * all tabs finished since the last call. Resolves to the JSON text of `{ requests, dropped? }` (raw entries, see
+   * the controller's `PageRequestEntry`). Read-only; never blocks behind a running command. Optional - absent on
+   * bridges older than this feature; the recorder then has no `requests` source.
+   */
+  requests?(): Promise<string>;
 }
 
 

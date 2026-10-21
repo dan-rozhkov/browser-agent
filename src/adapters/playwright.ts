@@ -15,7 +15,7 @@ import { BrowserController } from "../controller/index.js";
 import { controllerBridge } from "./controllerBridge.js";
 import type { OpenedBrowser } from "../loop/bridge.js";
 import { isBlockedIp, isFetchableStylesheetUrl } from "../controller/captureCss.js";
-import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo } from "../controller/index.js";
+import type { BrowserPageHandle, BrowserTarget, BrowserTabInfo, PageRequestEntry } from "../controller/index.js";
 import { sleep } from "../fixture/apply.js";
 import { httpOrigin } from "../fixture/util.js";
 import type { FixtureCookie, FixtureMockResponse, FixtureRequestInfo } from "../fixture/types.js";
@@ -158,6 +158,15 @@ function refererOrigin(pageUrl: string): string | undefined {
   }
 }
 
+/** A request being tracked for `drainRequests`. */
+interface ReqRecord { requestId: string; startMono?: number; mimeType?: string; error?: string; redirect?: boolean; entry: PageRequestEntry }
+const MAX_REQUEST_RING = 300;
+const MAX_BODY_FETCHES = 30;
+const MAX_BODY_CHARS = 16 * 1024;
+/** All body fetches of one drain together. */
+const BODY_PHASE_MS = 2000;
+const TEXT_MIME = /json|^text\/|xml|javascript|x-www-form-urlencoded/i;
+
 class PwPage implements BrowserPageHandle {
   private loading = false;
   private title = "";
@@ -166,6 +175,10 @@ class PwPage implements BrowserPageHandle {
   private failedRequests: string[] = [];
   // requestId -> method + redacted URL, for the requests worth reporting if they fail (bounded).
   private requestInfo = new Map<string, { method: string; url: string }>();
+  // Request log for `drainRequests`: in-flight records by requestId, and the finished ring (<= 300).
+  private reqActive = new Map<string, ReqRecord>();
+  private reqDone: ReqRecord[] = [];
+  private reqDropped = 0;
   private navCbs = new Set<() => void>();
   private domReadyWaiters: (() => void)[] = [];
   private pending = new Map<string, { startedAt: number; generation: number }>();
@@ -218,10 +231,12 @@ class PwPage implements BrowserPageHandle {
       this.gen += 1;
       this.pending.set(p.requestId, { startedAt: Date.now(), generation: this.gen });
       this.rememberRequest(p.requestId, p.request?.method, p.request?.url);
+      this.trackRequest(p);
     });
     const done = (p: { requestId: string }) => this.pending.delete(p.requestId);
-    cdp.on("Network.loadingFinished", (p) => { done(p); this.requestInfo.delete(p.requestId); });
+    cdp.on("Network.loadingFinished", (p) => { done(p); this.requestInfo.delete(p.requestId); this.finishRequest(p.requestId, p.timestamp, undefined, p.encodedDataLength); });
     cdp.on("Network.responseReceived", (p) => {
+      this.noteResponse(p.requestId, p.type, p.response);
       const status = p.response?.status;
       if (typeof status === "number" && status >= 400) this.recordFailedRequest(p.requestId, String(status));
     });
@@ -230,6 +245,7 @@ class PwPage implements BrowserPageHandle {
       // A request the page canceled itself (an aborted fetch, a navigation away) is not a failure.
       if (!p.canceled && p.errorText !== "net::ERR_ABORTED") this.recordFailedRequest(p.requestId, p.errorText || "failed");
       this.requestInfo.delete(p.requestId);
+      this.finishRequest(p.requestId, p.timestamp, p.errorText || "failed");
     });
     try {
       const tree = await cdp.send("Page.getFrameTree");
@@ -398,6 +414,74 @@ class PwPage implements BrowserPageHandle {
   drainDialogs() { return this.dialogs.splice(0); }
   drainConsoleErrors() { return this.consoleErrors.splice(0); }
   drainFailedRequests() { return this.failedRequests.splice(0); }
+  async drainRequests(): Promise<PageRequestEntry[]> {
+    const records = this.reqDone.splice(0);
+    let bodies = 0;
+    // Past the phase limit the entries go out as they are; a late body is not written.
+    let over = false;
+    const fetches = Promise.all(records.map(async (r) => {
+      if (bodies >= MAX_BODY_FETCHES || r.redirect || r.error !== undefined || !r.mimeType || !TEXT_MIME.test(r.mimeType) || !["fetch", "xhr"].includes(r.entry.type ?? "")) return;
+      bodies++;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const res = await Promise.race([
+          (this.cdp.send as (m: string, p?: Record<string, unknown>) => Promise<{ body?: string; base64Encoded?: boolean }>)("Network.getResponseBody", { requestId: r.requestId }),
+          new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 1000); }),
+        ]);
+        if (over || !res || res.base64Encoded || typeof res.body !== "string") return;
+        r.entry.body = res.body.slice(0, MAX_BODY_CHARS);
+        if (res.body.length > MAX_BODY_CHARS) r.entry.bodyTruncated = true;
+      } catch { /* the body is gone: no body */ } finally { clearTimeout(timer); }
+    }));
+    let phase: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([fetches, new Promise<void>((resolve) => { phase = setTimeout(resolve, BODY_PHASE_MS); })]);
+    clearTimeout(phase);
+    over = true;
+    return records.map((r) => r.entry);
+  }
+  droppedRequests() { const n = this.reqDropped; this.reqDropped = 0; return n; }
+  /** What a closing tab leaves: its finished entries (no bodies: the session is gone) and the drop count. */
+  takeClosedRequests(): { requests: PageRequestEntry[]; dropped: number } {
+    return { requests: this.reqDone.splice(0).map((r) => r.entry), dropped: this.droppedRequests() };
+  }
+  private trackRequest(p: { requestId: string; timestamp?: number; wallTime?: number; type?: string; request?: { url?: string; method?: string; headers?: Record<string, string> }; redirectResponse?: { status?: number; mimeType?: string; headers?: Record<string, string> } }) {
+    const url = p.request?.url;
+    if (!url || url.startsWith("data:") || ["WebSocket", "EventSource", "Ping"].includes(p.type ?? "")) return;
+    // A redirect reuses the requestId: the earlier hop ends here.
+    if (p.redirectResponse && this.reqActive.has(p.requestId)) {
+      this.noteResponse(p.requestId, undefined, p.redirectResponse);
+      // The hop shares its requestId with the final one: a body fetch would return the final body.
+      this.reqActive.get(p.requestId)!.redirect = true;
+      this.finishRequest(p.requestId, p.timestamp, undefined, undefined);
+    }
+    const entry: PageRequestEntry = {
+      at: typeof p.wallTime === "number" ? Math.round(p.wallTime * 1000) : Date.now(),
+      method: p.request?.method || "GET",
+      url,
+    };
+    if (p.type) entry.type = p.type.toLowerCase();
+    if (p.request?.headers) entry.requestHeaders = { ...p.request.headers };
+    this.reqActive.set(p.requestId, { requestId: p.requestId, startMono: p.timestamp, entry });
+    if (this.reqActive.size > 500) { this.reqActive.delete(this.reqActive.keys().next().value as string); this.reqDropped += 1; }
+  }
+  private noteResponse(requestId: string, type: string | undefined, response: { status?: number; mimeType?: string; headers?: Record<string, string> } | undefined) {
+    const r = this.reqActive.get(requestId);
+    if (!r || !response) return;
+    if (type && !r.entry.type) r.entry.type = type.toLowerCase();
+    if (typeof response.status === "number") r.entry.status = response.status;
+    if (response.mimeType) { r.entry.mimeType = response.mimeType; r.mimeType = response.mimeType; }
+    if (response.headers) r.entry.responseHeaders = { ...response.headers };
+  }
+  private finishRequest(requestId: string, timestamp: number | undefined, error: string | undefined, size?: number) {
+    const r = this.reqActive.get(requestId);
+    if (!r) return;
+    this.reqActive.delete(requestId);
+    if (error !== undefined) { r.error = error; r.entry.error = error; }
+    if (typeof size === "number") r.entry.size = size;
+    if (typeof timestamp === "number" && typeof r.startMono === "number") r.entry.durationMs = Math.max(0, Math.round((timestamp - r.startMono) * 1000));
+    this.reqDone.push(r);
+    if (this.reqDone.length > MAX_REQUEST_RING) { this.reqDone.shift(); this.reqDropped += 1; }
+  }
   private rememberRequest(requestId: string, method: string | undefined, url: string | undefined) {
     if (!url || url.startsWith("data:")) return;
     let shown: string;
@@ -533,7 +617,26 @@ export class PlaywrightTarget implements BrowserTarget {
     if (this.seenOrigins.size > MAX_SEEN_ORIGINS) this.seenOrigins.delete(this.seenOrigins.values().next().value as string);
   }
 
+  /** Finished request entries of closed tabs, until the controller drains them (at most 300). */
+  private closedRequests: PageRequestEntry[] = [];
+  private closedDropped = 0;
+  drainClosedRequests(): { requests: PageRequestEntry[]; dropped?: number } {
+    const requests = this.closedRequests.splice(0);
+    const dropped = this.closedDropped;
+    this.closedDropped = 0;
+    return dropped > 0 ? { requests, dropped } : { requests };
+  }
+
   private drop(id: number, p: Page) {
+    const taken = this.pages.get(id)?.takeClosedRequests();
+    if (taken) {
+      this.closedRequests.push(...taken.requests);
+      this.closedDropped += taken.dropped;
+      if (this.closedRequests.length > MAX_REQUEST_RING) {
+        this.closedDropped += this.closedRequests.length - MAX_REQUEST_RING;
+        this.closedRequests.splice(0, this.closedRequests.length - MAX_REQUEST_RING);
+      }
+    }
     this.pages.delete(id);
     this.ids.delete(p);
     this.awaiting.delete(id);

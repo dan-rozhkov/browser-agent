@@ -74,6 +74,161 @@ describe("PlaywrightTarget", () => {
     expect(h.drainFailedRequests?.()).toEqual([]);
   });
 
+  it("drainRequests: logs finished and failed requests with headers, timing and lazily fetched fetch/xhr text bodies", async () => {
+    const cdp = new FakeCdp();
+    const base = cdp.send.getMockImplementation()!;
+    (cdp as { send: unknown }).send = vi.fn(async (method: string, params?: unknown): Promise<unknown> => {
+      if (method === "Network.getResponseBody") {
+        const id = (params as { requestId: string }).requestId;
+        if (id === "gone") throw new Error("No resource with given identifier");
+        return { body: id === "big" ? "x".repeat(20000) : '{"ok":true}', base64Encoded: false };
+      }
+      return base(method);
+    });
+    const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+    const h = await target.ensurePage();
+    const sent = (requestId: string, url: string, type: string, extra: Record<string, unknown> = {}) =>
+      cdp.emit("Network.requestWillBeSent", { requestId, type, timestamp: 10, wallTime: 1700000000, request: { url, method: "POST", headers: { Authorization: "Bearer x" } }, ...extra });
+    const finish = (requestId: string, mimeType: string, status = 200) => {
+      cdp.emit("Network.responseReceived", { requestId, type: "Fetch", response: { status, mimeType, headers: { "content-type": mimeType } } });
+      cdp.emit("Network.loadingFinished", { requestId, timestamp: 10.25, encodedDataLength: 321 });
+    };
+    sent("a", "https://a.test/api", "Fetch");
+    finish("a", "application/json");
+    sent("big", "https://a.test/big", "XHR");
+    finish("big", "text/plain");
+    sent("gone", "https://a.test/gone", "Fetch");
+    finish("gone", "application/json");
+    sent("img", "https://a.test/i.png", "Image");
+    finish("img", "image/png");
+    sent("f", "https://a.test/f", "Fetch");
+    cdp.emit("Network.loadingFailed", { requestId: "f", timestamp: 10.5, errorText: "net::ERR_CONNECTION_REFUSED" });
+    sent("ws", "wss://a.test/s", "WebSocket");
+    sent("d", "data:image/png;base64,AA", "Image");
+    const out = await h.drainRequests!();
+    expect(out.map((r) => r.url)).toEqual(["https://a.test/api", "https://a.test/big", "https://a.test/gone", "https://a.test/i.png", "https://a.test/f"]);
+    expect(out[0]).toEqual({
+      at: 1700000000000, method: "POST", url: "https://a.test/api", type: "fetch", status: 200, mimeType: "application/json",
+      requestHeaders: { Authorization: "Bearer x" }, responseHeaders: { "content-type": "application/json" },
+      size: 321, durationMs: 250, body: '{"ok":true}',
+    });
+    expect(out[1]!.body).toHaveLength(16 * 1024);
+    expect(out[1]!.bodyTruncated).toBe(true);
+    expect(out[2]!.body).toBeUndefined();
+    expect(out[3]!.body).toBeUndefined();
+    expect(out[4]).toMatchObject({ error: "net::ERR_CONNECTION_REFUSED", durationMs: 500 });
+    expect(await h.drainRequests!()).toEqual([]);
+    // The failed-request behavior is unchanged.
+    expect(h.drainFailedRequests?.()).toEqual(["POST net::ERR_CONNECTION_REFUSED https://a.test/f"]);
+  });
+
+  it("drainRequests: a redirect ends the earlier hop (no body for it), and the ring keeps the newest 300", async () => {
+    const cdp = new FakeCdp();
+    const base = cdp.send.getMockImplementation()!;
+    const bodyCalls: string[] = [];
+    (cdp as { send: unknown }).send = vi.fn(async (method: string, params?: unknown): Promise<unknown> => {
+      if (method === "Network.getResponseBody") { bodyCalls.push((params as { requestId: string }).requestId); return { body: "final", base64Encoded: false }; }
+      return base(method);
+    });
+    const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+    const h = await target.ensurePage();
+    cdp.emit("Network.requestWillBeSent", { requestId: "r", type: "Fetch", timestamp: 1, request: { url: "https://a.test/old", method: "GET" } });
+    cdp.emit("Network.requestWillBeSent", { requestId: "r", type: "Fetch", timestamp: 1.1, request: { url: "https://a.test/new", method: "GET" }, redirectResponse: { status: 302, mimeType: "application/json", headers: { location: "/new" } } });
+    cdp.emit("Network.responseReceived", { requestId: "r", type: "Fetch", response: { status: 200, mimeType: "application/json" } });
+    cdp.emit("Network.loadingFinished", { requestId: "r", timestamp: 1.2, encodedDataLength: 5 });
+    const out = await h.drainRequests!();
+    expect(out.map((r) => [r.url, r.status, r.body])).toEqual([["https://a.test/old", 302, undefined], ["https://a.test/new", 200, "final"]]);
+    expect(out[0]!.responseHeaders).toEqual({ location: "/new" });
+    expect(bodyCalls).toEqual(["r"]);
+    for (let i = 0; i < 305; i++) {
+      cdp.emit("Network.requestWillBeSent", { requestId: `n${i}`, type: "Script", timestamp: 2, request: { url: `https://a.test/${i}`, method: "GET" } });
+      cdp.emit("Network.loadingFinished", { requestId: `n${i}`, timestamp: 2 });
+    }
+    const ring = await h.drainRequests!();
+    expect(ring).toHaveLength(300);
+    expect(ring[0]!.url).toBe("https://a.test/5");
+  });
+
+  it("drainRequests: WebSocket, EventSource and Ping requests are not logged even when they finish", async () => {
+    const cdp = new FakeCdp();
+    const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+    const h = await target.ensurePage();
+    for (const [id, type] of [["w", "WebSocket"], ["e", "EventSource"], ["p", "Ping"], ["ok", "Fetch"]] as const) {
+      cdp.emit("Network.requestWillBeSent", { requestId: id, type, timestamp: 1, request: { url: `https://a.test/${id}`, method: "GET" } });
+      cdp.emit("Network.loadingFinished", { requestId: id, timestamp: 2 });
+    }
+    expect((await h.drainRequests!()).map((r) => r.url)).toEqual(["https://a.test/ok"]);
+  });
+
+  it("drainRequests: counts ring overflow and in-flight eviction in droppedRequests, and resets it", async () => {
+    const cdp = new FakeCdp();
+    const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+    const h = await target.ensurePage();
+    for (let i = 0; i < 310; i++) {
+      cdp.emit("Network.requestWillBeSent", { requestId: `n${i}`, type: "Script", timestamp: 2, request: { url: `https://a.test/${i}`, method: "GET" } });
+      cdp.emit("Network.loadingFinished", { requestId: `n${i}`, timestamp: 2 });
+    }
+    for (let i = 0; i < 505; i++) cdp.emit("Network.requestWillBeSent", { requestId: `p${i}`, type: "Script", timestamp: 2, request: { url: `https://a.test/p${i}`, method: "GET" } });
+    expect(h.droppedRequests!()).toBe(10 + 5);
+    expect(h.droppedRequests!()).toBe(0);
+  });
+
+  it("drainRequests: the body phase is limited to 2 s; entries come back without the late bodies", async () => {
+    vi.useFakeTimers();
+    try {
+      const cdp = new FakeCdp();
+      const base = cdp.send.getMockImplementation()!;
+      (cdp as { send: unknown }).send = vi.fn(async (method: string): Promise<unknown> => (method === "Network.getResponseBody" ? new Promise((r) => setTimeout(() => r({ body: "late", base64Encoded: false }), 1900)) : base(method)));
+      const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);
+      const h = await target.ensurePage();
+      await vi.advanceTimersByTimeAsync(0);
+      cdp.emit("Network.requestWillBeSent", { requestId: "a", type: "Fetch", timestamp: 1, request: { url: "https://a.test/a", method: "GET" } });
+      cdp.emit("Network.responseReceived", { requestId: "a", type: "Fetch", response: { status: 200, mimeType: "application/json" } });
+      cdp.emit("Network.loadingFinished", { requestId: "a", timestamp: 2 });
+      const p = h.drainRequests!();
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      const out = await p;
+      expect(out).toHaveLength(1);
+      expect(out[0]!.status).toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a tab closed before the next drain leaves its finished entries to the target (no bodies), bounded at 300", async () => {
+    const cdp1 = new FakeCdp();
+    const cdp2 = new FakeCdp();
+    const p1 = fakePage();
+    const p2 = fakePage();
+    const sessions = [cdp1, cdp2];
+    const target = new PlaywrightTarget(fakeContext(async () => sessions.shift(), [p1, p2]) as never);
+    await target.pageHandles();
+    for (let i = 0; i < 5; i++) await tick();
+    for (let i = 0; i < 3; i++) {
+      cdp1.emit("Network.requestWillBeSent", { requestId: `a${i}`, type: "Fetch", timestamp: 1, request: { url: `https://a.test/${i}`, method: "GET" } });
+      cdp1.emit("Network.loadingFinished", { requestId: `a${i}`, timestamp: 2 });
+    }
+    cdp2.emit("Network.requestWillBeSent", { requestId: "b", type: "Fetch", timestamp: 1, request: { url: "https://b.test/", method: "GET" } });
+    cdp2.emit("Network.loadingFinished", { requestId: "b", timestamp: 2 });
+    p1.emit("close");
+    const closed = target.drainClosedRequests();
+    expect(closed.requests.map((r) => r.url)).toEqual(["https://a.test/0", "https://a.test/1", "https://a.test/2"]);
+    expect(closed.dropped).toBeUndefined();
+    expect(target.drainClosedRequests()).toEqual({ requests: [] });
+    // The other tab is still drained through its handle.
+    const handles = await target.pageHandles();
+    expect((await handles[0]!.page.drainRequests!()).map((r) => r.url)).toEqual(["https://b.test/"]);
+    for (let i = 0; i < 310; i++) {
+      cdp2.emit("Network.requestWillBeSent", { requestId: `c${i}`, type: "Fetch", timestamp: 1, request: { url: `https://b.test/c${i}`, method: "GET" } });
+      cdp2.emit("Network.loadingFinished", { requestId: `c${i}`, timestamp: 2 });
+    }
+    p2.emit("close");
+    const again = target.drainClosedRequests();
+    expect(again.requests).toHaveLength(300);
+    expect(again.dropped).toBe(10);
+  });
+
   it("caps the failed-request ring at 50 and each entry at 200 chars", async () => {
     const cdp = new FakeCdp();
     const target = new PlaywrightTarget(fakeContext(async () => cdp, [fakePage()]) as never);

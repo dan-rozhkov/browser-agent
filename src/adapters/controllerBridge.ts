@@ -19,6 +19,7 @@ export function controllerBridge(c: BrowserController): BrowserBridge {
     captureFixture: (opts) => c.captureFixture(opts),
     releaseFixture: (token) => c.releaseFixture(token),
     clearActEmulation: () => c.clearActEmulation(),
+    requests: async () => JSON.stringify(await c.requests()),
     startJournal: (opts) => c.startJournal(opts),
     stopJournal: (token) => c.stopJournal(token),
     captureCheckpoint: (token) => c.captureCheckpoint(token),

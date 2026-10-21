@@ -299,6 +299,17 @@ describe("runBrowseAgent: trace", () => {
     expect(t.console.map((e) => e.text)).toEqual(["TypeError: x"]);
   });
 
+  it("with a bridge that has requests, the trace gets them (also the last drain) and without it has none", async () => {
+    const steps: Step[] = [{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }];
+    let n = 0;
+    const withReq: BrowserBridge = { ...shotBrowser(), requests: async () => JSON.stringify({ requests: n++ === 1 ? [{ at: 1, method: "GET", url: "https://a.test/api?token=s" }] : [] }) };
+    const { t } = await traced(steps, withReq, { url: "https://a.test/" });
+    expect(n).toBeGreaterThanOrEqual(2);
+    expect(t.requests!.map((r) => r.url)).toEqual(["https://a.test/api?token=[redacted]"]);
+    const { t: none } = await traced(steps, shotBrowser(), { url: "https://a.test/" });
+    expect(none.requests).toBeUndefined();
+  });
+
   it("the trace is not in the prompt the model gets", async () => {
     const { model, seen } = scripted([{ calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }]);
     await runBrowseAgent("goal", { model, browser: shotBrowser(), trace: {} });

@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { mergeCarriedDialogs } from "../../src/shared/dialogs.js";
 import {
   BROWSE_TRACE_ASSET_PATH,
+  BROWSE_TRACE_REQUEST_BODY_MAX_CHARS,
+  redactTraceRequest,
+  redactTraceUrl,
   BROWSE_TRACE_ID,
   mapTraceFrames,
   parseBrowseTrace,
@@ -155,5 +158,103 @@ describe("mergeCarriedDialogs", () => {
     expect(mergeCarriedDialogs("[1]", d)).toBe("[1]");
     expect(mergeCarriedDialogs('{"a":1}', [])).toBe('{"a":1}');
     expect(mergeCarriedDialogs('{"a":1}', undefined)).toBe('{"a":1}');
+  });
+});
+
+describe("redactTraceRequest", () => {
+  it("redacts secret headers, url params and JSON body keys, and caps values", () => {
+    const out = redactTraceRequest({
+      at: 5, method: "POST", url: "https://a.test/x?token=abc&q=hi&Session=1&code=9#access_token=zz&a=1",
+      type: "XHR", status: 200, mimeType: "application/json", size: 10, durationMs: 4,
+      requestHeaders: { Authorization: "Bearer s", "X-Api-Key": "k", Accept: "a".repeat(900), "x-my-token": "t" },
+      responseHeaders: { "Set-Cookie": "sid=1", "content-type": "application/json" },
+      body: JSON.stringify({ user: "u", password: "p", nested: [{ apiKey: "k", ok: 1 }] }),
+    })!;
+    expect(out.url).toBe("https://a.test/x?token=[redacted]&q=hi&Session=[redacted]&code=[redacted]#access_token=[redacted]&a=1");
+    expect(out.type).toBe("xhr");
+    expect(out.requestHeaders).toEqual({ Authorization: "[redacted]", "X-Api-Key": "[redacted]", Accept: "a".repeat(500), "x-my-token": "[redacted]" });
+    expect(out.responseHeaders).toEqual({ "Set-Cookie": "[redacted]", "content-type": "application/json" });
+    expect(JSON.parse(out.responseBody!)).toEqual({ user: "u", password: "[redacted]", nested: [{ apiKey: "[redacted]", ok: 1 }] });
+    expect(out.bodyTruncated).toBeUndefined();
+  });
+
+  it("cuts long bodies and urls, limits headers to 60, and marks a source cut", () => {
+    const headers = Object.fromEntries(Array.from({ length: 80 }, (_, i) => [`h${i}`, "v"]));
+    const out = redactTraceRequest({ at: 1, method: "GET", url: `https://a.test/${"p".repeat(3000)}`, requestHeaders: headers, body: "z".repeat(5000) })!;
+    expect(out.url).toHaveLength(2000);
+    expect(Object.keys(out.requestHeaders!)).toHaveLength(60);
+    expect(out.responseBody).toHaveLength(BROWSE_TRACE_REQUEST_BODY_MAX_CHARS);
+    expect(out.bodyTruncated).toBe(true);
+    const cut = redactTraceRequest({ at: 1, method: "GET", url: "u", body: "short", bodyTruncated: true })!;
+    expect(cut).toMatchObject({ responseBody: "short", bodyTruncated: true });
+    // Form bodies lose secret fields; non-JSON text stays.
+    expect(redactTraceRequest({ at: 1, method: "POST", url: "u", mimeType: "application/x-www-form-urlencoded", body: "a=1&password=2" })!.responseBody).toBe("a=1&password=[redacted]");
+  });
+
+  it("JSON bodies: a secret-named key loses its whole subtree, after a BOM or XSSI prefix", () => {
+    const body = (b: string, mimeType = "application/json") => redactTraceRequest({ at: 1, method: "GET", url: "u", mimeType, body: b })!.responseBody!;
+    expect(body(JSON.stringify({ user: "u", auth: { a: 1, list: [1, 2] }, sessionId: "s", zipcode: "1", n: [{ code: 7 }] }))).toBe('{"user":"u","auth":"[redacted]","sessionId":"[redacted]","zipcode":"1","n":[{"code":"[redacted]"}]}');
+    expect(body(`\uFEFF{"apiKey":"k1","a":1}`)).toBe('{"apiKey":"[redacted]","a":1}');
+    expect(body(`)]}',\n{"secret":"s","a":1}`, "text/plain")).toBe('{"secret":"[redacted]","a":1}');
+  });
+
+  it("a body that does not parse and has a secret-looking word is replaced as a whole; else it is kept", () => {
+    const r = (b: string, mimeType = "application/json") => redactTraceRequest({ at: 1, method: "GET", url: "u", mimeType, body: b })!;
+    for (const b of ['{"user":"u","accessToken":"abc.def.gh","data":{"n":12', 'cb({"password":"p"})', "[INFO] token=abc", "var apiKey = 'x';"]) {
+      const out = r(b);
+      expect(out.responseBody).toBe("[redacted: unparsed body with a secret-looking key]");
+      expect(out.bodyTruncated).toBeUndefined();
+    }
+    expect(r('{"user":"u","n":12,"x":[1').responseBody).toBe('{"user":"u","n":12,"x":[1');
+    expect(r("hello world", "text/plain").responseBody).toBe("hello world");
+    expect(r("a=1&password=2", "application/x-www-form-urlencoded").responseBody).toBe("a=1&password=[redacted]");
+  });
+
+  it("one key rule: secret words as whole parts (snake, kebab, camel), not inside other words", () => {
+    const u = (q: string) => redactTraceUrl(`https://a.test/?${q}`);
+    expect(u("design=1&zipcode=2&author=3&sig=4&code=5&auth=6&auth_code=7&x-sig=8&Signature=9&sessionid=10&sessionId=11&x-session-id=12&userSid=13&Code=14")).toBe(
+      "https://a.test/?design=1&zipcode=2&author=3&sig=[redacted]&code=[redacted]&auth=[redacted]&auth_code=[redacted]&x-sig=[redacted]&Signature=[redacted]&sessionid=[redacted]&sessionId=[redacted]&x-session-id=[redacted]&userSid=[redacted]&Code=[redacted]",
+    );
+    const h = redactTraceRequest({ at: 1, method: "GET", url: "u", requestHeaders: { "X-Session-Id": "s", "x-sig": "1", "x-author": "me" } })!.requestHeaders;
+    expect(h).toEqual({ "X-Session-Id": "[redacted]", "x-sig": "[redacted]", "x-author": "me" });
+  });
+
+  it("strips userinfo from urls and redacts url-valued headers", () => {
+    expect(redactTraceUrl("https://user:pw@a.test/p?token=1")).toBe("https://a.test/p?token=[redacted]");
+    const out = redactTraceRequest({
+      at: 1, method: "GET", url: "https://u:p@a.test/",
+      requestHeaders: { Referer: "https://a.test/x?code=1&q=2", Origin: "https://a.test", "x-next": "https://b.test/?auth=z", "x-plain": "no url?auth=z" },
+      responseHeaders: { Location: "/cb?access_token=zz", "Content-Location": "https://a.test/?sig=1" },
+    })!;
+    expect(out.url).toBe("https://a.test/");
+    expect(out.requestHeaders).toEqual({ Referer: "https://a.test/x?code=[redacted]&q=2", Origin: "https://a.test", "x-next": "https://b.test/?auth=[redacted]", "x-plain": "no url?auth=z" });
+    // A relative Location is a url header too.
+    expect(out.responseHeaders).toEqual({ Location: "/cb?access_token=[redacted]", "Content-Location": "https://a.test/?sig=[redacted]" });
+  });
+
+  it("returns undefined for a value that is not a request, and never throws", () => {
+    expect(redactTraceRequest(null)).toBeUndefined();
+    expect(redactTraceRequest({ at: "1", method: "GET", url: "u" })).toBeUndefined();
+    expect(redactTraceRequest({ at: 1, method: "GET" })).toBeUndefined();
+  });
+});
+
+describe("parseBrowseTrace: actions and requests", () => {
+  const base = { format: "sideform.browse-trace", version: 1, id: "t1", goal: "g", startedAt: 1, endedAt: 2, status: "done", steps: [], frames: [], console: [], network: [] };
+  const step = { index: 0, tool: "browse_act", startedAt: 1, endedAt: 2, ok: true };
+  it("accepts valid actions and requests", () => {
+    const t = { ...base, steps: [{ ...step, actions: [{ action: "click", ok: true }, { action: "type", ok: false, error: "x" }] }], requests: [{ at: 1, method: "GET", url: "u", status: 200, requestHeaders: { a: "b" }, bodyTruncated: false }], extra: 1 };
+    expect(parseBrowseTrace(t)).toEqual({ trace: t });
+  });
+  it("rejects malformed actions", () => {
+    for (const actions of ["x", [null], [{ action: 1, ok: true }], [{ action: "a", ok: "yes" }], [{ action: "a", ok: true, error: 3 }]]) {
+      expect(parseBrowseTrace({ ...base, steps: [{ ...step, actions }] })).toEqual({ error: "steps[0]: invalid" });
+    }
+  });
+  it("rejects malformed requests", () => {
+    const bad = [{ at: 1, method: "GET" }, { at: 1, method: "GET", url: "u", requestHeaders: { a: 1 } }, { at: 1, method: "GET", url: "u", status: "200" }, { at: 1, method: "GET", url: "u", bodyTruncated: 1 }];
+    for (const r of bad) expect(parseBrowseTrace({ ...base, requests: [r] })).toEqual({ error: "requests[0]: invalid" });
+    expect(parseBrowseTrace({ ...base, requests: "x" })).toEqual({ error: "requests: expected an array" });
+    expect(parseBrowseTrace({ ...base, requests: Array.from({ length: 2001 }, () => ({ at: 1, method: "GET", url: "u" })) })).toEqual({ error: "requests: too many entries" });
   });
 });

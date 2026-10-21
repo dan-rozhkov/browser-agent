@@ -35,6 +35,12 @@ describe("controllerBridge", () => {
     expect(fake.assert).toHaveBeenCalledWith(args);
   });
 
+  it("requests resolves to the JSON of the controller's requests()", async () => {
+    const fake = { requests: vi.fn(async () => ({ requests: [{ at: 1, method: "GET", url: "https://a.test" }], dropped: 2 })) };
+    const bridge = controllerBridge(fake as unknown as BrowserController);
+    expect(JSON.parse((await bridge.requests?.()) ?? "")).toEqual({ requests: [{ at: 1, method: "GET", url: "https://a.test" }], dropped: 2 });
+  });
+
   it("forwards the checkpoint journal methods", async () => {
     const fake = {
       startJournal: vi.fn(() => "journal-7"),

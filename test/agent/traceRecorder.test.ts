@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBrowseTraceRecorder, type BrowseTraceRecorderOptions } from "../../src/agent/traceRecorder.js";
 import type { QaResult } from "../../src/agent/qaTypes.js";
 import { parseBrowseTrace } from "../../src/shared/trace.js";
@@ -41,14 +41,15 @@ describe("createBrowseTraceRecorder", () => {
     expect(make().id).not.toBe(make().id);
   });
 
-  it("captureAfter decides which calls get a frame; failed calls get none by default", async () => {
+  it("captureAfter decides which calls get a frame; a failed call gets one too", async () => {
     let n = 0;
     const r = make({ capture: async () => (n++, { imageData: IMG }) });
     await r.onToolCall({ toolName: "browse_open", input: {} })({ output: '{"url":"u"}' });
     await r.onToolCall({ toolName: "browse_tabs", input: { action: "switch" } })({ output: "{}" });
     await r.onToolCall({ toolName: "browse_act", input: {} })({ output: '{"error":"no such element"}' });
     await r.onToolCall({ toolName: "browse_act", input: {} })({ error: new Error("boom") });
-    expect(n).toBe(2);
+    // The second failure in a row gets no frame.
+    expect(n).toBe(3);
     const r2 = make({ capture: async () => ({ imageData: IMG }), captureAfter: (tool) => tool === "browse_read" });
     await r2.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
     expect(r2.finish({ status: "done" }).frames).toHaveLength(1);
@@ -157,7 +158,7 @@ describe("createBrowseTraceRecorder", () => {
     expect(await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" })).toEqual({});
   });
 
-  it("default captureAfter: act except wait, tabs only for switch/close/new, open; never a failed call", async () => {
+  it("default captureAfter: act except wait, tabs only for switch/close/new, open; a failed call too", async () => {
     const taken: string[] = [];
     const r = make({ capture: async () => (taken.push("x"), { imageData: IMG }) });
     const run = async (tool: string, input: unknown) => { const n = taken.length; await r.onToolCall({ toolName: tool, input })({ output: "{}" }); return taken.length > n; };
@@ -169,6 +170,79 @@ describe("createBrowseTraceRecorder", () => {
     expect(await run("browse_tabs", { action: "close", tabId: 1 })).toBe(true);
     expect(await run("browse_open", { url: "u" })).toBe(true);
     expect(await run("browse_read", {})).toBe(false);
+  });
+
+  it("default captureAfter: failed open, act, tabs switch get a frame; a failed lone wait and tabs list do not", async () => {
+    const taken: string[] = [];
+    const r = make({ capture: async () => (taken.push("x"), { imageData: IMG }) });
+    const ok = () => r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+    const fail = async (tool: string, input: unknown) => { const n = taken.length; await r.onToolCall({ toolName: tool, input })({ output: '{"error":"nope"}' }); const got = taken.length > n; await ok(); return got; };
+    expect(await fail("browse_open", { url: "u" })).toBe(true);
+    expect(await fail("browse_act", { action: "click", target: "a" })).toBe(true);
+    expect(await fail("browse_act", { action: "wait" })).toBe(false);
+    expect(await fail("browse_tabs", { action: "switch", tabId: 3 })).toBe(true);
+    expect(await fail("browse_tabs", { action: "list" })).toBe(false);
+    expect(await fail("browse_read", {})).toBe(false);
+  });
+
+  it("consecutive failures get one frame; a success or an unframed step resets it; validation refusals get none", async () => {
+    const taken: string[] = [];
+    const r = make({ capture: async () => (taken.push("x"), { imageData: IMG }) });
+    const run = async (tool: string, input: unknown, output: unknown) => { const n = taken.length; await r.onToolCall({ toolName: tool, input })({ output: JSON.stringify(output) }); return taken.length > n; };
+    expect(await run("browse_act", { action: "click" }, { error: "no element" })).toBe(true);
+    expect(await run("browse_act", { action: "click" }, { error: "no element" })).toBe(false);
+    expect(await run("browse_act", { action: "click" }, { ok: true })).toBe(true);
+    expect(await run("browse_act", { action: "click" }, { error: "no element" })).toBe(true);
+    for (const error of ['browse_act: "actions" accepts at most 10 entries.', 'browse_act: "actions" must contain at least 1 entry.', 'browse_act: action "type" requires a non-empty "text" field.', "browse_act: actions[2] must be an object.", "Unknown browse tool: x."]) {
+      expect(await run("browse_act", { action: "click" }, { ok: true })).toBe(true);
+      expect(await run("browse_act", { action: "type" }, { error })).toBe(false);
+    }
+    // A custom captureAfter decides alone.
+    const custom: string[] = [];
+    const r2 = make({ capture: async () => (custom.push("x"), { imageData: IMG }), captureAfter: () => true });
+    await r2.onToolCall({ toolName: "browse_act", input: {} })({ output: '{"error":"a"}' });
+    await r2.onToolCall({ toolName: "browse_act", input: {} })({ output: '{"error":"a"}' });
+    expect(custom).toHaveLength(2);
+  });
+
+  it("a failed step that typed a secret still gets no frame; one timeout still disables captures", async () => {
+    let n = 0;
+    const r = make({ capture: () => (n++, new Promise(() => {})), captureTimeoutMs: 5 });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", target: "Password", text: "p" } })({ output: '{"error":"x"}' });
+    expect(n).toBe(0);
+    await r.onToolCall({ toolName: "browse_open", input: { url: "u" } })({ output: '{"error":"x"}' });
+    await r.onToolCall({ toolName: "browse_open", input: { url: "u" } })({ output: '{"error":"x"}' });
+    expect(n).toBe(1);
+  });
+
+  it("a batched browse_act records one entry per action that ran, with the failing one", async () => {
+    const r = make();
+    const input = { actions: [{ action: "click", target: "a" }, { action: "type", target: "Password", text: "p" }, { target: "b" }, { action: "press", key: "Enter" }] };
+    await r.onToolCall({ toolName: "browse_act", input })({ output: JSON.stringify({ results: [{ ok: true }, { ok: true }, { error: "not found" }], completed: 2, stoppedAt: 2, error: "not found" }) });
+    await r.onToolCall({ toolName: "browse_act", input: { actions: [{ action: "click" }, { action: "wait" }] } })({ output: JSON.stringify({ results: [{}, {}], completed: 2 }) });
+    await r.onToolCall({ toolName: "browse_act", input })({ output: JSON.stringify({ error: 'browse_act: "actions" accepts at most 10 entries.' }) });
+    await r.onToolCall({ toolName: "browse_act", input })({ error: new Error("boom") });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "click" } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { actions: [{ action: "click" }, { action: "click" }] } })({ output: JSON.stringify({ results: [{}], completed: 0, stoppedAt: 0, error: "batch deadline reached." }) });
+    const t = r.finish({ status: "done" });
+    expect(t.steps[0]!.ok).toBe(false);
+    expect(t.steps[0]!.actions).toEqual([{ action: "click", ok: true }, { action: "type", ok: true }, { action: "act", ok: false, error: "not found" }]);
+    expect(t.steps[1]!.actions).toEqual([{ action: "click", ok: true }, { action: "wait", ok: true }]);
+    expect(t.steps[2]!.actions).toBeUndefined();
+    expect(t.steps[3]!.actions).toBeUndefined();
+    expect(t.steps[4]!.actions).toBeUndefined();
+    expect(t.steps[5]!.actions).toEqual([{ action: "click", ok: false, error: "batch deadline reached." }]);
+    expect(parseBrowseTrace(JSON.parse(JSON.stringify(t)))).toEqual({ trace: t });
+  });
+
+  it("a validation error in the middle of a batch (after actions ran) still gets its failure frame", async () => {
+    const taken: string[] = [];
+    const r = make({ capture: async () => (taken.push("x"), { imageData: IMG }) });
+    const run = async (output: unknown) => { const n = taken.length; await r.onToolCall({ toolName: "browse_act", input: { actions: [{}, {}] } })({ output: JSON.stringify(output) }); const got = taken.length > n; await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" }); return got; };
+    const error = "browse_act: actions[1] must be an object.";
+    expect(await run({ results: [{ ok: true }, { error }], completed: 1, stoppedAt: 1, error })).toBe(true);
+    expect(await run({ results: [{ error }], completed: 0, stoppedAt: 0, error })).toBe(false);
+    expect(await run({ error: 'browse_act: "actions" accepts at most 10 entries.' })).toBe(false);
   });
 
   it("a step that typed a secret gets no frame; the redaction remembers a click on a secret field", async () => {
@@ -306,6 +380,138 @@ describe("createBrowseTraceRecorder", () => {
     it("keeps error and ms of a step", () => {
       const t = make().finish({ status: "done", qa: qaOf([{ index: 1, tool: "browse_read", args: {}, ok: false, error: "boom", ms: 5 } as never]) });
       expect(t.qa!.steps[0]).toEqual({ index: 1, tool: "browse_read", args: "[omitted]", ok: false, error: "boom", ms: 5 });
+    });
+  });
+
+  describe("requests", () => {
+    const req = (at: number, extra: Record<string, unknown> = {}) => ({ at, method: "GET", url: `https://a.test/${at}`, ...extra });
+
+    it("has no requests field without the option", () => {
+      expect(make().finish({ status: "done" }).requests).toBeUndefined();
+    });
+
+    it("drains at the end of each step, redacts, and assigns stepIndex by time, else the finishing step", async () => {
+      // clock: start 1010, each now() call +10.
+      const batches: unknown[] = [
+        JSON.stringify({ requests: [req(1025, { url: "https://a.test/x?token=s", requestHeaders: { Cookie: "c" } })], dropped: 1 }),
+        { requests: [req(1, { stepIndex: 99 }), { bad: true }] },
+      ];
+      const r = make({ requests: async () => batches.shift() });
+      await r.onToolCall({ toolName: "browse_open", input: {} })({ output: "{}" });
+      await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+      await r.flush();
+      const t = r.finish({ status: "done" });
+      expect(t.requests).toHaveLength(2);
+      expect(t.requests![0]).toMatchObject({ stepIndex: 0, url: "https://a.test/x?token=[redacted]", requestHeaders: { Cookie: "[redacted]" } });
+      // at=1 lies in no step: the finishing step (1).
+      expect(t.requests![1]).toMatchObject({ at: 1, stepIndex: 1 });
+      expect(t.dropped).toEqual({ requests: 1 });
+      expect(parseBrowseTrace(JSON.parse(JSON.stringify(t)))).toEqual({ trace: t });
+    });
+
+    it("drains before the step frame is taken", async () => {
+      const order: string[] = [];
+      const r = make({ requests: async () => (order.push("requests"), []), capture: async () => (order.push("capture"), { imageData: IMG }) });
+      await r.onToolCall({ toolName: "browse_open", input: {} })({ output: "{}" });
+      await r.flush();
+      expect(order.slice(0, 2)).toEqual(["capture", "requests"]);
+    });
+
+    it("the step does not wait for a slow drain, and drains never overlap, in step order", async () => {
+      let running = 0;
+      let maxRunning = 0;
+      const seen: number[] = [];
+      let n = 0;
+      const r = make({ requests: async () => { const i = n++; running++; maxRunning = Math.max(maxRunning, running); await new Promise((res) => setTimeout(res, 20)); running--; seen.push(i); return []; } });
+      const t0 = Date.now();
+      for (let i = 0; i < 3; i++) await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+      expect(Date.now() - t0).toBeLessThan(40);
+      await r.flush();
+      expect(maxRunning).toBe(1);
+      expect(seen).toEqual([0, 1, 2, 3]);
+    });
+
+    it("caps with maxRequests and counts the overflow", async () => {
+      let n = 0;
+      const r = make({ maxRequests: 2, requests: async () => ({ requests: n++ === 0 ? [req(1), req(2), req(3)] : [] }) });
+      await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+      await r.flush();
+      const t = r.finish({ status: "done" });
+      expect(t.requests).toHaveLength(2);
+      expect(t.dropped).toEqual({ requests: 1 });
+    });
+
+    it("flush drains once more; entries outside every step get no stepIndex", async () => {
+      let calls = 0;
+      const r = make({ requests: async () => (calls++ === 0 ? [] : [req(1), req(1025)]) });
+      await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+      await r.flush();
+      const t = r.finish({ status: "done" });
+      expect(t.requests!.map((e) => e.stepIndex)).toEqual([undefined, 0]);
+    });
+
+    it("stops calling after one timeout, and is not called when the signal is aborted", async () => {
+      let calls = 0;
+      const hung = make({ requests: () => (calls++, new Promise(() => {})) });
+      vi.useFakeTimers();
+      try {
+        await hung.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+        const f = hung.flush();
+        await vi.advanceTimersByTimeAsync(5100);
+        await f;
+        await hung.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+        await hung.flush();
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(calls).toBe(1);
+      expect(hung.finish({ status: "done" }).requests).toEqual([]);
+      // An aborted run schedules no drain at a step end, but flush still drains once.
+      let called = 0;
+      const ac = new AbortController();
+      ac.abort();
+      const r = make({ requests: async () => (called++, [{ at: 1, method: "GET", url: "https://a.test/last" }]) });
+      await r.onToolCall({ toolName: "browse_read", input: {} }, { signal: ac.signal })({ output: "{}" });
+      expect(called).toBe(0);
+      await r.flush(ac.signal);
+      expect(called).toBe(1);
+      expect(r.finish({ status: "aborted" }).requests).toHaveLength(1);
+    });
+
+    it("a drain already queued still runs after an abort", async () => {
+      const ac = new AbortController();
+      let release!: () => void;
+      let called = 0;
+      const r = make({ requests: async () => { called++; if (called === 1) await new Promise<void>((res) => { release = res; }); return []; } });
+      await r.onToolCall({ toolName: "browse_read", input: {} }, { signal: ac.signal })({ output: "{}" });
+      await r.onToolCall({ toolName: "browse_read", input: {} }, { signal: ac.signal })({ output: "{}" });
+      ac.abort();
+      await new Promise((res) => setTimeout(res, 5));
+      release();
+      await r.flush(ac.signal);
+      expect(called).toBe(3);
+    });
+
+    it("the flush drain has its own 2 s time box", async () => {
+      vi.useFakeTimers();
+      try {
+        const r = make({ requests: () => new Promise(() => {}) });
+        const f = r.flush();
+        await vi.advanceTimersByTimeAsync(2100);
+        await f;
+        expect(r.finish({ status: "done" }).requests).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a throwing or malformed source never reaches the host", async () => {
+      for (const src of [async () => { throw new Error("x"); }, async () => "not json", async () => 5]) {
+        const r = make({ requests: src });
+        await r.onToolCall({ toolName: "browse_read", input: {} })({ output: "{}" });
+        await r.flush();
+        expect(r.finish({ status: "done" }).requests).toEqual([]);
+      }
     });
   });
 });

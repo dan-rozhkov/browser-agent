@@ -99,8 +99,8 @@ export interface BrowseTraceRecorderOptions {
   labels?: Record<string, string>;
   /** Take a screenshot of the current page. Returns a data URL. */
   capture?: () => Promise<{ imageData: string; width?: number; height?: number; dialogs?: unknown[] } | undefined>;
-  /** Which finished calls get a "step" frame. Default (ok calls only): browse_open; browse_act except a lone
-   *  `wait`; browse_tabs switch/close/new. */
+  /** Which finished calls get a "step" frame. Default (a failed call too, since 2026-10-21): browse_open;
+   *  browse_act except a lone `wait`; browse_tabs switch/close/new. */
   captureAfter?: (tool: string, args: unknown, ok: boolean) => boolean;
   captureTimeoutMs?: number;  // default 4000; a throw = no frame, never an error. ONE timeout stops all later
                               // step captures (the screenshot may still hold the browser); lost and skipped
@@ -264,7 +264,50 @@ what to do with it.
 
 ## Not in scope
 
-- A log of ALL network requests (needs a new `BrowserPageHandle.drainRequests`
-  in the controller and the desktop handle). Today only failed requests.
+- A log of ALL network requests: done 2026-10-21 (see "v1 additions"). The desktop handle must implement
+  `BrowserPageHandle.drainRequests` itself.
 - `browse_task` (rollback-only tool) is not traced.
 - Retention of R2 traces (no TTL yet). Import of Playwright `trace.zip`.
+
+## v1 additions (2026-10-21)
+
+All additive and optional: no version bump, no new frame kinds. An older viewer keeps unknown fields
+(`parseBrowseTrace`).
+
+- **Frame after a failed action.** The default `captureAfter` also captures after a FAILED `browse_open`,
+  `browse_act` (not a lone `wait`) and `browse_tabs` `switch`/`close`/`new`, so a viewer shows the page at the
+  failure, except (default `captureAfter` only) a call refused by argument validation before it ran, and a second
+  failure in a row after a failure frame (one frame per run of failures). Unchanged: a step with redacted typed text gets no frame, and one capture timeout stops all later captures.
+- **`step.actions?: BrowseTraceAction[]`** (`{ action, ok, error? }`). For a batched `browse_act`, built from the result
+  `{ results, completed, stoppedAt?, error? }`: one ok entry per completed action, then the failing one at `stoppedAt`
+  (`ok: false`, its error, else the batch error). Actions after it never ran and are not listed; a viewer counts them
+  from `args.actions`. Absent when the call failed before the batch ran. Names come from the redacted `args`
+  ("act" when missing).
+- **`trace.requests?: BrowseTraceRequest[]`** and `dropped.requests`. Every request of the run: `at`, `stepIndex?`,
+  `method`, `url`, `type?`, `status?`, `error?`, `durationMs?`, `size?`, `mimeType?`, `requestHeaders?`,
+  `responseHeaders?`, `responseBody?`, `bodyTruncated?`.
+  - Source: `BrowserPageHandle.drainRequests?(): Promise<PageRequestEntry[]>` (raw; WebSocket, EventSource, Ping and
+    `data:` skipped; ring of 300; fetch/xhr text bodies fetched lazily at drain, each <= 1 s and 2 s in total (entries come back without the late bodies), cut to 16 KB (a longer JSON body no longer parses: see redaction); the adapter counts ring overflow and eviction (`droppedRequests?()`, added to `dropped.requests`); entries of a tab closed since the last drain come through `BrowserTarget.drainClosedRequests?()` (no bodies, at most 300); the
+    Playwright adapter implements it). `BrowserController.requests()` drains every known tab without the command
+    lock, <= 3 s, never throws. `BrowserBridge.requests?(): Promise<string>` returns the JSON of `{ requests, dropped? }`.
+  - Recorder: option `requests: () => Promise<unknown>` (string or object), `maxRequests` (500). Drained at the end of
+    each finished step in the background, AFTER the step frame (the step never waits for it; drains run one after
+    another through one queue); 5000 ms limit per drain (above the controller's 3000 ms), one timeout stops it;
+    skipped when the signal is aborted. `flush(signal?)` waits for the queue and drains once more (await it before
+    `finish`; `runBrowseAgent` does). A redirect hop is logged as its own entry (its status, no body: the body belongs
+    to the final hop, which shares the requestId). `stepIndex` = the step whose time span
+    holds `at`, else the step being finished (`flush`: none). `requests` is in the trace only when the option was given.
+  - Redaction (`redactTraceRequest`), one key rule (`isSecretName`) for body keys, header names and query params:
+    the args rule (substring `pass|secret|token|api_key|otp|cvv|card`), or `session|sid|auth|code|sig|signature` as a
+    whole part (split at `_ - .` and camelCase: `sessionId`, `x-session-id`, `auth` match; `zipcode`, `author`,
+    `design` do not). Headers `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`,
+    `x-auth-token`, `x-csrf-token` and secret-named ones become `"[redacted]"`; values <= 500 chars, at most 60
+    headers; values of `referer`, `location`, `content-location`, `origin` (and any absolute http(s) value) go
+    through `redactTraceUrl`. Url: `user:pass@` removed, secret-named query/fragment params redacted, <= 2000 chars.
+    Body: if it parses as JSON (after BOM / `)]}'`), a secret-named key loses its whole subtree; a form body keeps its
+    field redaction; any other text (cut JSON, JSONP, script, plain) that contains a secret-looking word anywhere
+    is replaced by `"[redacted: unparsed body with a secret-looking key]"`, else kept. Cut to 4000 chars
+    (`bodyTruncated`).
+  - A flush after an abort still drains once (own 2000 ms limit); an aborted run schedules no new step drains, and a
+    queued drain still runs. The default failure frame is also skipped for an argument-validation error only when no
+    action ran (a validation error in the middle of a batch gets its frame).

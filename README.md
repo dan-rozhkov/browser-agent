@@ -667,9 +667,9 @@ const trace = rec.finish({ status: result.status, answer: result.answer, qa: res
 
 Format (`BrowseTrace`): `format`, `version`, `id` (`BROWSE_TRACE_ID`), `goal`, `startedAt`,
 `endedAt`, `status`, `answer?`, `error?`, `labels?`, `steps[]`, `frames[]`, `console[]`,
-`network[]`, `qa?`, `dropped?`.
+`network[]`, `requests?`, `qa?`, `dropped?`.
 
-- `steps`: `{ index (0-based, call order), tool, args, startedAt, endedAt, ok, error?, output? }`.
+- `steps`: `{ index (0-based, call order), tool, args, startedAt, endedAt, ok, error?, output?, actions? }`. For a batched `browse_act`, `actions` is `{ action, ok, error? }[]`: the actions that ran and the one that stopped the batch (later ones never ran).
   `args` are redacted: the value of a key that matches `/pass(word)?|secret|token|api[-_]?key|otp|cvv|card/i`
   becomes `"[redacted]"`, recursively, and strings over 2000 chars are cut. Pass `redactArgs`
   to use your own rule. Typed text is redacted too: for `browse_act` `type`/`fill` (also each entry of `actions`),
@@ -679,9 +679,9 @@ Format (`BrowseTrace`): `format`, `version`, `id` (`BROWSE_TRACE_ID`), `goal`, `
   target after a click on a secret field is redacted. A call that names the field only by `index` (the click too)
   has no word to match, so its text stays visible: use a custom `redactArgs` if you need more. `output` has the image data removed and is cut at 4000 chars.
 - `frames`: `{ id, at, stepIndex?, kind: "step" | "screenshot" | "final", src, width?, height? }`.
-  A `"step"` frame is taken with `capture` after a successful `browse_open`, a successful `browse_act`
-  (not a lone `wait`) and a successful `browse_tabs` `switch`, `close` or `new` (not `list`); `captureAfter`
-  changes this. A step whose typed text was redacted gets no frame (it would show the secret). A `browse_screenshot` result becomes a `"screenshot"`
+  A `"step"` frame is taken with `capture` after `browse_open`, `browse_act` (not a lone `wait`) and
+  `browse_tabs` `switch`, `close` or `new` (not `list`), also when the call failed (the viewer shows the page at
+  the failure (not for a call refused by argument validation, and one frame per run of consecutive failures); `captureAfter` changes this. A step whose typed text was redacted gets no frame (it would show the secret). A `browse_screenshot` result becomes a `"screenshot"`
   frame (raw base64 is turned into a data URL). A capture that throws gives no frame and no error. A capture that
   takes more than `captureTimeoutMs` (4000) also gives no frame, and it stops all later step captures of the run (the
   screenshot may still hold the browser). No step capture is taken after the run is aborted, and an abort during
@@ -690,6 +690,12 @@ Format (`BrowseTrace`): `format`, `version`, `id` (`BROWSE_TRACE_ID`), `goal`, `
 - `console` / `network`: `{ at, stepIndex?, text }`, from the `consoleErrors` and `failedRequests`
   of tool outputs (also the entries of a batched `browse_act`) and from `qa`; deduped over the whole run. The controller's own `consoleErrorsDropped` / `failedRequestsDropped` counts
   are added to `dropped.console` / `dropped.network`.
+- `requests`: every network request of the run (`BrowseTraceRequest`: `at`, `stepIndex?`, `method`, `url`, `type?`,
+  `status?`, `error?`, `durationMs?`, `size?`, `mimeType?`, `requestHeaders?`, `responseHeaders?`, `responseBody?`,
+  `bodyTruncated?`). Pass the option `requests: () => bridge.requests()` (`BrowserBridge.requests`, from
+  `BrowserController.requests()`; the page handle needs `drainRequests`, the Playwright adapter has it) and await
+  `rec.flush()` before `finish`. Headers, url params (userinfo too) and bodies are redacted (`redactTraceRequest`, one key rule: secret substrings, or `session`/`sid`/`auth`/`code`/`sig`/`signature` as a whole name part). A JSON body loses the subtree of a secret-named key; a body that does not parse (cut at 16 KB, JSONP, text) with a secret-looking word is replaced as a whole. Bodies exist
+  only for fetch/xhr text responses and are cut to 4000 chars. `flush()` still drains once after an abort. `maxRequests` (500); the overflow is in `dropped.requests`.
 - Caps (`maxSteps` 300, `maxFrames` 150, `maxLogEntries` 300 per log): the oldest frames go first
   (the first frame stays); steps and log entries past the cap are dropped. Counts are in `dropped`.
 - Calls still pending at `finish(...)` become steps with `ok: false` and `error: "unfinished"`. Steps are in call

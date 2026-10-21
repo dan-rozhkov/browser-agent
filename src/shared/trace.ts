@@ -19,6 +19,25 @@ export const BROWSE_TRACE_OUTPUT_MAX_CHARS = 4000;
 /** Strings longer than this are cut in the recorded `args`. */
 export const BROWSE_TRACE_ARG_STRING_MAX_CHARS = 2000;
 
+/** The body of a request in the log is cut to this many chars. */
+export const BROWSE_TRACE_REQUEST_BODY_MAX_CHARS = 4000;
+/** The url of a request in the log is cut to this many chars. */
+export const BROWSE_TRACE_REQUEST_URL_MAX_CHARS = 2000;
+const REQUEST_HEADER_VALUE_MAX_CHARS = 500;
+const REQUEST_HEADERS_MAX = 60;
+
+/** A step lists at most this many `actions`. */
+export const BROWSE_TRACE_MAX_ACTIONS = 100;
+
+/** One entry of a batched `browse_act`: an action that ran or was skipped. */
+export interface BrowseTraceAction {
+  /** `action` of the entry, "act" when missing. */
+  action: string;
+  ok: boolean;
+  /** Capped at 2000 chars. */
+  error?: string;
+}
+
 export interface BrowseTraceStep {
   /** 0-based, call order. */
   index: number;
@@ -32,6 +51,12 @@ export interface BrowseTraceStep {
   error?: string;
   /** JSON/text of the result with the image data removed, capped at 4000 chars. */
   output?: string;
+  /**
+   * A batched `browse_act`: one entry per action that ran (ok), and the one that stopped the batch (not ok).
+   * Actions after it never ran and are not listed (a viewer counts them from `args.actions`). Absent when
+   * the call failed before the batch ran, and for every other tool.
+   */
+  actions?: BrowseTraceAction[];
 }
 
 export interface BrowseTraceFrame {
@@ -52,6 +77,32 @@ export interface BrowseTraceLogEntry {
   at: number;
   stepIndex?: number;
   text: string;
+}
+
+/** One network request of the run (docs/specs/2026-10-20-browse-run-trace-design.md, "v1 additions"). */
+export interface BrowseTraceRequest {
+  /** Epoch ms when the request started. */
+  at: number;
+  stepIndex?: number;
+  method: string;
+  /** Redacted (secret-looking query values), capped at 2000 chars. */
+  url: string;
+  /** CDP resource type, lower case: document, xhr, fetch, script, stylesheet, image, font, media, other... */
+  type?: string;
+  status?: number;
+  /** Network error text (net::ERR_...). */
+  error?: string;
+  durationMs?: number;
+  /** Encoded bytes received. */
+  size?: number;
+  mimeType?: string;
+  /** Redacted. */
+  requestHeaders?: Record<string, string>;
+  /** Redacted. */
+  responseHeaders?: Record<string, string>;
+  /** fetch/xhr text responses only (json, text, xml, javascript, form), redacted, capped. */
+  responseBody?: string;
+  bodyTruncated?: boolean;
 }
 
 export interface BrowseTrace {
@@ -79,8 +130,10 @@ export interface BrowseTrace {
   /** Failed requests (`<METHOD> <status|error> <origin><path>`). */
   network: BrowseTraceLogEntry[];
   qa?: QaResult;
+  /** Every network request of the run, when the recorder had a `requests` source. */
+  requests?: BrowseTraceRequest[];
   /** How many entries the recorder's caps left out. */
-  dropped?: { steps?: number; frames?: number; console?: number; network?: number };
+  dropped?: { steps?: number; frames?: number; console?: number; network?: number; requests?: number };
 }
 
 /** Cuts `text` to `max` chars. */
@@ -156,6 +209,142 @@ export function redactTraceArgs(args: unknown): unknown {
   return redactTraceArgsTracked(args, { secretFocus: false }).value;
 }
 
+const SECRET_HEADER = /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token)$/i;
+const SECRET_PART = new Set(["session", "sid", "auth", "code", "sig", "signature"]);
+const REDACTED = "[redacted]";
+
+/**
+ * The one key rule of the request log (body keys, header names, query params): the args rule (`SECRET_KEY`, a
+ * substring), or a name that has `session`, `sid`, `auth`, `code`, `sig` or `signature` as a whole part. Parts are
+ * split at `_`, `-`, `.` and camelCase boundaries: `sessionId`, `x-session-id`, `auth`, `code` match; `zipcode`,
+ * `author`, `design` do not.
+ */
+function isSecretName(name: string): boolean {
+  if (SECRET_KEY.test(name) || /^(session|signature)/i.test(name)) return true;
+  return name.split(/[_\-.\s]+|(?<=[a-z0-9])(?=[A-Z])/).some((part) => SECRET_PART.has(part.toLowerCase()));
+}
+
+/** `a=1&b=2` with the value of each secret-named param replaced. */
+function redactParams(params: string): string {
+  return params
+    .split("&")
+    .map((part) => {
+      const eq = part.indexOf("=");
+      if (eq < 0) return part;
+      let name = part.slice(0, eq);
+      try {
+        name = decodeURIComponent(name);
+      } catch {
+        // keep the raw name
+      }
+      return isSecretName(name) ? `${part.slice(0, eq + 1)}${REDACTED}` : part;
+    })
+    .join("&");
+}
+
+/** Redacts the userinfo and the secret-looking query values (and fragment params) of a url, then caps it. */
+export function redactTraceUrl(url: string): string {
+  const hash = url.indexOf("#");
+  // `user:pass@` in front of the host goes.
+  const base = (hash < 0 ? url : url.slice(0, hash)).replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, "$1");
+  const frag = hash < 0 ? "" : url.slice(hash);
+  const q = base.indexOf("?");
+  const out = q < 0 ? base : `${base.slice(0, q + 1)}${redactParams(base.slice(q + 1))}`;
+  // A fragment that looks like `#access_token=...&x=1` is redacted the same way.
+  const fragOut = frag.includes("=") ? `#${redactParams(frag.slice(1))}` : frag;
+  return capTraceText(out + fragOut, BROWSE_TRACE_REQUEST_URL_MAX_CHARS);
+}
+
+/** Headers whose value is a url (a query in it can hold a token). */
+const URL_HEADER = /^(referer|location|content-location|origin)$/i;
+
+function redactHeaders(headers: unknown): Record<string, string> | undefined {
+  if (!isObject(headers)) return undefined;
+  const out: Record<string, string> = {};
+  let n = 0;
+  for (const [name, value] of Object.entries(headers)) {
+    if (n >= REQUEST_HEADERS_MAX) break;
+    if (typeof value !== "string") continue;
+    const isUrl = URL_HEADER.test(name) || /^https?:\/\//i.test(value);
+    out[name] = SECRET_HEADER.test(name) || isSecretName(name) ? REDACTED : capTraceText(isUrl ? redactTraceUrl(value) : value, REQUEST_HEADER_VALUE_MAX_CHARS);
+    n++;
+  }
+  return out;
+}
+
+function redactJsonKeys(value: unknown, depth: number): unknown {
+  if (!value || typeof value !== "object") return value;
+  if (depth >= MAX_ARG_DEPTH) return Array.isArray(value) ? [] : {};
+  if (Array.isArray(value)) return value.map((v) => redactJsonKeys(v, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value)) out[key] = isSecretName(key) ? REDACTED : redactJsonKeys(v, depth + 1);
+  return out;
+}
+
+const UNPARSED_BODY = "[redacted: unparsed body with a secret-looking key]";
+
+/**
+ * Redacts a text body. JSON (after a BOM and an anti-XSSI prefix): secret-named keys lose their whole subtree. Form
+ * bodies: secret-named fields. Any other text (cut JSON, JSONP, script, plain text) that has a secret-looking word
+ * anywhere is replaced as a whole; else it is kept. Then caps it.
+ */
+function redactBody(body: string, mimeType: string | undefined, alreadyCut: boolean): { text: string; truncated: boolean } {
+  const cleaned = body.replace(/^\uFEFF/, "").replace(/^\)\]\}',?\s*/, "").trim();
+  let text: string | undefined;
+  try {
+    if (cleaned !== "") text = JSON.stringify(redactJsonKeys(JSON.parse(cleaned), 0));
+  } catch {
+    // Not JSON.
+  }
+  if (text === undefined) {
+    if (mimeType !== undefined && /x-www-form-urlencoded/i.test(mimeType)) text = redactParams(body);
+    else if (SECRET_KEY.test(body)) return { text: UNPARSED_BODY, truncated: false };
+    else text = body;
+  }
+  const cut = text.length > BROWSE_TRACE_REQUEST_BODY_MAX_CHARS;
+  return { text: capTraceText(text, BROWSE_TRACE_REQUEST_BODY_MAX_CHARS), truncated: cut || alreadyCut };
+}
+
+/**
+ * Turns a raw request entry (the controller's `PageRequestEntry`, or the JSON of one) into a trace entry: the url,
+ * header values and body are redacted and capped. Returns undefined for a value that is not a request (no finite
+ * `at`, no string `method` or `url`). Never throws.
+ * - Headers named authorization, proxy-authorization, cookie, set-cookie, x-api-key, x-auth-token, x-csrf-token or
+ *   matching the args key rule: "[redacted]". Values are cut to 500 chars, at most 60 headers.
+ * - Header values that are urls (`referer`, `location`, `content-location`, `origin`, or any absolute http(s) value) go
+ *   through `redactTraceUrl`.
+ * - Url: `user:pass@` is removed; query (and fragment) params with a secret name (`isSecretName`) are "[redacted]".
+ * - A JSON `body` is parsed, a secret-named key loses its whole subtree and it is stringified again. A body that is not
+ *   JSON and has a secret-looking word (the args key rule) anywhere is replaced by a fixed text; a form body keeps
+ *   its field redaction; other text is kept. Cut to `BROWSE_TRACE_REQUEST_BODY_MAX_CHARS`; `bodyTruncated` is set
+ *   when anything was cut.
+ */
+export function redactTraceRequest(raw: unknown): BrowseTraceRequest | undefined {
+  try {
+    if (!isObject(raw) || !isNum(raw.at) || !isStr(raw.method) || !isStr(raw.url)) return undefined;
+    const out: BrowseTraceRequest = { at: raw.at, method: capTraceText(raw.method, 16), url: redactTraceUrl(raw.url) };
+    if (isStr(raw.type)) out.type = capTraceText(raw.type.toLowerCase(), 32);
+    if (isNum(raw.status)) out.status = raw.status;
+    if (isStr(raw.error)) out.error = capTraceText(raw.error, BROWSE_TRACE_ERROR_MAX_CHARS);
+    if (isNum(raw.durationMs)) out.durationMs = raw.durationMs;
+    if (isNum(raw.size)) out.size = raw.size;
+    if (isStr(raw.mimeType)) out.mimeType = capTraceText(raw.mimeType, 200);
+    const reqHeaders = redactHeaders(raw.requestHeaders);
+    if (reqHeaders) out.requestHeaders = reqHeaders;
+    const resHeaders = redactHeaders(raw.responseHeaders);
+    if (resHeaders) out.responseHeaders = resHeaders;
+    const body = isStr(raw.body) ? raw.body : isStr(raw.responseBody) ? raw.responseBody : undefined;
+    if (body !== undefined) {
+      const { text, truncated } = redactBody(body, out.mimeType, raw.bodyTruncated === true);
+      out.responseBody = text;
+      if (truncated) out.bodyTruncated = true;
+    } else if (raw.bodyTruncated === true) out.bodyTruncated = true;
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
 const DATA_URL = /^data:image\/(jpeg|png|webp);base64,/i;
 
 /**
@@ -196,6 +385,9 @@ const isStr = (v: unknown): v is string => typeof v === "string";
 const optNum = (v: unknown) => v === undefined || isNum(v);
 const optStr = (v: unknown) => v === undefined || isStr(v);
 
+const isStrRecord = (v: unknown) => isObject(v) && Object.values(v).every(isStr);
+const isAction = (a: unknown) => isObject(a) && isStr(a.action) && typeof a.ok === "boolean" && optStr(a.error);
+
 function listProblem(name: string, list: unknown, check: (entry: Record<string, unknown>) => boolean): string | undefined {
   if (!Array.isArray(list)) return `${name}: expected an array`;
   if (list.length > MAX_ENTRIES) return `${name}: too many entries`;
@@ -226,10 +418,19 @@ export function parseBrowseTrace(value: unknown): { trace: BrowseTrace } | { err
   if (value.qa !== undefined && (!isObject(value.qa) || !isStr(value.qa.outcome) || !Array.isArray(value.qa.steps))) return { error: "qa: invalid" };
   if (value.dropped !== undefined && (!isObject(value.dropped) || !Object.values(value.dropped).every(isNum))) return { error: "dropped: expected numbers" };
   const problem =
-    listProblem("steps", value.steps, (s) => isNum(s.index) && isStr(s.tool) && isNum(s.startedAt) && isNum(s.endedAt) && typeof s.ok === "boolean" && optStr(s.error) && optStr(s.output)) ??
+    listProblem("steps", value.steps, (s) => isNum(s.index) && isStr(s.tool) && isNum(s.startedAt) && isNum(s.endedAt) && typeof s.ok === "boolean" && optStr(s.error) && optStr(s.output) && (s.actions === undefined || (Array.isArray(s.actions) && s.actions.length <= BROWSE_TRACE_MAX_ACTIONS && s.actions.every(isAction)))) ??
     listProblem("frames", value.frames, (f) => isNum(f.id) && isNum(f.at) && optNum(f.stepIndex) && isStr(f.kind) && FRAME_KINDS.includes(f.kind) && isStr(f.src) && isFrameSrc(f.src) && optNum(f.width) && optNum(f.height)) ??
     listProblem("console", value.console, (e) => isNum(e.at) && optNum(e.stepIndex) && isStr(e.text)) ??
-    listProblem("network", value.network, (e) => isNum(e.at) && optNum(e.stepIndex) && isStr(e.text));
+    listProblem("network", value.network, (e) => isNum(e.at) && optNum(e.stepIndex) && isStr(e.text)) ??
+    (value.requests === undefined
+      ? undefined
+      : listProblem(
+          "requests",
+          value.requests,
+          (r) =>
+            isNum(r.at) && optNum(r.stepIndex) && isStr(r.method) && isStr(r.url) && optStr(r.type) && optNum(r.status) && optStr(r.error) && optNum(r.durationMs) && optNum(r.size) && optStr(r.mimeType) &&
+            (r.requestHeaders === undefined || isStrRecord(r.requestHeaders)) && (r.responseHeaders === undefined || isStrRecord(r.responseHeaders)) && optStr(r.responseBody) && (r.bodyTruncated === undefined || typeof r.bodyTruncated === "boolean"),
+        ));
   if (problem) return { error: problem };
   return { trace: value as unknown as BrowseTrace };
 }

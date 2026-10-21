@@ -605,6 +605,31 @@ async function readViewportSize(page: BrowserPageHandle): Promise<{ width: numbe
   return undefined;
 }
 
+/**
+ * One finished or failed network request of a page (raw: nothing redacted; the trace recorder redacts).
+ * Same fields as the trace's `BrowseTraceRequest` minus `stepIndex`, plus the raw body.
+ */
+export interface PageRequestEntry {
+  /** Epoch ms when the request started. */
+  at: number;
+  method: string;
+  url: string;
+  /** CDP resource type, lower case: document, xhr, fetch, script, stylesheet, image, font, media, other... */
+  type?: string;
+  status?: number;
+  /** Network error text (net::ERR_...). */
+  error?: string;
+  durationMs?: number;
+  /** Encoded bytes received. */
+  size?: number;
+  mimeType?: string;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  /** fetch/xhr text responses only, cut to 16 KB. */
+  body?: string;
+  bodyTruncated?: boolean;
+}
+
 /** A browser tab's page, as the controller needs to drive it. Electron-free
  * — window.ts supplies the real implementation over a WebContentsView. */
 export interface BrowserPageHandle {
@@ -728,6 +753,16 @@ export interface BrowserPageHandle {
    */
   drainFailedRequests?(): string[];
   /**
+   * Optional: drains (and clears) the requests that finished or failed since the last drain, oldest first, for
+   * the run trace's request log (`BrowserController.requests`). WebSocket, EventSource, Ping and `data:` URLs are
+   * skipped; a ring of at most 300 entries (the oldest go). Bodies only for fetch/xhr with a text-like mimeType
+   * (json, text, xml, javascript, form), fetched lazily AT DRAIN time (best effort: each fetch is limited to 1 s,
+   * a failure is ignored) and cut to 16 KB; the body phase of one drain is limited to 2 s in total. Never throws.
+   */
+  drainRequests?(): Promise<PageRequestEntry[]>;
+  /** Optional: drains and resets the count of request entries `drainRequests` could not keep (ring overflow, in-flight eviction). */
+  droppedRequests?(): number;
+  /**
    * Optional: Wave 1 speed (`2026-09-24-browse-speed-contract.md`).
    * Subscribes to this tab's navigation lifecycle (`did-start-navigation`,
    * `did-navigate`, `did-navigate-in-page`, `did-start-loading`) — fired
@@ -831,6 +866,12 @@ export interface BrowserTarget {
    * only `currentPage()`, the previous behavior.
    */
   pageHandles?(): Promise<{ tabId: number; page: BrowserPageHandle }[]>;
+  /**
+   * Optional: drains the request entries of tabs that were closed since the last call (a tab that closes during a
+   * step takes its page handle with it), without bodies; `dropped` counts entries that did not fit. Called by
+   * `BrowserController.requests()`.
+   */
+  drainClosedRequests?(): { requests: PageRequestEntry[]; dropped?: number };
   /**
    * Optional: PageFixture cookies (docs/specs/2026-10-15-page-fixture-design.md).
    * Cookies live on the browser context, not on a page, so they are target
@@ -1230,6 +1271,11 @@ function validatePerformArgs(args: unknown): { ok: true; value: ValidatedPerform
     value: { index, operation, text: args.text, snapshotId: args.snapshotId },
   };
 }
+
+/** The longest `BrowserController.requests` waits for the pages' drains. */
+const REQUESTS_DRAIN_TIMEOUT_MS = 3000;
+/** The most request entries one `BrowserController.requests` call returns. */
+const MAX_DRAINED_REQUESTS = 600;
 
 export class BrowserController {
   private readonly timeoutMs: number;
@@ -5473,6 +5519,66 @@ export class BrowserController {
       if (entries.length > MAX_DRAINED_DIAGNOSTICS) merged[`${key}Dropped`] = entries.length - MAX_DRAINED_DIAGNOSTICS;
     }
     return merged;
+  }
+
+  /**
+   * Drains the request log (`BrowserPageHandle.drainRequests`) of every tab the target knows (`pageHandles`, else
+   * the current page), merged by start time. Read-only for the page: it does NOT take the command lock (a running
+   * command must not delay it), and it is limited to 3 s in total. `dropped` counts the entries lost: the adapters'
+   * ring overflow, the oldest beyond 600, and the entries of a tab closed since the last call that did not fit. If
+   * the 3 s limit fires, the entries the pages already handed over are lost (not counted). Never throws; `{ requests: [] }` when no page supports it.
+   */
+  async requests(): Promise<{ requests: PageRequestEntry[]; dropped?: number }> {
+    try {
+      return await withTimeout(this.drainAllRequests(), REQUESTS_DRAIN_TIMEOUT_MS, "requests timed out.");
+    } catch {
+      return { requests: [] };
+    }
+  }
+
+  private async drainAllRequests(): Promise<{ requests: PageRequestEntry[]; dropped?: number }> {
+    let lost = 0;
+    const closed: PageRequestEntry[] = [];
+    try {
+      const c = this.target.drainClosedRequests?.();
+      if (c) {
+        closed.push(...c.requests);
+        lost += c.dropped ?? 0;
+      }
+    } catch {
+      // No closed-tab entries.
+    }
+    let pages: BrowserPageHandle[] = [];
+    try {
+      const handles = this.target.pageHandles ? await this.target.pageHandles() : [];
+      pages = handles.map((h) => h.page);
+    } catch {
+      // Falls back to the current page.
+    }
+    if (pages.length === 0) {
+      const current = this.target.currentPage();
+      if (current) pages = [current];
+    }
+    for (const page of pages) {
+      try {
+        lost += page.droppedRequests?.() ?? 0;
+      } catch {
+        // No count.
+      }
+    }
+    const lists = await Promise.all(
+      pages.map(async (page) => {
+        try {
+          return (await page.drainRequests?.()) ?? [];
+        } catch {
+          return [];
+        }
+      }),
+    );
+    const all = [...closed, ...lists.flat()].filter((e) => e && typeof e.at === "number").sort((a, b) => a.at - b.at);
+    if (all.length > MAX_DRAINED_REQUESTS) lost += all.length - MAX_DRAINED_REQUESTS;
+    const requests = all.length > MAX_DRAINED_REQUESTS ? all.slice(-MAX_DRAINED_REQUESTS) : all;
+    return lost > 0 ? { requests, dropped: lost } : { requests };
   }
 
   /** Wave 3 reliability, item 2: discovers which of the top document's

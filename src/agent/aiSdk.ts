@@ -459,6 +459,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         goal,
         ...(opts.trace.labels ? { labels: opts.trace.labels } : {}),
         ...(traceCapture ? { capture: () => takeScreenshot(opts.browser, TRACE_CAPTURE_MS) } : {}),
+        ...(opts.browser.requests ? { requests: () => opts.browser.requests!() } : {}),
       })
     : undefined;
   const extras: Record<string, BrowseAgentExtraTool> = {
@@ -654,6 +655,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const result = await finish();
   if (recorder) {
     if (shot && qaOn && traceCapture) recorder.addFrame({ imageData: shot, kind: "final" });
+    await recorder.flush(opts.signal);
     const trace: BrowseTrace = recorder.finish({
       status: result.status,
       answer: result.answer,
