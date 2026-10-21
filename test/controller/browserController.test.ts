@@ -2311,6 +2311,40 @@ describe("screenshot", () => {
     });
   });
 
+  it("masks password fields for the capture and unmasks them afterwards", async () => {
+    const order: string[] = [];
+    const isMask = (code: string) => code.includes("__penMaskedFields");
+    const page = makeFakePage({
+      executeJavaScript: vi.fn((code: string) => {
+        if (isMask(code)) {
+          order.push(code.includes('"masked":true') ? "mask" : "unmask");
+          return Promise.resolve({ changed: true });
+        }
+        return Promise.resolve({ ok: true });
+      }),
+      capture: vi.fn(() => {
+        order.push("capture");
+        return Promise.resolve({ imageData: "data:image/jpeg;base64,AAAA", width: 4, height: 4 });
+      }),
+    });
+    const result = await new BrowserController(makeFakeTarget(page)).screenshot(undefined);
+    expect(result).toHaveProperty("imageData");
+    expect(order).toEqual(["mask", "capture", "unmask"]);
+  });
+
+  it("refuses the screenshot when the password mask cannot be applied", async () => {
+    const capture = vi.fn(() => Promise.resolve({ imageData: "data:image/jpeg;base64,AAAA", width: 4, height: 4 }));
+    const page = makeFakePage({
+      executeJavaScript: vi.fn((code: string) =>
+        Promise.resolve(code.includes("__penMaskedFields") ? { error: "boom" } : { ok: true }),
+      ),
+      capture,
+    });
+    const result = await new BrowserController(makeFakeTarget(page)).screenshot(undefined);
+    expect(String((result as { error: string }).error)).toMatch(/could not hide password fields/);
+    expect(capture).not.toHaveBeenCalled();
+  });
+
   it("reports an error (not a blank image) when capture() resolves null", async () => {
     const page = makeFakePage({ capture: vi.fn(() => Promise.resolve(null)) });
     const controller = new BrowserController(makeFakeTarget(page));

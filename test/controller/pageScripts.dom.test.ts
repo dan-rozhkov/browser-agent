@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach } from "vitest";
-import { ARGS_MARKER, CAPTURE_JS, CSS_QUERY_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
+import { ARGS_MARKER, CAPTURE_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
 import { BrowserController } from "../../src/controller/controller.js";
 
 /** Runs a page script in the happy-dom document, like page.evaluate would. */
@@ -252,6 +252,112 @@ describe("SNAPSHOT_JS inputType", () => {
   });
 });
 
+describe("SNAPSHOT_JS value rule", () => {
+  const els = () => run(SNAPSHOT_JS, { snapshotId: "sv", maxElements: 100 }).elements as { value?: string; hasValue?: boolean; label: string }[];
+  it("hides the value of a password-named field even when its type is text (show-password eye)", () => {
+    document.body.innerHTML =
+      '<input type="text" name="user_password" aria-label="Pw" value="hunter2"><input type="text" id="PWD" aria-label="Pwd2" value="hunter3">' +
+      '<input type="text" name="q" aria-label="Query" value="shoes">';
+    const list = els();
+    const pw = list.find((e) => e.label === "Pw")!;
+    const pwd = list.find((e) => e.label === "Pwd2")!;
+    expect(pw.value).toBeUndefined();
+    expect(pw.hasValue).toBe(true);
+    expect(pwd.value).toBeUndefined();
+    expect(pwd.hasValue).toBe(true);
+    expect(list.find((e) => e.label === "Query")!.value).toBe("shoes");
+  });
+});
+
+describe("SNAPSHOT_JS password-like names", () => {
+  const field = (attrs: string) => {
+    document.body.innerHTML = `<input type="text" aria-label="F" ${attrs} value="secretvalue">`;
+    return (run(SNAPSHOT_JS, { snapshotId: "sn", maxElements: 100 }).elements as { value?: string; hasValue?: boolean }[])[0]!;
+  };
+  it.each(['name="password"', 'name="user_pass"', 'name="userPass"', 'id="pwd"', 'name="pass"', 'name="pass1"', 'name="pw"', 'id="pw2"', 'name="new-passphrase"', 'id="парольный"'])(
+    "hides %s",
+    (attrs) => {
+      const e = field(attrs);
+      expect(e.value).toBeUndefined();
+      expect(e.hasValue).toBe(true);
+    },
+  );
+  it.each(['name="passengerFirstName"', 'name="passportNumber"', 'id="compass"', 'name="bypass_code_x"', 'name="pwa"'])("does not hide %s", (attrs) => {
+    expect(field(attrs).value).toBe("secretvalue");
+  });
+});
+
+describe("PASSWORD_MASK_JS", () => {
+  // happy-dom has no -webkit-text-security, so it drops the inline value: these
+  // tests check which fields the script masked and restores. The rendering
+  // itself is verified in a real Chromium (the desktop live check).
+  const maskedIds = () =>
+    ((window as any).__penMaskedFields ?? []).map((m: { el: HTMLElement }) => m.el.id || m.el.getAttribute("name"));
+  beforeEach(() => {
+    (window as any).__penMaskedFields = [];
+  });
+
+  it("masks the filled secret text fields and restores them after", () => {
+    document.body.innerHTML =
+      '<input id="password" type="text" value="hunter22"><input id="q" name="q" type="text" value="shoes">' +
+      '<input id="p2" name="pass2" type="password" value="hunter33"><input id="pw" name="pw" type="text" value="">' +
+      '<input id="ac" name="field_2" autocomplete="current-password" value="hunter44">' +
+      '<input id="btn" type="submit" name="pw_submit" value="Log in">';
+    expect(run(PASSWORD_MASK_JS, { masked: true })).toEqual({ changed: true });
+    // Not a secret, already masked by its type, empty, or not a text field: left out.
+    expect(maskedIds()).toEqual(["password", "ac"]);
+    // Masking twice records nothing new.
+    expect(run(PASSWORD_MASK_JS, { masked: true })).toEqual({ changed: false });
+    expect(maskedIds()).toEqual(["password", "ac"]);
+
+    expect(run(PASSWORD_MASK_JS, { masked: false })).toEqual({ changed: true });
+    expect(maskedIds()).toEqual([]);
+    expect((document.querySelector("#password") as HTMLInputElement).value).toBe("hunter22");
+  });
+
+  it("masks a field a snapshot saw as type=password after a show-password toggle, whatever its name", () => {
+    document.body.innerHTML = '<input id="f" name="credential" type="password" value="hunter22" aria-label="Secret">';
+    run(SNAPSHOT_JS, { snapshotId: "m1", maxElements: 100 });
+    (document.querySelector("#f") as HTMLInputElement).type = "text";
+    const el = (run(SNAPSHOT_JS, { snapshotId: "m2", maxElements: 100 }).elements as { label: string; value?: string; hasValue?: boolean }[]).find(
+      (e) => e.label === "Secret",
+    )!;
+    expect(el.value).toBeUndefined();
+    expect(el.hasValue).toBe(true);
+    expect(run(PASSWORD_MASK_JS, { masked: true })).toEqual({ changed: true });
+    expect(maskedIds()).toEqual(["f"]);
+  });
+
+  it("reaches a password field in an open shadow root", () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = '<input id="inner" name="password" type="text" value="hunter22">';
+    expect(run(PASSWORD_MASK_JS, { masked: true })).toEqual({ changed: true });
+    expect(maskedIds()).toEqual(["inner"]);
+  });
+
+  it("refuses when a field still renders in clear text after the mask", () => {
+    document.body.innerHTML = '<input id="password" type="text" value="hunter22">';
+    const real = window.getComputedStyle;
+    (window as any).getComputedStyle = () => ({ getPropertyValue: () => "none" });
+    try {
+      expect(run(PASSWORD_MASK_JS, { masked: true })).toEqual({ error: "a password field could not be masked" });
+    } finally {
+      (window as any).getComputedStyle = real;
+    }
+    // What was recorded is still restored by the unmask call.
+    expect(maskedIds()).toEqual(["password"]);
+    expect(run(PASSWORD_MASK_JS, { masked: false })).toEqual({ changed: true });
+  });
+
+  it("reports no change on a page without a revealed password", () => {
+    document.body.innerHTML = '<input name="q" type="text" value="shoes"><input name="password" type="password" value="x123">';
+    expect(run(PASSWORD_MASK_JS, { masked: true })).toEqual({ changed: false });
+    expect(run(PASSWORD_MASK_JS, { masked: false })).toEqual({ changed: false });
+  });
+});
+
 describe("CAPTURE_JS", () => {
   const doc = { snapshotId: null, index: null, maxChars: 3_000_000 };
   // v2: CAPTURE_JS returns the parts; `html` is the body-side document with
@@ -263,6 +369,15 @@ describe("CAPTURE_JS", () => {
     }
     return res;
   };
+
+  it("writes no value for a password-named text input or textarea", () => {
+    document.body.innerHTML =
+      '<input type="text" name="user_pw" value="hunter22"><textarea id="pass1">hunter33</textarea><input name="q" value="shoes">';
+    const html = capture().html as string;
+    expect(html).not.toContain("hunter22");
+    expect(html).not.toContain("hunter33");
+    expect(html).toContain("shoes");
+  });
 
   it("reports <link rel=stylesheet> and <style> as ordered sources and no longer emits them in the body", () => {
     document.head.innerHTML =

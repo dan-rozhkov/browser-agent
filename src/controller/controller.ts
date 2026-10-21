@@ -75,6 +75,7 @@ import {
   COMPOSE_MARKS_JS,
   REMOVE_MARKS_JS,
   CURSOR_VISIBILITY_JS,
+  PASSWORD_MASK_JS,
   HOVER_TARGET_JS,
   ASSERT_JS,
   UPLOAD_JS,
@@ -120,6 +121,7 @@ const SCRIPT_TEMPLATES = {
   MARKS_JS,
   REMOVE_MARKS_JS,
   CURSOR_VISIBILITY_JS,
+  PASSWORD_MASK_JS,
   HOVER_TARGET_JS,
   ASSERT_JS,
   UPLOAD_JS,
@@ -4752,6 +4754,34 @@ export class BrowserController {
           // best effort — the next cursor move's show() clears it too
         }
       };
+      // A password field flipped to type=text by a "show password" eye would
+      // show the password in the image (the snapshot already hides its
+      // value): render such fields as discs for the capture, restore after.
+      // Unlike the cursor this is not cosmetic, so a failed mask fails the
+      // screenshot instead of capturing the plain text.
+      let passwordsMasked = false;
+      // Set once the mask ran at all: a mask that failed half-way may have
+      // masked some fields already, and `finally` must restore those too.
+      let maskAttempted = false;
+      const maskPasswords = async (): Promise<{ error: string } | null> => {
+        maskAttempted = true;
+        try {
+          const res = await this.executeScript(page, "PASSWORD_MASK_JS", { masked: true });
+          if ("error" in res) return { error: String(res.error) };
+          passwordsMasked = isRecord(res) && res.changed === true;
+          return null;
+        } catch (e) {
+          return { error: toMessage(e) };
+        }
+      };
+      const unmaskPasswords = async (): Promise<void> => {
+        if (!maskAttempted) return;
+        try {
+          await this.executeScript(page, "PASSWORD_MASK_JS", { masked: false });
+        } catch {
+          // best effort — a leftover mask only hides text on screen
+        }
+      };
 
       let snapshotId: string | undefined;
       let elements: unknown;
@@ -4771,14 +4801,19 @@ export class BrowserController {
             snapshotId = snap.snapshotId as string;
             elements = snap.elements;
           }
+          const maskFailed = await maskPasswords();
+          if (maskFailed) return errorResult(`Screenshot refused: could not hide password fields (${maskFailed.error}).`);
           await hideCursor();
-          const annotated = await this.captureAnnotated(page, snapshotId, cursorHidden, overlay);
+          // `cursorHidden` doubles as "the page changed, wait for a paint" in captureAnnotated.
+          const annotated = await this.captureAnnotated(page, snapshotId, cursorHidden || passwordsMasked, overlay);
           if ("error" in annotated) return errorResult(annotated.error);
           captured = annotated.captured;
           marked = annotated.marked;
         } else {
+          const maskFailed = await maskPasswords();
+          if (maskFailed) return errorResult(`Screenshot refused: could not hide password fields (${maskFailed.error}).`);
           await hideCursor();
-          if (cursorHidden) await this.waitForPaint(page);
+          if (cursorHidden || passwordsMasked) await this.waitForPaint(page);
           captured = await this.captureImage(page);
         }
         if (!captured || !captured.imageData) {
@@ -4799,6 +4834,7 @@ export class BrowserController {
         return result;
       } finally {
         await restoreCursor();
+        await unmaskPasswords();
         if (overlay.drawn) {
           try {
             await this.executeScript(page, "REMOVE_MARKS_JS", {});

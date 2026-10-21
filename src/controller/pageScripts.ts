@@ -72,6 +72,60 @@ const DEEP_QUERY_HELPER_JS = `
 `;
 
 /**
+ * One definition of "this field holds a secret", shared by SNAPSHOT_JS (value
+ * rule), PASSWORD_MASK_JS (screenshots), CAPTURE_JS (copied value) and
+ * ASSERT_JS (value check). A "show password" eye flips type=password to
+ * type=text, so the type alone no longer protects a value the agent's saved
+ * login typed. `penIsSecretField(el)` is true for a text-entry input/textarea
+ * (never a button, checkbox, hidden... input) that:
+ * - is type=password now, or was when a snapshot saw it (`penMarkSecret`
+ *   keeps it in a per-document WeakSet: no DOM change, so neither the page's
+ *   observers nor the action-change signature notice it; a framework that
+ *   swaps the element on the toggle loses it, the rules below remain);
+ * - has autocomplete current-password / new-password;
+ * - or is named like a password (`penIsPasswordNamed`, name or id):
+ *   password, passwd, passcode, passphrase, pwd, парол*, and "pass" or "pw"
+ *   (optionally with digits: pass1, pw2) only as a whole token (start/end, a
+ *   non-alphanumeric delimiter, or a camelCase boundary: userPass).
+ *   "passenger", "passport" and "compass" are not password fields.
+ */
+const SECRET_FIELD_JS = `
+  function penIsPasswordNamed(el) {
+    var raw = String(el.getAttribute("name") || "") + " " + String(el.getAttribute("id") || "");
+    if (/password|passwd|passcode|passphrase|pwd|парол/i.test(raw)) return true;
+    var spaced = raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+    return /(^|[^a-z0-9])(pass|pw)\\d*($|[^a-z0-9])/i.test(spaced);
+  }
+  var PEN_NOT_TEXT_INPUT = { button: 1, submit: 1, reset: 1, image: 1, hidden: 1, checkbox: 1, radio: 1, file: 1, range: 1, color: 1 };
+  function penSecretSet() {
+    try {
+      if (!(window.__penSecretFields instanceof WeakSet)) window.__penSecretFields = new WeakSet();
+      return window.__penSecretFields;
+    } catch (err) {
+      return null;
+    }
+  }
+  function penMarkSecret(el) {
+    var set = penSecretSet();
+    if (set) set.add(el);
+  }
+  function penIsSecretField(el) {
+    var tag = String(el.tagName || "").toLowerCase();
+    if (tag !== "input" && tag !== "textarea") return false;
+    if (tag === "input") {
+      var type = (el.getAttribute("type") || "").toLowerCase();
+      if (type === "password") return true;
+      if (PEN_NOT_TEXT_INPUT[type]) return false;
+    }
+    var set = penSecretSet();
+    if (set && set.has(el)) return true;
+    var ac = (el.getAttribute("autocomplete") || "").toLowerCase().trim();
+    if (ac === "current-password" || ac === "new-password") return true;
+    return penIsPasswordNamed(el);
+  }
+`;
+
+/**
  * Shared `findByText` body, interpolated into both CLICK_JS and TYPE_JS
  * (kept as one TypeScript-side string so the two copies can't drift, even
  * though each is inlined into its own independent IIFE at runtime — there
@@ -3294,6 +3348,7 @@ export const SCROLL_JS = `(() => {
  */
 export const SNAPSHOT_JS = `(() => {
   var args = ${ARGS_MARKER};
+  ${SECRET_FIELD_JS}
   var snapshotId = args.snapshotId;
   var maxElements = args.maxElements;
   // Per-document token: FIND_BY_SNAPSHOT_JS relocates a re-mounted node only
@@ -3488,6 +3543,8 @@ export const SNAPSHOT_JS = `(() => {
     }
     var tag = tagOf(el);
     var isPassword = tag === "input" && (el.getAttribute("type") || "").toLowerCase() === "password";
+    // Remembered for after a "show password" toggle (SECRET_FIELD_JS).
+    if (isPassword) penMarkSecret(el);
     var ops = opsFor(el, tag);
     var rect = box.getBoundingClientRect();
     // 0 for anything the user can see right now, else how far it is from
@@ -3600,10 +3657,14 @@ export const SNAPSHOT_JS = `(() => {
         autocomplete === "one-time-code" ||
         autocomplete === "current-password" ||
         autocomplete === "new-password";
+      // A "show password" eye flips type=password to type=text, so the type
+      // alone no longer protects the value (SECRET_FIELD_JS).
+      var secretField = penIsSecretField(el);
       // A range value is a bare number the model needs to see (where the
       // slider currently sits), never user-entered text.
       var valueEligible =
         !isPassword &&
+        !secretField &&
         (inputType === "text" || inputType === "search" || inputType === "textarea" || inputType === "range") &&
         !sensitiveAutocomplete;
       var rawValue = el.value || "";
@@ -6265,6 +6326,56 @@ export const REMOVE_MARKS_JS = `(() => {
   return { removed: !!el };
 })()`;
 
+/** Masks (or unmasks) the text of every non-empty secret field
+ * (SECRET_FIELD_JS) that is not type=password, so a screenshot never shows a
+ * password a "show password" eye revealed (the snapshot already hides its
+ * value). Inline `-webkit-text-security` set through CSSOM: a page CSP that
+ * blocks inline <style> elements does not block it, and it reaches fields in
+ * open shadow roots too. Top document only. `masked: true` returns
+ * `{ changed }`, or `{ error }` when a field still renders in clear text
+ * after the mask (the caller must not capture then); `masked: false` restores
+ * the fields' own inline values. Never throws.
+ */
+export const PASSWORD_MASK_JS = `(() => {
+  var args = ${ARGS_MARKER};
+  ${DEEP_QUERY_HELPER_JS}
+  ${SECRET_FIELD_JS}
+  var PROP = "-webkit-text-security";
+  if (!args.masked) {
+    var done = window.__penMaskedFields || [];
+    window.__penMaskedFields = [];
+    for (var i = 0; i < done.length; i++) {
+      var d = done[i];
+      if (d.prev) d.el.style.setProperty(PROP, d.prev, d.priority);
+      else d.el.style.removeProperty(PROP);
+    }
+    return { changed: done.length > 0 };
+  }
+  var list = window.__penMaskedFields || [];
+  var fields = deepQueryAll(document, "input, textarea");
+  var added = 0;
+  for (var j = 0; j < fields.length; j++) {
+    var el = fields[j];
+    if ((el.getAttribute("type") || "").toLowerCase() === "password") continue;
+    if (!el.value || !penIsSecretField(el)) continue;
+    var seen = false;
+    for (var k = 0; k < list.length; k++) if (list[k].el === el) seen = true;
+    if (!seen) {
+      list.push({ el: el, prev: el.style.getPropertyValue(PROP), priority: el.style.getPropertyPriority(PROP) });
+      added++;
+    }
+    el.style.setProperty(PROP, "disc", "important");
+    // An engine without the property reports "": nothing to verify there.
+    var shown = getComputedStyle(el).getPropertyValue(PROP);
+    if (shown && shown !== "disc") {
+      window.__penMaskedFields = list;
+      return { error: "a password field could not be masked" };
+    }
+  }
+  window.__penMaskedFields = list;
+  return { changed: added > 0 };
+})()`;
+
 /** Hides (or restores) the agent-cursor overlay root so a screenshot never
  * shows its glow/ripple. `changed` is true only when the overlay exists
  * and its visibility actually flipped. Never throws. */
@@ -6767,6 +6878,7 @@ export const BOT_CHECK_JS = `(() => {
  * canvases turned into images, open shadow roots flattened.
  */
 export const CAPTURE_JS = `(() => {
+  ${SECRET_FIELD_JS}
   ${FIND_BY_SNAPSHOT_JS}
   var args = ${ARGS_MARKER};
   try {
@@ -7165,7 +7277,7 @@ export const CAPTURE_JS = `(() => {
         if (type === "checkbox" || type === "radio") {
           if (n.checked) c.setAttribute("checked", "");
           else c.removeAttribute("checked");
-        } else if (type !== "file" && type !== "password") {
+        } else if (type !== "file" && !penIsSecretField(n)) {
           c.setAttribute("value", n.value);
         } else {
           c.removeAttribute("value");
@@ -7176,7 +7288,7 @@ export const CAPTURE_JS = `(() => {
       }
 
       if (tag === "textarea") {
-        c.textContent = n.value;
+        if (!penIsSecretField(n)) c.textContent = n.value;
         return c;
       }
 
@@ -7550,6 +7662,7 @@ export const DOC_MARKER_JS = `(() => {
  */
 export const ASSERT_JS = `(() => {
   var args = ${ARGS_MARKER};
+  ${SECRET_FIELD_JS}
 
   ${LOCATE_TARGET_JS}
 
@@ -7609,12 +7722,19 @@ export const ASSERT_JS = `(() => {
     var el = r.el;
     if (!el) return { passed: false, actual: "not found" };
     if (typeof el.value !== "string") return { passed: false, error: "The element has no value." };
-    var secret = (el.getAttribute("type") || "").toLowerCase() === "password";
     var v = el.value;
+    // A password field answers only "is it empty": an equals/contains result
+    // on its value would let the caller guess the password piece by piece.
+    if (penIsSecretField(el)) {
+      if (check.contains === undefined && check.equals === "") {
+        return v === "" ? { passed: true } : { passed: false, actual: "value hidden (password field)" };
+      }
+      return { passed: false, error: "A password field's value cannot be checked, only that it is empty (equals '')." };
+    }
     var ok = true;
     if (check.equals !== undefined && v !== check.equals) ok = false;
     if (check.contains !== undefined && v.indexOf(check.contains) === -1) ok = false;
-    return ok ? { passed: true } : { passed: false, actual: secret ? "value hidden (password field)" : "value " + JSON.stringify(cut(v, 100)) };
+    return ok ? { passed: true } : { passed: false, actual: "value " + JSON.stringify(cut(v, 100)) };
   }
 
   function checkCount(check) {
