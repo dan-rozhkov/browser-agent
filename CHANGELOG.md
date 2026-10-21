@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.5](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.4...v0.3.5) (2026-10-21)
+
+
+### Features
+
+* **agent:** secret placeholders the model never sees ([8a950fd](https://github.com/dan-rozhkov/browser-agent/commit/8a950fd742bdaf22243ad67d2b670c1ce9c909eb))
+
 ## [0.3.4](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.3...v0.3.4) (2026-10-21)
 
 
