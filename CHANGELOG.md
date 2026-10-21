@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.2...v0.3.3) (2026-10-21)
+
+
+### Bug Fixes
+
+* **trace:** no typed secrets in trace.qa, page-load errors on the open step ([a560596](https://github.com/dan-rozhkov/browser-agent/commit/a5605965403aba8080bd783e9bca68f95680b186))
+
 ## [0.3.2](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.1...v0.3.2) (2026-10-20)
 
 
