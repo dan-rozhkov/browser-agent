@@ -65,3 +65,31 @@ APP=/Applications/Orca.app OPENROUTER_API_KEY=... \
 
 `APP` is a `.app` bundle or an executable path. `AGENT_MODEL` works as in `run-agent.ts`.
 An app that strips `--remote-debugging-port` fails with a clear error after 30 s.
+
+## trace-compare.ts
+
+`trace-compare.ts` runs the real browse agent on eight public websites and compares
+our run trace (`runBrowseAgent({ trace })`) with Playwright's own trace
+(`context.tracing`, screenshots and snapshots on) from the same run. It needs no
+LLM key: a scripted `MockLanguageModelV3` plays a fixed list of `browse_*` calls and
+ends with `qa_verdict`. Each scenario runs in four fresh contexts: `none`, `ours`,
+`pw` and `both`. The comparison uses the `both` run.
+
+```bash
+npx tsx examples/trace-compare.ts --out ./trace-compare-out --repeat 2
+npx tsx examples/trace-compare.ts --only example,quotes-login
+```
+
+| Flag | Meaning |
+|---|---|
+| `--out <dir>` | output directory, default `./trace-compare-out` |
+| `--only <a,b>` | run only these scenarios |
+| `--repeat N` | repeat the four timing runs N times; the table shows the median |
+
+The output directory gets `results.json` (all numbers and the recall misses),
+`summary.md` (tables for completeness, recall, size, overhead and the secret
+check), and per scenario `<name>/ours/trace.json` with `<name>/ours/frames/*`
+(from `splitTraceAssets`) and `<name>/pw-trace.zip`. A failing scenario is
+recorded in `results.json` and the run goes on. It needs network access and the
+`unzip` CLI (it reads Playwright's zip with it); the order of the four modes rotates per repeat;
+`npm run lint` type-checks it. The site selectors can break when a site changes.
