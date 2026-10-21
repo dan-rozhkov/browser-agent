@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.3...v0.3.4) (2026-10-21)
+
+
+### Features
+
+* **trace:** request log, batch actions and a frame after a failed step ([d531838](https://github.com/dan-rozhkov/browser-agent/commit/d531838bd23ca0d2c62813a393d048af658636dd))
+
 ## [0.3.3](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.2...v0.3.3) (2026-10-21)
 
 
