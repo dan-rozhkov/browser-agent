@@ -1537,9 +1537,11 @@ synchronously as part of a click's own dispatch and settle is typically
 already drained by *that click's own* `act`/`perform` call, not a
 subsequent one — a caller (or a test) watching for a specific error should
 check the acting command's own result first, not assume it always lands on
-the next call. `open`/`findImages`/`snapshot`/`read`/`screenshot`/`tabs`
-carry no `consoleErrors` field at all — only `act`/`perform` have a
-meaningful "since the previous command" window.
+the next call. `open` drains too (since 2026-10-21, at the public `open()`
+and in `tabs` for "new"+url, both through `openUnlocked(args, true)`; `applyFixture` does not drain. A refusal drains nothing. If the load times out, errors that land later show up on the next command: accepted), so an error
+thrown while a page loads is reported by the `open` result, not by the next
+`act`. `findImages`/`snapshot`/`read`/`screenshot`/`tabs` carry no
+`consoleErrors` field at all.
 
 **botCheck on open.** `BOT_CHECK_JS` (`pageScripts.ts`) checks the page's
 title and the first 2000 chars of its visible body text against a fixed

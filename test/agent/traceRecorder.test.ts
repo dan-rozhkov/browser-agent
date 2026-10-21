@@ -276,4 +276,36 @@ describe("createBrowseTraceRecorder", () => {
     expect(a.frames).toEqual([]);
     expect(a.status).toBe("done");
   });
+
+  describe("the trace carries no QA step args", () => {
+    const step = (index: number, args: unknown) => ({ index, tool: "browse_act", args, ok: true, error: undefined as string | undefined });
+    const qaOf = (steps: QaResult["steps"]): QaResult => ({ outcome: "passed", steps, stepsDropped: 2 });
+
+    it("stateful click-then-type, #password, a raw string, more than 30 steps, a host-built qa: no secret; the host qa is unchanged", async () => {
+      const r = make();
+      await r.onToolCall({ toolName: "browse_act", input: { action: "click", target: "Password" } })({ output: "{}" });
+      await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "hunter2" } })({ output: "{}" });
+      const many = Array.from({ length: 35 }, (_, i) => step(i + 3, { action: "type", text: "hunter2" }));
+      const qa = qaOf([
+        step(1, { action: "click", target: "Password" }),
+        step(2, { action: "type", text: "hunter2" }),
+        step(3, { action: "type", target: "#password", text: "hunter2" }),
+        step(4, '{"action":"type","text":"hunter2"}'),
+        ...many,
+      ]);
+      const before = JSON.stringify(qa);
+      const t = r.finish({ status: "done", qa });
+      expect(JSON.stringify(t)).not.toContain("hunter2");
+      expect(t.qa!.steps).toHaveLength(qa.steps.length);
+      expect(t.qa!.steps[0]).toMatchObject({ index: 1, tool: "browse_act", ok: true, args: "[omitted]" });
+      expect(t.qa!.stepsDropped).toBe(2);
+      expect(JSON.stringify(qa)).toBe(before);
+      expect(parseBrowseTrace(JSON.parse(JSON.stringify(t)))).toEqual({ trace: t });
+    });
+
+    it("keeps error and ms of a step", () => {
+      const t = make().finish({ status: "done", qa: qaOf([{ index: 1, tool: "browse_read", args: {}, ok: false, error: "boom", ms: 5 } as never]) });
+      expect(t.qa!.steps[0]).toEqual({ index: 1, tool: "browse_read", args: "[omitted]", ok: false, error: "boom", ms: 5 });
+    });
+  });
 });

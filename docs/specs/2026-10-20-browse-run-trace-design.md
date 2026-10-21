@@ -133,6 +133,17 @@ Rules:
   over the whole run (a seen-set, shared with the QA recorder). The controller's own
   `consoleErrorsDropped` / `failedRequestsDropped` counts add to `dropped.console` / `dropped.network`.
 - `qa.consoleErrors` / `qa.failedRequests` passed to `finish` are merged the same way.
+- The trace carries no QA step args (2026-10-21). The QA step recorder keeps the raw input of each call (a typed
+  password included) and traces go to a public bucket; `steps` already holds the redacted args of every call. So in
+  `trace.qa` each step keeps `index`, `tool`, `ok`, `error` and `ms`, and `args` is the fixed string `"[omitted]"` (the
+  `QaStep` type requires the field). The `qa` in the run result and the object the host passed to `finish` are not
+  changed. Nothing reads these args: the viewer uses `qa.stepsDropped` only.
+- Page-load diagnostics (2026-10-21): the controller's public `open` drains the console errors and failed requests
+  like `act`/`perform`/`assert` do, so an error thrown while `browse_open` loads a page has the `stepIndex` of the
+  open step, not of the next `browse_act`. `tabs` with `action: "new"` and a valid `url` drains the same way, once, in that branch (a refused open, an empty or invalid url drain nothing); `applyFixture` calls
+  `openUnlocked` and does not drain. The QA step recorder records no step for a pre-open call (the start page) but
+  harvests its `consoleErrors` / `failedRequests`, so a start page that throws on load reaches `qa.consoleErrors` and
+  the `no_console_errors` / `no_failed_requests` checks.
 - A step takes its slot (index = call order) when the call starts, so `steps` is in call order and
   parallel calls cannot pass `maxSteps`. Calls still pending at `finish` become steps with
   `ok: false`, `error: "unfinished"`, `endedAt` = finish time.

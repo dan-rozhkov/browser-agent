@@ -97,6 +97,17 @@ describe("runBrowseAgent: qa_assert", () => {
     expect(qa.consoleErrors).toEqual(["TypeError: boom"]);
   });
 
+  it("a start page that throws on load: its errors reach qa.consoleErrors and fail a later no_console_errors check", async () => {
+    const { bridge } = assertingBrowser([{}], { open: async (a) => ({ url: a.url, title: "A", consoleErrors: ["Uncaught: load boom"], failedRequests: ["GET 500 https://a.test/x.js"] }) });
+    const model = scripted([assertStep([{ type: "no_console_errors" }, { type: "no_failed_requests" }]), verdict("pass"), { text: "fin" }]);
+    const qa = qaOf(await runBrowseAgent("goal", { model, browser: bridge, url: "https://a.test/", qa: true }));
+    expect(qa.consoleErrors).toEqual(["Uncaught: load boom"]);
+    expect(qa.failedRequests).toEqual(["GET 500 https://a.test/x.js"]);
+    expect(qa.checks!.map((c) => c.passed)).toEqual([false, false]);
+    // The pre-open is still not a step.
+    expect(qa.steps.map((s) => s.tool)).toEqual(["qa_assert", "qa_verdict"]);
+  });
+
   it("puts the errors a qa_assert call drained into the run lists", async () => {
     const { bridge } = assertingBrowser([{ consoleErrors: ["E1"], failedRequests: ["GET 500 https://a.test/api"] }]);
     const model = scripted([assertStep([{ type: "no_failed_requests" }]), verdict("fail", "api failed"), { text: "fin" }]);

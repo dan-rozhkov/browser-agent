@@ -383,6 +383,36 @@ describe("runBrowseAgent: trace", () => {
     expect(secondPrompt(withTrace)).toContain('\\"dialogs\\":[{\\"type\\":\\"alert\\",\\"message\\":\\"Saved!\\"}]');
   });
 
+  it("qa: the typed password is not in the serialized trace (also in qa.steps)", async () => {
+    const SECRET = "hunter2-s3cret";
+    const long = `${SECRET} ${"x".repeat(3000)}`;
+    const steps: Step[] = [
+      { calls: [{ name: "browse_act", input: { action: "click", target: "Password" } }] },
+      { calls: [{ name: "browse_act", input: { action: "type", text: SECRET } }] },
+      { calls: [{ name: "browse_act", input: { action: "type", target: "#password", text: SECRET } }] },
+      { calls: [{ name: "browse_act", input: { action: "type", target: "#password", text: long } }] },
+      { calls: [{ name: "qa_verdict", input: { verdict: "pass", reason: "ok" } }] },
+    ];
+    const { r, t } = await traced(steps, shotBrowser(), { qa: true });
+    expect(t.qa!.steps.map((s) => s.index)).toEqual([1, 2, 3, 4, 5]);
+    expect(JSON.stringify(t)).not.toContain(SECRET);
+    expect(t.qa!.steps.map((s) => s.args)).toEqual(Array(5).fill("[omitted]"));
+    // The trace's own steps hold the redacted args.
+    expect(t.steps[1]!.args).toEqual({ action: "type", text: "[redacted]" });
+    expect(t.steps[2]!.args).toEqual({ action: "type", target: "#password", text: "[redacted]" });
+    // The host's own result is unchanged: it still has the QA steps as the model-side recorder saw them.
+    expect(JSON.stringify(r.qa)).toContain(SECRET);
+  });
+
+  it("a console error thrown while browse_open loads the page is attributed to the open step", async () => {
+    const browser: BrowserBridge = { ...shotBrowser(), open: async (a) => ({ url: a.url, title: "A", consoleErrors: ["Uncaught: load boom"], failedRequests: ["GET /x -> 404"] }), act: async () => ({ changed: true }) };
+    const steps: Step[] = [{ calls: [{ name: "browse_open", input: { url: "https://a.test/" } }] }, { calls: [{ name: "browse_act", input: ACT }] }, { text: "done" }];
+    const { t } = await traced(steps, browser, { qa: true });
+    expect(t.console).toEqual([{ at: expect.any(Number), stepIndex: 0, text: "Uncaught: load boom" }]);
+    expect(t.network).toEqual([{ at: expect.any(Number), stepIndex: 0, text: "GET /x -> 404" }]);
+    expect(t.qa!.consoleErrors).toEqual(["Uncaught: load boom"]);
+  });
+
   it("no step screenshot after an abort", async () => {
     const ac = new AbortController();
     const log: string[] = [];

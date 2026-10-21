@@ -2808,6 +2808,27 @@ describe("tabs", () => {
     expect(page.loadURL).toHaveBeenCalledWith("https://example.com");
   });
 
+  it("new with a url carries the diagnostics of the page load, drained once", async () => {
+    const drainConsoleErrors = vi.fn(() => ["Uncaught Error: tab load boom"]);
+    const drainFailedRequests = vi.fn(() => ["GET 404 https://a.test/x.js"]);
+    const page = makeFakePage({ drainConsoleErrors, drainFailedRequests });
+    const controller = new BrowserController(makeTabsTarget(page, []));
+    const result = await controller.tabs({ action: "new", url: "https://example.com" });
+    expect(result).toMatchObject({ consoleErrors: ["Uncaught Error: tab load boom"], failedRequests: ["GET 404 https://a.test/x.js"] });
+    expect(drainConsoleErrors).toHaveBeenCalledTimes(1);
+    expect(drainFailedRequests).toHaveBeenCalledTimes(1);
+  });
+
+  it("new with an invalid or empty url does not drain", async () => {
+    const drainConsoleErrors = vi.fn(() => ["Uncaught Error: earlier"]);
+    const page = makeFakePage({ drainConsoleErrors });
+    const controller = new BrowserController(makeTabsTarget(page, []));
+    expect(await controller.tabs({ action: "new", url: "javascript:alert(1)" })).not.toHaveProperty("consoleErrors");
+    expect(await controller.tabs({ action: "new" })).not.toHaveProperty("consoleErrors");
+    expect(await controller.tabs({ action: "list" })).not.toHaveProperty("consoleErrors");
+    expect(drainConsoleErrors).not.toHaveBeenCalled();
+  });
+
   it("finding 9: on open() failure, reports the error alongside the tab listing (the tab already exists — no reason to retry into a duplicate)", async () => {
     const tabsData = [{ tabId: 99, url: "", title: "New Tab", current: true }];
     const page = makeFakePage({
@@ -4954,6 +4975,34 @@ describe("BrowserController — Wave 3 reliability", () => {
       const snapshot = (await controller.snapshot()) as { snapshotId: string };
       const result = await controller.perform({ snapshotId: snapshot.snapshotId, index: 0, operation: "SCROLL_DOWN" });
       expect(result).not.toHaveProperty("consoleErrors");
+    });
+
+    it("open carries the errors and failed requests the page load produced, drained once", async () => {
+      const drainConsoleErrors = vi.fn(() => ["Uncaught Error: load boom"]);
+      const drainFailedRequests = vi.fn(() => ["GET https://a.test/x.js -> 404"]);
+      const page = makeFakePage({ drainConsoleErrors, drainFailedRequests });
+      const controller = new BrowserController(makeFakeTarget(page));
+      const result = await controller.open({ url: "https://a.test/" });
+      expect(result).toMatchObject({ consoleErrors: ["Uncaught Error: load boom"], failedRequests: ["GET https://a.test/x.js -> 404"] });
+      expect(drainConsoleErrors).toHaveBeenCalledTimes(1);
+      expect(drainFailedRequests).toHaveBeenCalledTimes(1);
+    });
+
+    it("a refused open (invalid url, locked) does not drain: the errors stay for the next command", async () => {
+      const drainConsoleErrors = vi.fn(() => ["Uncaught Error: earlier"]);
+      const page = makeFakePage({ drainConsoleErrors });
+      const controller = new BrowserController(makeFakeTarget(page));
+      const bad = await controller.open({ url: "javascript:alert(1)" });
+      expect(bad).toHaveProperty("error");
+      expect(bad).not.toHaveProperty("consoleErrors");
+      expect(drainConsoleErrors).not.toHaveBeenCalled();
+    });
+
+    it("open omits the diagnostics fields when the load was clean", async () => {
+      const page = makeFakePage({ drainConsoleErrors: vi.fn(() => []), drainFailedRequests: vi.fn(() => []) });
+      const result = await new BrowserController(makeFakeTarget(page)).open({ url: "https://a.test/" });
+      expect(result).not.toHaveProperty("consoleErrors");
+      expect(result).not.toHaveProperty("failedRequests");
     });
 
     it("a page with no drainConsoleErrors (unit-test fakes predating Wave 3) is unaffected", async () => {

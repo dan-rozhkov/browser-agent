@@ -77,6 +77,9 @@ export interface BrowseTraceRecorder {
   finish(end: { status: string; answer?: string; error?: string; qa?: QaResult }): BrowseTrace;
 }
 
+/** What `qa.steps[].args` holds in a trace. */
+const QA_ARGS_OMITTED = "[omitted]";
+
 const TAB_CAPTURE_ACTIONS: readonly string[] = ["switch", "close", "new"];
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -214,6 +217,20 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
     }
   }
 
+  /**
+   * The trace carries no QA step args: the QA step recorder keeps the raw input (a typed password included), and
+   * `steps` already holds the redacted args of every call. Each step keeps index, tool, ok, error and ms; `args` is
+   * a fixed placeholder (the `QaStep` type requires the field). Never throws.
+   */
+  function qaWithoutArgs(qa: QaResult): QaResult {
+    try {
+      const steps = Array.isArray(qa.steps) ? qa.steps : [];
+      return { ...qa, steps: steps.map((st) => ({ ...st, args: QA_ARGS_OMITTED })) };
+    } catch {
+      return { ...qa, steps: [] };
+    }
+  }
+
   return {
     id,
     addFrame,
@@ -327,7 +344,7 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
         frames,
         console: consoleLog.entries,
         network: networkLog.entries,
-        ...(end.qa ? { qa: end.qa } : {}),
+        ...(end.qa ? { qa: qaWithoutArgs(end.qa) } : {}),
         ...(Object.keys(dropped).length > 0 ? { dropped } : {}),
       };
       for (const s of slots) s.open = false;

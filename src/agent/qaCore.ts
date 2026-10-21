@@ -191,7 +191,12 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
       };
     },
     onToolCall(call) {
-      if (call.preOpen) return () => undefined;
+      if (call.preOpen) {
+        // No step, but the page load of the start page is the first thing the run saw: its errors count.
+        return (result) => {
+          if (result.error === undefined) harvestDiagnostics(parseJsonObject(result.output ?? ""), consoleErrors, failedRequests);
+        };
+      }
       // The slot is taken when the call starts, so parallel calls keep their order.
       const slot = { step: { index: slots.length + 1, tool: call.toolName, args: cutText(call.input), ok: false, error: "did not finish", ms: 0 } as QaStep, started: now(), open: true };
       slots.push(slot);

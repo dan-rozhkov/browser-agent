@@ -1566,14 +1566,22 @@ export class BrowserController {
    * the actual work — see `runExclusive`'s doc comment for why `tabs()`'s
    * internal "new"+url case calls `openUnlocked` directly instead of this. */
   async open(args: unknown): Promise<BrowserCommandResult> {
-    return this.runExclusive(() => this.openUnlocked(args));
+    // Errors and failed requests the page load produced belong to THIS command, not to the next `act`.
+    return this.runExclusive(() => this.openUnlocked(args, true));
   }
 
-  private async openUnlocked(args: unknown): Promise<BrowserCommandResult> {
+  /**
+   * `drain`: merge the console errors and failed requests the load produced into the result (see
+   * mergeDiagnostics). The public `open` and `tabs` ("new" + url) pass true: each is the outermost entry point of
+   * its command, so the buffer is drained once. `applyFixture` leaves it off. A refusal (lock, invalid args) returns
+   * before the page is touched and drains nothing. A load that times out is drained too; errors that land after
+   * the timeout show up on the next command (accepted).
+   */
+  private async openUnlocked(args: unknown, drain = false): Promise<BrowserCommandResult> {
     if (this.lockMessage) return errorResult(this.lockMessage);
     const validated = validateOpenArgs(args);
     if (!validated.ok) return errorResult(validated.error);
-    return this.withCommandTimeout(async () => {
+    const result = await this.withCommandTimeout(async () => {
       const page = await this.target.ensurePage();
 
       // Armed before loadURL() is called — see the doc comment above.
@@ -1612,6 +1620,7 @@ export class BrowserController {
       const loaded = graceOutcome !== "timeout" && graceOutcome.via === "load" && graceOutcome.error === null;
       return { url: page.getURL(), title: page.getTitle(), loaded, ...(await this.checkBotWall(page)) };
     }, this.openTimeoutMs, this.journal ? { op: "nav" } : undefined);
+    return drain ? this.mergeDiagnostics(result, this.target.currentPage()) : result;
   }
 
   /**
@@ -4807,13 +4816,13 @@ export class BrowserController {
         // `openUnlocked`, not the public `open` — see `runExclusive`'s doc
         // comment: this call is already running inside the queue, from
         // `tabs`'s own turn, and calling back into `open` would deadlock.
-        const openResult = await this.openUnlocked({ url });
+        const openResult = await this.openUnlocked({ url }, true);
         const tabsResult = await this.listTabsResult();
         // On open failure the tab still exists (newPage() already created
         // it) — report the error alongside the tab listing so the caller
         // can see the new (empty) tab instead of retrying `new` into a
         // duplicate tab.
-        return "error" in openResult ? { ...tabsResult, error: openResult.error } : { ...tabsResult, ...openResult };
+        return { ...tabsResult, ...openResult };
       }
       if (action === "switch") {
         const ok = await this.target.selectPage!(tabId!);
@@ -5439,7 +5448,7 @@ export class BrowserController {
    * (not 5) so a step recorder (QA mode) that reads the result loses little.
    * A field is omitted entirely when there's nothing new, so a caller can check
    * for its presence rather than an always-present empty array. Called once,
-   * by the outermost public `act()`/`perform()` entry point (not by every
+   * by the outermost public `open()`/`act()`/`perform()` entry point (not by every
    * internal branch), so an action that itself routes through another
    * command internally (`act`'s index-based click calling `perform`'s CLICK
    * branch) never double-drains the same ring buffer. */
