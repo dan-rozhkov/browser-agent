@@ -3,6 +3,7 @@
 // recorder. Mechanism only: it builds the object; the host stores it.
 // Zod-free (exported from `agent/session` and `agent`).
 import { createSeenList, harvestDiagnostics, type SeenList } from "../shared/diagnostics.js";
+import { inputHasSecretPlaceholder } from "../shared/secrets.js";
 import { normalizeScreenshot } from "../shared/image.js";
 import type { QaResult } from "../shared/qaTypes.js";
 import {
@@ -166,7 +167,7 @@ function nothingRan(parsed: Record<string, unknown>): boolean {
   return !Array.isArray(parsed.results) || (parsed.completed === 0 && parsed.results.length <= 1);
 }
 /** Errors of a call refused before it touched the page (execute.ts argument checks): a failure frame would repeat the last one. */
-const PRE_EXECUTION_ERROR = /^(?:browse_act: (?:"actions" (?:must|accepts)|action "[^"]*" requires|actions\[\d+\] (?:is a viewport|uses "element"|must be))|Unknown browse tool)/;
+const PRE_EXECUTION_ERROR = /^(?:browse_act: (?:"actions" (?:must|accepts)|action "[^"]*" requires|actions\[\d+\] (?:is a viewport|uses "element"|must be)|a \{\{secret:|secret placeholders are not available|Unknown secret "|No secrets are set|Secret "[^"]*" cannot be used)|Unknown browse tool)/;
 
 const ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
 
@@ -379,6 +380,8 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
       } catch {
         args = "[unavailable]";
       }
+      // A host `redactArgs` may hide or drop the placeholder: look at the raw input too.
+      if (inputHasSecretPlaceholder(call.input)) typedSecret = true;
       // The slot is taken now, so parallel calls keep call order and cannot pass `maxSteps`.
       const slot = index < maxSteps ? { step: { index, tool: call.toolName, args, startedAt: stepStartedAt, endedAt: stepStartedAt, ok: false, error: "unfinished" } as BrowseTraceStep, open: true } : undefined;
       if (slot) slots.push(slot);

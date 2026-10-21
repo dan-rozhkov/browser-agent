@@ -90,6 +90,15 @@ describe("ASSERT_JS value", () => {
     expect(secret.passed).toBe(false);
     expect(JSON.stringify(secret)).not.toContain("hunter2");
   });
+  it("never prints the value of a password-named text field", () => {
+    document.body.innerHTML = '<input id="x" name="password" type="text" value="hunter2">';
+    const r = one({ type: "value", selector: "#x", equals: "nope" });
+    expect(r).toMatchObject({ passed: false, actual: "value hidden (password field)" });
+  });
+  it("does not hide a field that only looks like a password (passport)", () => {
+    document.body.innerHTML = '<input id="x" name="passportNumber" type="text" value="AB123">';
+    expect(one({ type: "value", selector: "#x", equals: "nope" })).toMatchObject({ passed: false, actual: 'value "AB123"' });
+  });
   it("errors on an element without a value and on a missing element", () => {
     document.body.innerHTML = "<div id='d'>x</div>";
     expect(one({ type: "value", selector: "#d", equals: "x" }).error).toContain("no value");

@@ -9,6 +9,7 @@ import {
   mapTraceFrames,
   parseBrowseTrace,
   redactTraceArgs,
+  redactTraceArgsTracked,
   splitTraceAssets,
   type BrowseTrace,
 } from "../../src/shared/trace.js";
@@ -256,5 +257,28 @@ describe("parseBrowseTrace: actions and requests", () => {
     for (const r of bad) expect(parseBrowseTrace({ ...base, requests: [r] })).toEqual({ error: "requests[0]: invalid" });
     expect(parseBrowseTrace({ ...base, requests: "x" })).toEqual({ error: "requests: expected an array" });
     expect(parseBrowseTrace({ ...base, requests: Array.from({ length: 2001 }, () => ({ at: 1, method: "GET", url: "u" })) })).toEqual({ error: "requests: too many entries" });
+  });
+});
+
+describe("redactTraceArgsTracked: secret placeholders", () => {
+  it("sets typedSecret for a placeholder in text or value and keeps the placeholder visible", () => {
+    const state = { secretFocus: false };
+    const a = redactTraceArgsTracked({ action: "type", target: "Email", text: "{{secret:pw}}" }, state);
+    expect(a.typedSecret).toBe(true);
+    expect((a.value as any).text).toBe("{{secret:pw}}");
+    expect(redactTraceArgsTracked({ value: "x{{secret:a-1}}" }, state).typedSecret).toBe(true);
+    expect(redactTraceArgsTracked({ action: "type", target: "Email", text: "plain" }, state).typedSecret).toBe(false);
+  });
+  it("sets typedSecret for a placeholder inside a batch entry", () => {
+    const r = redactTraceArgsTracked(
+      { actions: [{ action: "click", index: 1 }, { action: "type", index: 2, text: "{{secret:pw}}" }] },
+      { secretFocus: false },
+    );
+    expect(r.typedSecret).toBe(true);
+  });
+  it("a placeholder typed into a password field stays redacted", () => {
+    const r = redactTraceArgsTracked({ action: "type", target: "Password", text: "{{secret:pw}}" }, { secretFocus: false });
+    expect((r.value as any).text).toBe("[redacted]");
+    expect(r.typedSecret).toBe(true);
   });
 });

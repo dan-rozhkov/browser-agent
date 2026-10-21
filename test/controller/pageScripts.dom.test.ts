@@ -252,6 +252,41 @@ describe("SNAPSHOT_JS inputType", () => {
   });
 });
 
+describe("SNAPSHOT_JS value rule", () => {
+  const els = () => run(SNAPSHOT_JS, { snapshotId: "sv", maxElements: 100 }).elements as { value?: string; hasValue?: boolean; label: string }[];
+  it("hides the value of a password-named field even when its type is text (show-password eye)", () => {
+    document.body.innerHTML =
+      '<input type="text" name="user_password" aria-label="Pw" value="hunter2"><input type="text" id="PWD" aria-label="Pwd2" value="hunter3">' +
+      '<input type="text" name="q" aria-label="Query" value="shoes">';
+    const list = els();
+    const pw = list.find((e) => e.label === "Pw")!;
+    const pwd = list.find((e) => e.label === "Pwd2")!;
+    expect(pw.value).toBeUndefined();
+    expect(pw.hasValue).toBe(true);
+    expect(pwd.value).toBeUndefined();
+    expect(pwd.hasValue).toBe(true);
+    expect(list.find((e) => e.label === "Query")!.value).toBe("shoes");
+  });
+});
+
+describe("SNAPSHOT_JS password-like names", () => {
+  const field = (attrs: string) => {
+    document.body.innerHTML = `<input type="text" aria-label="F" ${attrs} value="secretvalue">`;
+    return (run(SNAPSHOT_JS, { snapshotId: "sn", maxElements: 100 }).elements as { value?: string; hasValue?: boolean }[])[0]!;
+  };
+  it.each(['name="password"', 'name="user_pass"', 'name="userPass"', 'id="pwd"', 'name="pass"', 'name="pass1"', 'name="pw"', 'id="pw2"', 'name="new-passphrase"', 'id="парольный"'])(
+    "hides %s",
+    (attrs) => {
+      const e = field(attrs);
+      expect(e.value).toBeUndefined();
+      expect(e.hasValue).toBe(true);
+    },
+  );
+  it.each(['name="passengerFirstName"', 'name="passportNumber"', 'id="compass"', 'name="bypass_code_x"', 'name="pwa"'])("does not hide %s", (attrs) => {
+    expect(field(attrs).value).toBe("secretvalue");
+  });
+});
+
 describe("CAPTURE_JS", () => {
   const doc = { snapshotId: null, index: null, maxChars: 3_000_000 };
   // v2: CAPTURE_JS returns the parts; `html` is the body-side document with
@@ -263,6 +298,15 @@ describe("CAPTURE_JS", () => {
     }
     return res;
   };
+
+  it("writes no value for a password-named text input or textarea", () => {
+    document.body.innerHTML =
+      '<input type="text" name="user_pw" value="hunter22"><textarea id="pass1">hunter33</textarea><input name="q" value="shoes">';
+    const html = capture().html as string;
+    expect(html).not.toContain("hunter22");
+    expect(html).not.toContain("hunter33");
+    expect(html).toContain("shoes");
+  });
 
   it("reports <link rel=stylesheet> and <style> as ordered sources and no longer emits them in the body", () => {
     document.head.innerHTML =

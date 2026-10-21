@@ -469,6 +469,23 @@ What stays in the host:
   integration carries tool-result images natively. For a model that cannot read
   images at all, pass `screenshots: false` to drop the tool.
 
+### Secret placeholders
+
+Pass `secrets: () => ({ name: value })` in the options of `executeBrowseTool`
+(`agent/execute`) and the model can type a password without seeing it: it writes
+`{{secret:<name>}}` in the `text` of a `browse_act` `type` action (name:
+`SECRET_NAME_PATTERN`, `[A-Za-z0-9_-]{1,40}`). The executor puts the value in
+right before `browser.act`, after validation and `element` locating (a locator
+never gets it), and passes every string it returns through `redactSecrets`:
+raw and JSON-escaped values become `{{secret:<name>}}` again. Values shorter than
+`MIN_REDACTED_SECRET_LENGTH` (4) are not redacted, so hosts should refuse them.
+Any other action, an unknown name, or a call without the option is refused with
+an `{ error }` and the bridge is not called. The run trace takes no screenshot
+for a step whose `text` holds a placeholder. Tool descriptions and the prompt do
+not mention placeholders: the host adds that text. The page-side snapshot also
+hides the value of any input whose `name` or `id` looks like a password field
+(`pass`, `pwd`, `парол`), so a "show password" toggle does not leak it.
+
 ### Light entry for browsers
 
 `@sideform/browser-agent/agent/session` exports the limits, the result helpers,

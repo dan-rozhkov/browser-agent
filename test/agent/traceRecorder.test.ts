@@ -514,4 +514,26 @@ describe("createBrowseTraceRecorder", () => {
       }
     });
   });
+
+  it("a placeholder step gets no frame even with a custom redactArgs", async () => {
+    let n = 0;
+    const r = make({ capture: async () => (n++, { imageData: IMG }), redactArgs: () => ({ hidden: true }) });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", target: "Email", text: "{{secret:pw}}" } })({ output: '{"ok":true}' });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "click", index: 1 } })({ output: '{"ok":true}' });
+    expect(n).toBe(1);
+  });
+
+  it("secret refusals are pre-execution errors: no failure frame", async () => {
+    let n = 0;
+    const r = make({ capture: async () => (n++, { imageData: IMG }) });
+    const errors = [
+      'browse_act: a {{secret:...}} placeholder can only be used in the text of a "type" action.',
+      "browse_act: secret placeholders are not available here.",
+      'browse_act: Unknown secret "x". Known secrets: a.',
+      "browse_act: No secrets are set. Ask the user to add one.",
+      'browse_act: Secret "s" cannot be used: its value must be a string of at least 4 characters.',
+    ];
+    for (const error of errors) await r.onToolCall({ toolName: "browse_act", input: { action: "click", index: 1 } })({ output: JSON.stringify({ error }) });
+    expect(n).toBe(0);
+  });
 });
