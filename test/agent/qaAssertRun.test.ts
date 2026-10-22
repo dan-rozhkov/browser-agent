@@ -159,6 +159,15 @@ describe("runBrowseAgent: qa.checks (final checks)", () => {
     expect(qa.checks).toEqual([{ source: "final", check: final[0], passed: true }]);
   });
 
+  it("carries an inferred type of an untyped final check into the call and the record", async () => {
+    const { bridge, calls } = assertingBrowser();
+    const model = scripted([verdict("pass", "ok"), { text: "fin" }]);
+    const untyped = [{ selector: "#a", state: "visible" }] as unknown as QaCheck[];
+    const qa = qaOf(await runBrowseAgent("goal", { model, browser: bridge, qa: { checks: untyped } }));
+    expect(calls).toEqual([{ checks: [{ type: "element", selector: "#a", state: "visible" }] }]);
+    expect(qa.checks?.[0]?.check).toEqual({ type: "element", selector: "#a", state: "visible" });
+  });
+
   it("turns passed into failed when a final check fails", async () => {
     const model = scripted([verdict("pass", "looks fine"), { text: "fin" }]);
     const qa = qaOf(await runBrowseAgent("goal", { model, browser: assertingBrowser().bridge, qa: { checks: failing } }));

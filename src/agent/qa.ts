@@ -3,7 +3,7 @@
 // re-exported here so `agent` keeps one QA surface. Imports `zod` (no `ai`, no `node:*`).
 import { z } from "zod";
 import type { QaJudgeVerdict, QaVerdict } from "./qaCore.js";
-import { QA_CHECKS_MAX, QA_CHECK_STRING_MAX_CHARS, REASON_MAX_CHARS, normalizeQaChecks } from "./qaCore.js";
+import { QA_CHECKS_MAX, QA_CHECK_STRING_MAX_CHARS, QA_CHECK_TYPE_MISSING_ERROR, QA_CHECK_TYPE_UNKNOWN_ERROR, REASON_MAX_CHARS, normalizeQaChecks } from "./qaCore.js";
 import type { QaCheck } from "./qaTypes.js";
 
 export * from "./qaCore.js";
@@ -73,7 +73,11 @@ export const qaCheckSchema = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("no_console_errors"), ignore: z.array(checkString()).max(50).optional().describe(ignoreDescribe) }),
   z.object({ type: z.literal("no_failed_requests"), ignore: z.array(checkString()).max(50).optional().describe(ignoreDescribe) }),
-]);
+], {
+  // Only the message of the discriminator issue; the emitted JSON schema does not change.
+  errorMap: (issue, ctx) =>
+    issue.code === "invalid_union_discriminator" ? { message: (ctx.data as { type?: unknown } | null)?.type === undefined ? QA_CHECK_TYPE_MISSING_ERROR : QA_CHECK_TYPE_UNKNOWN_ERROR } : { message: ctx.defaultError },
+});
 
 export const qaAssertSchema = z.object({
   // Like browse_act: strict-mode placeholders ("", null, []) are removed before validation (`normalizeQaChecks`).

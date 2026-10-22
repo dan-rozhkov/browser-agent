@@ -532,7 +532,7 @@ try {
 With `qa` on, the model gets `qa_verdict({ verdict: "pass" | "fail", reason })` (once; a
 repeat is refused), the prompt gets a QA section (principal "a QA engineer" unless you
 set one; with `prompt` as a string, include the exported `QA_PROMPT_SECTION` and end with `QA_AGENT_CLOSING` yourself; QA also swaps the "stop before submitting a form" rule for `QA_IRREVERSIBLE_LINE`), and
-the result gets an extra `qa` field before `error`. Outcome: `passed` / `failed` (the
+the result gets an extra `qa` field before `error`. A QA check without `type` is inferred only when unambiguous (an `element`, `count`, `url` or `text` check; never `value`, so `{selector, contains}` needs `type`); otherwise it fails with "type: missing". Outcome: `passed` / `failed` (the
 verdict), `inconclusive` (the run ended without a verdict), `error` (model error, timeout or
 step limit without a verdict; `reason` says why when the result has no `error` of its own), `setup_failed` (the fixture broke; `error` and
 `setupStage` stay on the result) and `aborted`. `qa.steps` is one entry per tool call of the

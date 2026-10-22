@@ -437,10 +437,12 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const onScreenshot = typeof opts.qa === "object" ? opts.qa.onScreenshot : undefined;
   if (qaOn && opts.extraTools?.[QA_VERDICT_TOOL]) throw new Error(`runBrowseAgent: qa mode owns the tool name ${QA_VERDICT_TOOL}; rename your extra tool.`);
   if (qaOn && opts.extraTools?.[QA_ASSERT_TOOL]) throw new Error(`runBrowseAgent: qa mode owns the tool name ${QA_ASSERT_TOOL}; rename your extra tool.`);
-  const finalChecks = typeof opts.qa === "object" && opts.qa.checks && opts.qa.checks.length > 0 ? opts.qa.checks : undefined;
-  if (finalChecks) {
-    const parsedChecks = parseQaChecks(finalChecks);
+  const rawFinalChecks = typeof opts.qa === "object" && opts.qa.checks && opts.qa.checks.length > 0 ? opts.qa.checks : undefined;
+  let finalChecks: QaCheck[] | undefined; // the parsed checks: an inferred `type` is carried
+  if (rawFinalChecks) {
+    const parsedChecks = parseQaChecks(rawFinalChecks);
     if (!parsedChecks.ok) throw new Error(`runBrowseAgent: qa.checks: ${parsedChecks.errors.join("; ")}`);
+    finalChecks = parsedChecks.value;
   }
   const judge = typeof opts.qa === "object" ? opts.qa.judge : undefined;
   if (judge) {

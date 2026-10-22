@@ -9,6 +9,7 @@ import {
   evaluateQaChecks,
   executeQaAssert,
   finalChecksApply,
+  normalizeQaChecks,
   parseQaChecks,
   qaResultOf,
   runFinalChecks,
@@ -428,5 +429,126 @@ describe("createStepRecorder: diagnostics", () => {
     const rec = createStepRecorder();
     done(rec, QA_ASSERT_TOOL, { passed: false, results: [] });
     expect(rec.steps()[0]).toMatchObject({ tool: "qa_assert", ok: true });
+  });
+});
+
+describe("normalizeQaChecks type inference", () => {
+  const one = (c: unknown) => (normalizeQaChecks([c]) as Array<Record<string, unknown>>)[0];
+  it.each([
+    [{ selector: "#a", state: "visible" }, "element"],
+    [{ index: 2, state: "checked" }, "element"],
+    [{ matches: "orders/\\d+" }, "url"],
+    [{ selector: "tr", visible: true, min: 1 }, "count"],
+    [{ selector: "tr", equals: 3 }, "count"],
+    [{ selector: "tr", max: 0 }, "count"],
+    [{ matches: "x", contains: "/orders" }, "url"],
+    [{ text: "Hi", absent: "yes" }, "text"],
+    [{ selector: "tr", visible: true, equals: "3" }, "count"],
+    [{ selector: "tr", min: 1.5 }, "count"],
+    [{ matches: "(" }, "url"],
+    [{ selector: "a", state: "bogus" }, "element"],
+    [{ selector: "tr", equals: 0, min: 2 }, "count"],
+    [{ text: "Hello" }, "text"],
+    [{ text: "Hello", absent: true }, "text"],
+    [{ type: "", selector: "#a", state: "hidden" }, "element"],
+    [{ type: null, text: "Hi", absent: "" }, "text"],
+  ])("infers the type of %j as %s", (check, type) => {
+    expect(one(check).type).toBe(type);
+  });
+  it.each([[{}], [{ ignore: ["x"] }], [{ ignore: [] }], [{ selector: "#a" }], [{ state: "visible", matches: "x" }], [{ text: "a", selector: "#a" }], [{ junk: 1 }], [{ contains: "Welcome back" }], [{ equals: "https://a.b/" }], [{ selector: "h1", contains: "Welcome" }], [{ selector: "input", equals: "x" }], [{ index: 1, contains: "x" }], [{ selector: "input#q", equals: "" }], [{ selector: "#a", state: "visible", equals: false }], [{ selector: "tr", equals: 1.5 }], [{ selector: "tr", equals: -1 }], [{ selector: "text=Hi", equals: "x" }]])(
+    "leaves %j untyped",
+    (check) => {
+      expect(one(check).type).toBeUndefined();
+    },
+  );
+  it("does not change a typed check", () => {
+    expect(one({ type: "url", selector: "#a", state: "visible" })).toEqual({ type: "url", selector: "#a", state: "visible" });
+    expect(one({ type: "no_console_errors" })).toEqual({ type: "no_console_errors" });
+  });
+  it("normalizes an untyped check like the typed one", () => {
+    expect(one({ selector: "tr", equals: 0, min: 2 })).toEqual(one({ type: "count", selector: "tr", equals: 0, min: 2 }));
+    expect(one({ selector: "tr", equals: 0, min: 2 })).toEqual({ type: "count", selector: "tr", min: 2 });
+    expect(one({ type: "value", selector: "a", equals: "", contains: "x" })).toEqual({ type: "value", selector: "a", contains: "x" });
+  });
+  it("the inferred type wins over a type: undefined key", () => {
+    const r = one({ type: undefined, selector: "#a", state: "visible" });
+    expect(r.type).toBe("element");
+    expect(Object.keys(r)[0]).toBe("type");
+  });
+  it("a bare contains stays untyped with a type: missing error", () => {
+    const r = parse([{ contains: "Welcome back" }]);
+    expect(JSON.stringify(r)).toContain("type: missing");
+  });
+  it("parseQaChecks and qaAssertSchema accept an untyped check", () => {
+    expect(parse([{ selector: "#a", state: "visible" }])).toEqual({ ok: true, value: [{ type: "element", selector: "#a", state: "visible" }] });
+    expect(qaAssertSchema.parse({ checks: [{ selector: "#a", state: "visible" }] }).checks).toEqual([{ type: "element", selector: "#a", state: "visible" }]);
+  });
+  it("names the missing type and the allowed values", () => {
+    const r = parse([{ ignore: ["x"] }]);
+    expect(r).toMatchObject({ ok: false });
+    expect(JSON.stringify(r)).toContain('set \\"type\\"');
+    expect(JSON.stringify(r)).toContain("no_failed_requests");
+    const z1 = qaAssertSchema.safeParse({ checks: [{ ignore: [] }] });
+    expect(z1.success).toBe(false);
+    const msg = JSON.stringify(z1.success ? "" : z1.error.issues);
+    expect(msg).toContain('set \\"type\\"');
+    expect(msg).toContain("no_failed_requests");
+    const z2 = qaAssertSchema.safeParse({ checks: [{ type: "bogus" }] });
+    const issues = z2.success ? [] : z2.error.issues;
+    expect(JSON.stringify(issues)).toContain("expected \\\"text\\\"");
+    expect(issues.every((i) => !i.message.startsWith("type:"))).toBe(true);
+    const z3 = qaAssertSchema.safeParse({ checks: [{ ignore: [] }] });
+    expect((z3.success ? [] : z3.error.issues).every((i) => !i.message.startsWith("type:"))).toBe(true);
+  });
+  it("hand parser keeps the field name in its message", () => {
+    expect(JSON.stringify(parse([{ ignore: ["x"] }]))).toContain("checks[0]: type: missing");
+  });
+});
+
+describe("normalizeQaChecks strict-mode placeholders and inference", () => {
+  const one = (c: unknown) => (normalizeQaChecks([c]) as Array<Record<string, unknown>>)[0];
+  it("index:0 next to a selector does not block inference", () => {
+    expect(one({ selector: "tr", index: 0, min: 1 })).toEqual(one({ type: "count", selector: "tr", index: 0, min: 1 }));
+    expect(one({ selector: "tr", index: 0, min: 1 })).toEqual({ type: "count", selector: "tr", min: 1 });
+    expect(one({ selector: "#a", index: 0, state: "visible" }).type).toBe("element");
+  });
+  it("an all-placeholder object stays untyped", () => {
+    const c = { selector: "", index: 0, equals: "", contains: "", state: "" };
+    expect(one(c).type).toBeUndefined();
+    expect(JSON.stringify(parse([c]))).toContain("type: missing");
+  });
+  it("false booleans do not make a check ambiguous", () => {
+    expect(one({ selector: "#a", visible: false, state: "visible" })).toEqual(one({ type: "element", selector: "#a", visible: false, state: "visible" }));
+    expect(one({ selector: "#a", visible: false, state: "visible" }).type).toBe("element");
+    expect(one({ text: "Hi", absent: false, visible: false })).toEqual(one({ type: "text", text: "Hi", absent: false, visible: false }));
+    expect(one({ text: "Hi", absent: false, visible: false }).type).toBe("text");
+  });
+  it("a selector with only visible:false stays untyped", () => {
+    expect(one({ selector: "#a", visible: false }).type).toBeUndefined();
+    expect(one({ selector: "#a" }).type).toBeUndefined();
+  });
+  it("value is never inferred; an empty equals is a placeholder without a type", () => {
+    expect(one({ selector: "i", index: 0, equals: "", contains: "", state: "" }).type).toBeUndefined();
+    expect(one({ index: 2, equals: "" }).type).toBeUndefined();
+    expect(one({ equals: "" })).toEqual({});
+  });
+  it("one type passing the key filter is chosen and validation reports the field error", () => {
+    expect(JSON.stringify(parse([{ text: "Hi", absent: "yes" }]))).toContain("checks[0]: absent: expected a boolean");
+    expect(JSON.stringify(parse([{ selector: "tr", min: 1.5 }]))).toContain("min: expected a non-negative integer");
+    expect(JSON.stringify(parse([{ matches: "(" }]))).toContain("matches: not a valid regular expression");
+  });
+  it("false is absent only for visible and absent", () => {
+    expect(one({ selector: "#a", state: "visible", equals: false }).type).toBeUndefined();
+    expect(JSON.stringify(parse([{ selector: "#a", state: "visible", equals: false }]))).toContain("type: missing");
+  });
+  it("an explicitly typed value check keeps equals: ''", () => {
+    expect(one({ type: "value", selector: "a", equals: "" })).toEqual({ type: "value", selector: "a", equals: "" });
+  });
+  it("typed checks normalize as before", () => {
+    expect(one({ type: "count", selector: "tr", index: 0, equals: 0, min: 2, max: 0 })).toEqual({ type: "count", selector: "tr", min: 2 });
+    expect(one({ type: "value", selector: "a", equals: "" })).toEqual({ type: "value", selector: "a", equals: "" });
+    expect(one({ type: "text", text: "Hi", absent: false, selector: "" })).toEqual({ type: "text", text: "Hi", absent: false });
+    expect(one({ type: "element", index: 0, state: "visible" })).toEqual({ type: "element", index: 0, state: "visible" });
+    expect(one({ type: "element", selector: "#a", index: 0, state: "visible" })).toEqual({ type: "element", selector: "#a", state: "visible" });
   });
 });

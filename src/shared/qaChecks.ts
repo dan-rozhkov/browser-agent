@@ -48,19 +48,94 @@ function dropCountPlaceholders(out: Record<string, unknown>): void {
   if (min === 0) delete out.min;
 }
 
+/** The check types, in the order the messages list them. The single source of the type list. */
+export const QA_CHECK_TYPES = ["text", "element", "value", "count", "url", "no_console_errors", "no_failed_requests"] as const satisfies readonly QaCheck["type"][];
+type QaCheckTypeName = (typeof QA_CHECK_TYPES)[number];
+// Compile-time: every `QaCheck["type"]` is in QA_CHECK_TYPES (the `satisfies` above covers the other direction).
+type AssertNever<T extends never> = T;
+export type QaCheckTypesComplete = AssertNever<Exclude<QaCheck["type"], QaCheckTypeName>>;
+
+const QA_CHECK_TYPE_LIST = `${QA_CHECK_TYPES.slice(0, -1)
+  .map((t) => `"${t}"`)
+  .join(", ")} or "${QA_CHECK_TYPES[QA_CHECK_TYPES.length - 1]}"`;
+/** The error text of a check that has no `type` and none can be inferred (no field name: the caller adds the path). */
+export const QA_CHECK_TYPE_MISSING_ERROR = `missing; set "type" to ${QA_CHECK_TYPE_LIST}`;
+/** The error text of a check with an unknown `type`. */
+export const QA_CHECK_TYPE_UNKNOWN_ERROR = `expected ${QA_CHECK_TYPE_LIST}`;
+
+/** Per type: the keys it knows. Membership only; the value rules live in `validateQaCheck`. */
+const QA_TYPE_KEYS = {
+  text: ["text", "absent"],
+  element: ["selector", "index", "state"],
+  value: ["selector", "index", "equals", "contains"],
+  count: ["selector", "visible", "equals", "min", "max"],
+  url: ["equals", "contains", "matches"],
+  no_console_errors: ["ignore"],
+  no_failed_requests: ["ignore"],
+} as const satisfies Record<QaCheckTypeName, readonly string[]>;
+// Compile-time, both directions: the key list of each type equals the keys of its `QaCheck` member minus `type`.
+type KeysOf<K extends QaCheckTypeName> = Exclude<keyof Extract<QaCheck, { type: K }>, "type">;
+type ListedKeys<K extends QaCheckTypeName> = (typeof QA_TYPE_KEYS)[K][number];
+export type QaTypeKeysComplete = AssertNever<{ [K in QaCheckTypeName]: Exclude<KeysOf<K>, ListedKeys<K>> | Exclude<ListedKeys<K>, KeysOf<K>> }[QaCheckTypeName]>;
+const QA_KNOWN_KEYS: ReadonlySet<string> = new Set(Object.values(QA_TYPE_KEYS).flat());
+/** The types a check without `type` may be given. `value` is never inferred: see `inferQaCheckType`. */
+const QA_INFERABLE_TYPES: readonly QaCheckTypeName[] = ["element", "count", "url", "text"];
+/** The boolean keys for which `false` means "not given". */
+const QA_BOOLEAN_KEYS: readonly string[] = ["visible", "absent"];
+
+/** The type-gated placeholder rules, on a copy of `out`. `emptyEquals`: restore `equals: ""` of a `value` check. */
+function applyTypeRules(type: unknown, out: Record<string, unknown>, emptyEquals: boolean): Record<string, unknown> {
+  const o = { ...out };
+  if (type === "value" && emptyEquals && o.contains === undefined) o.equals = "";
+  if (type === "count") dropCountPlaceholders(o);
+  return o;
+}
+
+/**
+ * The type of a check that has none, or undefined. `view` has the type-independent placeholders removed. Rules:
+ * - a `false` value of the boolean keys `visible` and `absent` counts as not given; any other `false` is a given key;
+ * - the check needs a type-specific key (any known key except `selector`/`index`); `{selector}` alone,
+ *   `{selector, visible:false}`, `ignore` alone and `{}` stay untyped;
+ * - a type passes the key filter when it knows every given key; a `url` also needs `matches`
+ *   (a bare `equals`/`contains` is too vague);
+ * - exactly one type passes: it is chosen when it is inferable, and `validateQaCheck` then reports its
+ *   field errors (`{text:"Hi", absent:"yes"}` is a `text` check with "absent: expected a boolean");
+ * - several types pass: the single inferable one whose check validates is chosen, else the check stays untyped;
+ * - inferable types: element, count, url, text. `value` is never inferred (and the `ignore` types neither): a
+ *   `selector`/`index` with a string `equals`/`contains` could be a value or the element's text, so it stays
+ *   untyped and the model must name the type.
+ * Unknown keys are ignored.
+ */
+function inferQaCheckType(view: Record<string, unknown>): QaCheckTypeName | undefined {
+  const given = Object.keys(view).filter((k) => QA_KNOWN_KEYS.has(k) && view[k] !== undefined && !(view[k] === false && QA_BOOLEAN_KEYS.includes(k)));
+  if (!given.some((k) => k !== "selector" && k !== "index")) return undefined;
+  const passing = QA_CHECK_TYPES.filter((t) => given.every((k) => (QA_TYPE_KEYS[t] as readonly string[]).includes(k)) && (t !== "url" || given.includes("matches")));
+  const inferable = passing.filter((t) => QA_INFERABLE_TYPES.includes(t));
+  if (passing.length === 1) return inferable[0];
+  const valid = inferable.filter((t) => {
+    const candidate: Record<string, unknown> = { type: t };
+    for (const k of given) candidate[k] = view[k];
+    return validateQaCheck(applyTypeRules(t, candidate, false)).ok;
+  });
+  return valid.length === 1 ? valid[0] : undefined;
+}
+
 /**
  * Strict-mode placeholder stripping (the QA twin of `normalizeBrowseActInput` in
  * agent/schemas.ts). OpenAI models in strict mode fill EVERY key of the schema, so unused
  * fields arrive as "", null or []. The rule, applied to each check object:
- * - `null` and `""` are absent, except `equals: ""` of a `value` check when no other
- *   comparator is given (an input that must be empty is a real check);
- * - an empty `ignore` array is absent;
- * - `index: 0` next to a non-empty `selector` is the placeholder zero: the selector wins.
- * - `false` is the safe default of a boolean (`absent` of a `text` check), so it needs no rule.
- * - `count` with more than one comparator: a 0 that conflicts is a placeholder and is dropped.
- *   `min: 0` always goes (it is a no-op). `equals: 0` goes when `min` or `max` is non-zero.
- *   `max: 0` goes when `min` is above 0 or `equals` is above 0.
- * - `value`: `equals: ""` next to a non-empty `contains` goes (see the first rule).
+ * 1. Type-independent (also before inference):
+ *    - `null` and `""` are absent, except `equals: ""` of a `value` check (see 3);
+ *    - an empty `ignore` array is absent;
+ *    - `index: 0` next to a non-empty `selector` is the placeholder zero: the selector wins.
+ * 2. A check without `type` (also a `""` or null placeholder) gets a type only when it is unambiguous
+ *    (`inferQaCheckType`; the rules are there), so an untyped check normalizes like the same check with
+ *    that type. `value` is never inferred. An ambiguous or conflicting check stays untyped and fails validation.
+ * 3. Type-gated, with the final type:
+ *    - `value`: `equals: ""` stays when no `contains` is given (an input that must be empty is a real check);
+ *    - `count` with more than one comparator: a 0 that conflicts is a placeholder and is dropped.
+ *      `min: 0` always goes (it is a no-op). `equals: 0` goes when `min` or `max` is non-zero.
+ *      `max: 0` goes when `min` is above 0 or `equals` is above 0.
  * Nothing else is touched: `equals: 0` of `count` alone and `index: 0` alone are real values.
  * Entries that are not objects, and non-arrays, come back unchanged.
  */
@@ -70,15 +145,133 @@ export function normalizeQaChecks(input: unknown): unknown {
     if (!isObject(raw)) return raw;
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(raw)) {
-      if (value === null || value === "") continue;
-      if (key === "ignore" && Array.isArray(value) && value.length === 0) continue;
+      if (value === null || value === "" || (key === "ignore" && Array.isArray(value) && value.length === 0)) continue;
       out[key] = value;
     }
-    if (raw.type === "value" && raw.equals === "" && out.contains === undefined) out.equals = "";
-    if (raw.type === "count") dropCountPlaceholders(out);
     if (out.index === 0 && typeof out.selector === "string" && out.selector.trim() !== "") delete out.index;
-    return out;
+    const type: unknown = out.type ?? inferQaCheckType(out);
+    const result = applyTypeRules(type, out, raw.equals === "");
+    if (result.type === undefined && type !== undefined) {
+      delete result.type; // a `type: undefined` key would otherwise shadow the inferred one
+      return { type, ...result };
+    }
+    return result;
   });
+}
+
+/**
+ * Validates ONE already-normalized check object by hand (the per-type rules `parseQaChecks` and the
+ * type inference of `normalizeQaChecks` share). Errors carry no `checks[i]:` prefix. Unknown keys are dropped.
+ */
+export function validateQaCheck(raw: Record<string, unknown>): { ok: true; value: QaCheck } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+  const pushed: QaCheck[] = [];
+  const fail = (msg: string) => errors.push(msg);
+  const str = (key: string): string | undefined => {
+    const v = raw[key];
+    if (v === undefined) return undefined;
+    if (typeof v !== "string") {
+      fail(`${key}: expected a string`);
+      return undefined;
+    }
+    if (v.length > QA_CHECK_STRING_MAX_CHARS) {
+      fail(`${key}: must be at most ${QA_CHECK_STRING_MAX_CHARS} characters`);
+      return undefined;
+    }
+    return v;
+  };
+  const num = (key: string): number | undefined => {
+    const v = raw[key];
+    if (v === undefined) return undefined;
+    if (!isCount(v)) {
+      fail(`${key}: expected a non-negative integer`);
+      return undefined;
+    }
+    return v;
+  };
+  const before = errors.length;
+  const locator = (): { selector?: string; index?: number } => {
+    const selector = str("selector");
+    const index = num("index");
+    if (selector !== undefined && selector.trim() === "") fail("selector: must not be empty");
+    else if (selector !== undefined && hasPlaywrightSelectorSyntax(selector)) fail(QA_SELECTOR_SYNTAX_ERROR);
+    if (selector === undefined && index === undefined && errors.length === before) fail('give a "selector" or an "index"');
+    return { ...(selector !== undefined ? { selector } : {}), ...(index !== undefined ? { index } : {}) };
+  };
+  const ignoreList = (): string[] | undefined => {
+    const v = raw.ignore;
+    if (v === undefined) return undefined;
+    if (!Array.isArray(v) || v.some((x) => typeof x !== "string" || x.length > QA_CHECK_STRING_MAX_CHARS) || v.length > 50) {
+      fail("ignore: expected an array of strings");
+      return undefined;
+    }
+    return v as string[];
+  };
+  switch (raw.type) {
+    case "text": {
+      const text = str("text");
+      if (text === undefined || text === "") fail('"text" is required and must not be empty');
+      if (raw.absent !== undefined && typeof raw.absent !== "boolean") fail("absent: expected a boolean");
+      if (errors.length === before) pushed.push({ type: "text", text: text as string, ...(typeof raw.absent === "boolean" ? { absent: raw.absent } : {}) });
+      break;
+    }
+    case "element": {
+      const loc = locator();
+      const state = raw.state;
+      if (typeof state !== "string" || !QA_ELEMENT_STATES.includes(state as QaElementState)) fail(`state: expected one of ${QA_ELEMENT_STATES.join(", ")}`);
+      if (errors.length === before) pushed.push({ type: "element", ...loc, state: state as QaElementState });
+      break;
+    }
+    case "value": {
+      const loc = locator();
+      const equals = str("equals");
+      const contains = str("contains");
+      if (equals === undefined && contains === undefined && errors.length === before) fail('give "equals" or "contains"');
+      if (errors.length === before) pushed.push({ type: "value", ...loc, ...(equals !== undefined ? { equals } : {}), ...(contains !== undefined ? { contains } : {}) });
+      break;
+    }
+    case "count": {
+      const selector = str("selector");
+      if (selector === undefined || selector.trim() === "") fail('"selector" is required and must not be empty');
+      else if (hasPlaywrightSelectorSyntax(selector)) fail(QA_SELECTOR_SYNTAX_ERROR);
+      if (raw.visible !== undefined && typeof raw.visible !== "boolean") fail("visible: expected a boolean");
+      const equals = num("equals");
+      const min = num("min");
+      const max = num("max");
+      if (equals === undefined && min === undefined && max === undefined && errors.length === before) fail('give "equals", "min" or "max"');
+      if (min !== undefined && max !== undefined && min > max && errors.length === before) fail("min: must not be above max");
+      if (errors.length === before) {
+        pushed.push({ type: "count", selector: selector as string, ...(raw.visible === true ? { visible: true } : {}), ...(equals !== undefined ? { equals } : {}), ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) });
+      }
+      break;
+    }
+    case "url": {
+      const equals = str("equals");
+      const contains = str("contains");
+      const matches = str("matches");
+      if (equals === undefined && contains === undefined && matches === undefined && errors.length === before) fail('give "equals", "contains" or "matches"');
+      if (matches !== undefined) {
+        try {
+          new RegExp(matches);
+        } catch {
+          fail("matches: not a valid regular expression");
+        }
+      }
+      if (errors.length === before) {
+        pushed.push({ type: "url", ...(equals !== undefined ? { equals } : {}), ...(contains !== undefined ? { contains } : {}), ...(matches !== undefined ? { matches } : {}) });
+      }
+      break;
+    }
+    case "no_console_errors":
+    case "no_failed_requests": {
+      const ignore = ignoreList();
+      if (errors.length === before) pushed.push({ type: raw.type, ...(ignore ? { ignore } : {}) });
+      break;
+    }
+    default:
+      fail(`type: ${raw.type === undefined ? QA_CHECK_TYPE_MISSING_ERROR : QA_CHECK_TYPE_UNKNOWN_ERROR}`);
+  }
+  return errors.length > 0 || pushed.length === 0 ? { ok: false, errors } : { ok: true, value: pushed[0] };
 }
 
 /**
@@ -95,113 +288,10 @@ export function parseQaChecks(rawInput: unknown): { ok: true; value: QaCheck[] }
   const errors: string[] = [];
   const value: QaCheck[] = [];
   input.forEach((raw, i) => {
-    const at = `checks[${i}]`;
-    const fail = (msg: string) => errors.push(`${at}: ${msg}`);
-    if (!isObject(raw)) return fail("expected an object");
-    const str = (key: string): string | undefined => {
-      const v = raw[key];
-      if (v === undefined) return undefined;
-      if (typeof v !== "string") {
-        fail(`${key}: expected a string`);
-        return undefined;
-      }
-      if (v.length > QA_CHECK_STRING_MAX_CHARS) {
-        fail(`${key}: must be at most ${QA_CHECK_STRING_MAX_CHARS} characters`);
-        return undefined;
-      }
-      return v;
-    };
-    const num = (key: string): number | undefined => {
-      const v = raw[key];
-      if (v === undefined) return undefined;
-      if (!isCount(v)) {
-        fail(`${key}: expected a non-negative integer`);
-        return undefined;
-      }
-      return v;
-    };
-    const before = errors.length;
-    const locator = (): { selector?: string; index?: number } => {
-      const selector = str("selector");
-      const index = num("index");
-      if (selector !== undefined && selector.trim() === "") fail("selector: must not be empty");
-      else if (selector !== undefined && hasPlaywrightSelectorSyntax(selector)) fail(QA_SELECTOR_SYNTAX_ERROR);
-      if (selector === undefined && index === undefined && errors.length === before) fail('give a "selector" or an "index"');
-      return { ...(selector !== undefined ? { selector } : {}), ...(index !== undefined ? { index } : {}) };
-    };
-    const ignoreList = (): string[] | undefined => {
-      const v = raw.ignore;
-      if (v === undefined) return undefined;
-      if (!Array.isArray(v) || v.some((x) => typeof x !== "string" || x.length > QA_CHECK_STRING_MAX_CHARS) || v.length > 50) {
-        fail("ignore: expected an array of strings");
-        return undefined;
-      }
-      return v as string[];
-    };
-    switch (raw.type) {
-      case "text": {
-        const text = str("text");
-        if (text === undefined || text === "") fail('"text" is required and must not be empty');
-        if (raw.absent !== undefined && typeof raw.absent !== "boolean") fail("absent: expected a boolean");
-        if (errors.length === before) value.push({ type: "text", text: text as string, ...(typeof raw.absent === "boolean" ? { absent: raw.absent } : {}) });
-        break;
-      }
-      case "element": {
-        const loc = locator();
-        const state = raw.state;
-        if (typeof state !== "string" || !QA_ELEMENT_STATES.includes(state as QaElementState)) fail(`state: expected one of ${QA_ELEMENT_STATES.join(", ")}`);
-        if (errors.length === before) value.push({ type: "element", ...loc, state: state as QaElementState });
-        break;
-      }
-      case "value": {
-        const loc = locator();
-        const equals = str("equals");
-        const contains = str("contains");
-        if (equals === undefined && contains === undefined && errors.length === before) fail('give "equals" or "contains"');
-        if (errors.length === before) value.push({ type: "value", ...loc, ...(equals !== undefined ? { equals } : {}), ...(contains !== undefined ? { contains } : {}) });
-        break;
-      }
-      case "count": {
-        const selector = str("selector");
-        if (selector === undefined || selector.trim() === "") fail('"selector" is required and must not be empty');
-        else if (hasPlaywrightSelectorSyntax(selector)) fail(QA_SELECTOR_SYNTAX_ERROR);
-        if (raw.visible !== undefined && typeof raw.visible !== "boolean") fail("visible: expected a boolean");
-        const equals = num("equals");
-        const min = num("min");
-        const max = num("max");
-        if (equals === undefined && min === undefined && max === undefined && errors.length === before) fail('give "equals", "min" or "max"');
-        if (min !== undefined && max !== undefined && min > max && errors.length === before) fail("min: must not be above max");
-        if (errors.length === before) {
-          value.push({ type: "count", selector: selector as string, ...(raw.visible === true ? { visible: true } : {}), ...(equals !== undefined ? { equals } : {}), ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) });
-        }
-        break;
-      }
-      case "url": {
-        const equals = str("equals");
-        const contains = str("contains");
-        const matches = str("matches");
-        if (equals === undefined && contains === undefined && matches === undefined && errors.length === before) fail('give "equals", "contains" or "matches"');
-        if (matches !== undefined) {
-          try {
-            new RegExp(matches);
-          } catch {
-            fail("matches: not a valid regular expression");
-          }
-        }
-        if (errors.length === before) {
-          value.push({ type: "url", ...(equals !== undefined ? { equals } : {}), ...(contains !== undefined ? { contains } : {}), ...(matches !== undefined ? { matches } : {}) });
-        }
-        break;
-      }
-      case "no_console_errors":
-      case "no_failed_requests": {
-        const ignore = ignoreList();
-        if (errors.length === before) value.push({ type: raw.type, ...(ignore ? { ignore } : {}) });
-        break;
-      }
-      default:
-        fail('type: expected "text", "element", "value", "count", "url", "no_console_errors" or "no_failed_requests"');
-    }
+    if (!isObject(raw)) return errors.push(`checks[${i}]: expected an object`);
+    const r = validateQaCheck(raw);
+    if (r.ok) value.push(r.value);
+    else errors.push(...r.errors.map((e) => `checks[${i}]: ${e}`));
   });
   return errors.length > 0 ? { ok: false, errors } : { ok: true, value };
 }
