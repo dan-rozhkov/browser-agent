@@ -78,7 +78,7 @@ describe("neutral definitions", () => {
       );
     }
     const shot = asSchema(browseToolDefinitions.browse_screenshot.inputSchema).jsonSchema as { properties: object };
-    expect(Object.keys(shot.properties)).toEqual(["annotate"]);
+    expect(Object.keys(shot.properties)).toEqual(["annotate", "waitFor"]);
   });
 
   it("browse_act has no element targeting: no field, no text", () => {

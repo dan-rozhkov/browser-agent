@@ -795,6 +795,13 @@ const fixture: PageFixture = {
   `applyFixture` releases the previous one first. `runBrowseAgent({ fixture })` calls
   `browser.releaseFixture()` in `finally` for every outcome, and refuses (status `setup_failed`,
   stage `network`) a bridge with mocks but no `releaseFixture`.
+- Unmatched mocks: `createNetworkHandler(rules).hits()` and the `mockHits()` of an `applyFixture`
+  result give the hit count per rule (`{ method?, url, hits }`). `controller.releaseFixture()`
+  resolves to `{ mockHits }` when it released mocks, and `runBrowseAgent({ qa: true, fixture })`
+  puts the rules with 0 hits into `qa.unmatchedMocks` (`{ method?, url }[]`, absent when none), also in
+  `trace.qa`. A host that drives the session itself reads `createFixtureSetup(...).mockHits()` after
+  `release()` and calls `unmatchedMocks(hits)` (both zod-free, from `agent/session`). A bridge
+  must forward the `releaseFixture` result for this to work; one that drops it gives no counts.
 - `fresh: true` calls `target.resetSession(origins)` before anything else. `PlaywrightTarget` closes
   ALL tabs and opens one new blank tab (sessionStorage and history are gone), then clears cookies,
   permissions and storage (CDP `Storage.clearDataForOrigin`). **Limit:** cookies are cleared everywhere,

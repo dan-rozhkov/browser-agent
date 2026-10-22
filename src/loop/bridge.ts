@@ -50,7 +50,11 @@ export interface BrowserBridge {
    * `browse_act`/`browse_snapshot` call can act by index against it.
    * Optional — absent on bridges older than this feature.
    */
-  screenshot?(args?: { annotate?: boolean; snapshotId?: string }): Promise<unknown>;
+  screenshot?(args?: {
+    annotate?: boolean;
+    snapshotId?: string;
+    waitFor?: { text?: string; selector?: string; ms?: number };
+  }): Promise<unknown>;
   /**
    * browse_tabs (same design doc) — list/switch/close/open the shell's
    * browser tabs. `new` optionally loads `url` with `open`'s semantics and
@@ -99,6 +103,8 @@ export interface BrowserBridge {
    * (network mocks). Idempotent. `token` is the `fixtureToken` of this run's
    * `applyFixture` result: with it, only that fixture is released. A bridge that can apply a fixture with
    * `network` must have it: `runBrowseAgent` refuses such a bridge otherwise.
+   * It may resolve to a `FixtureReleaseResult` (`{ mockHits }`, the hit count per network rule); `runBrowseAgent`
+   * reads it for `QaResult.unmatchedMocks`. A bridge that resolves to anything else just gives no counts.
    */
   releaseFixture?(token?: string): Promise<unknown>;
   /**

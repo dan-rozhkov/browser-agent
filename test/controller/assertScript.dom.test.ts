@@ -116,6 +116,15 @@ describe("ASSERT_JS value", () => {
   });
 });
 
+describe("ASSERT_JS count visible", () => {
+  it("counts hidden rows by default and skips them with visible true", () => {
+    document.body.innerHTML = "<table><tbody><tr><td>a</td></tr><tr data-nobox><td>empty</td></tr></tbody></table>";
+    expect(one({ type: "count", selector: "tbody tr", equals: 2 }).passed).toBe(true);
+    expect(one({ type: "count", selector: "tbody tr", visible: true, equals: 1 }).passed).toBe(true);
+    expect(one({ type: "count", selector: "tbody tr", visible: true, equals: 2 })).toMatchObject({ passed: false, actual: "1 match" });
+  });
+});
+
 describe("ASSERT_JS count", () => {
   beforeEach(() => {
     document.body.innerHTML = "<ul><li>a</li><li>b</li><li>c</li></ul>";

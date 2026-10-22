@@ -5,7 +5,7 @@
 // This is the zod-free core (exported from `agent/session` and `agent`); the zod
 // schema of `qa_verdict` is in qa.ts. Imports the session and result only.
 import { browseAgentErrorMessage, type BrowseAgentStatus } from "./result.js";
-import { QA_ASSERT_TOOL, QA_VERDICT_TOOL, REASON_MAX_CHARS, type QaFinalSink } from "./qaChecks.js";
+import { QA_ASSERT_TOOL, QA_VERDICT_TOOL, REASON_MAX_CHARS, cut, describeQaCheckFailure, type QaFinalSink } from "./qaChecks.js";
 import type { QaCheckRecord, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
 import { createSeenList, harvestDiagnostics } from "../shared/diagnostics.js";
 import { parseJsonObject, singleUseTool, type BrowseAgentExtraToolHooks, type BrowseAgentToolCall } from "./session.js";
@@ -53,7 +53,7 @@ export function parseQaVerdict(input: unknown): { ok: true; value: QaVerdict } |
 
 /** QA variant of the irreversible-step rule: the scenario asks for submits and test data, so the subagent rule ("stop") does not apply. */
 export const QA_IRREVERSIBLE_LINE =
-  "- Do the steps the scenario asks for, including submitting forms and creating or deleting test data on the app under test. Never pay with a real payment method, never send messages to real people outside the app, and never enter real personal data: use the test data the scenario gives or obvious fake data.";
+  "- Do the steps the scenario asks for, including submitting forms and creating test data on the app under test. Do a destructive or irreversible step (delete, send, pay, confirm) only when the scenario names that step. If the scenario asks you to open, read or check a dialog, do not confirm it. Close it or cancel it. Never pay with a real payment method, never send messages to real people outside the app, and never enter real personal data: use the test data the scenario gives or obvious fake data.";
 
 /** The closing paragraph of a QA prompt. It names `qa_verdict`, so it is the last thing the model reads. */
 export const QA_AGENT_CLOSING = `When you have checked the expected result, call \`${QA_VERDICT_TOOL}\` once, unless a blocked step (a CAPTCHA, a login or anti-bot wall, a missing page) stopped you. Then give a short final answer in plain text: what you checked, what you saw, and the final URL. Do not add facts you did not see. Do not open other pages after the verdict.`;
@@ -86,12 +86,17 @@ export function executeQaVerdict(input: unknown): string {
 }
 
 /** The outcome of a run. A verdict wins over a later `step_limit` or `timeout`. */
-export function qaOutcome(status: BrowseAgentStatus, verdict: QaVerdict | undefined): QaOutcome {
+export function qaOutcome(status: BrowseAgentStatus, verdict: QaVerdict | undefined, failedAgentCheck?: QaCheckRecord): QaOutcome {
   if (status === "setup_failed") return "setup_failed";
   if (status === "aborted") return "aborted";
-  if (verdict?.verdict === "pass") return "passed";
+  if (verdict?.verdict === "pass") return failedAgentCheck ? "inconclusive" : "passed";
   if (verdict?.verdict === "fail") return "failed";
   return status === "done" ? "inconclusive" : "error";
+}
+
+/** The first failed check of the agent's MOST RECENT `qa_assert` call (an earlier, replaced check does not count). */
+function failedInLastCall(lastCall: readonly QaCheckRecord[] | undefined): QaCheckRecord | undefined {
+  return lastCall?.find((r) => !r.passed);
 }
 
 const STATUS_REASONS: Partial<Record<BrowseAgentStatus, string>> = {
@@ -105,6 +110,12 @@ function verdictOf(fields: Record<string, unknown>): QaVerdict | undefined {
   return parsed.ok ? parsed.value : undefined;
 }
 
+/** `Agent said pass, but check failed: <check> (<detail>). Agent reason: <reason>`, within `REASON_MAX_CHARS`. */
+function downgradedReason(failed: QaCheckRecord, agentReason: string): string {
+  const head = `Agent said pass, but check failed: ${cut(describeQaCheckFailure(failed), 200)}. Agent reason: `;
+  return `${head}${cut(agentReason, REASON_MAX_CHARS - head.length)}`;
+}
+
 /** The run-level lists a step recorder collects (`StepRecorder.extras()`): console errors, failed requests, check records. */
 export type QaRunExtras = Pick<QaResult, "consoleErrors" | "consoleErrorsDropped" | "failedRequests" | "failedRequestsDropped" | "checks">;
 
@@ -113,11 +124,13 @@ export type QaRunExtras = Pick<QaResult, "consoleErrors" | "consoleErrorsDropped
  * and the `qaVerdict` field) and the recorded steps. `extras` (from the step
  * recorder) adds the console errors, failed requests and checks.
  */
-export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown; [k: string]: unknown }, steps: readonly QaStep[], extras?: QaRunExtras): QaResult {
+export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown; [k: string]: unknown }, steps: readonly QaStep[], extras?: QaRunExtras, lastAgentCall?: readonly QaCheckRecord[]): QaResult {
   const verdict = verdictOf(result);
-  const outcome = qaOutcome(result.status, verdict);
+  // A pass verdict is downgraded when the agent's last qa_assert call still had a failed check.
+  const failed = verdict?.verdict === "pass" ? failedInLastCall(lastAgentCall) : undefined;
+  const outcome = qaOutcome(result.status, verdict, failed);
   // The run's own `error` is on the result already; `reason` does not copy it.
-  const reason = verdict?.reason ?? (outcome === "error" && typeof result.error !== "string" ? (STATUS_REASONS[result.status] ?? `the run ended with status ${result.status}`) : undefined);
+  const reason = failed && verdict ? downgradedReason(failed, verdict.reason) : verdict?.reason ?? (outcome === "error" && typeof result.error !== "string" ? (STATUS_REASONS[result.status] ?? `the run ended with status ${result.status}`) : undefined);
   const kept = steps.slice(-QA_RESULT_MAX_STEPS);
   return {
     outcome,
@@ -151,6 +164,8 @@ const DIAGNOSTICS_MEMORY = 200;
 export interface StepRecorder extends QaFinalSink {
   /** Pass this as `onToolCall`. */
   onToolCall(call: BrowseAgentToolCall): (result: { output?: string; error?: unknown }) => void;
+  /** The check records of the agent's most recent `qa_assert` call (empty when none ran). */
+  lastAgentCall(): QaCheckRecord[];
   /** The steps so far in call order. A call that has not ended is not ok. */
   steps(): QaStep[];
   /** The run-level lists for `qaResultOf`: deduped, first-seen order, capped, with dropped counters. Empty lists are absent. */
@@ -169,12 +184,16 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
   const consoleErrors = createSeenList(DIAGNOSTICS_MEMORY, QA_RESULT_MAX_DIAGNOSTICS);
   const failedRequests = createSeenList(DIAGNOSTICS_MEMORY, QA_RESULT_MAX_DIAGNOSTICS);
   const checks: QaCheckRecord[] = [];
+  let lastAgentCall: QaCheckRecord[] = [];
   return {
     seenConsoleErrors: () => consoleErrors.list(),
     seenFailedRequests: () => failedRequests.list(),
     addChecks(records) {
       checks.push(...records);
+      // The agent's records of one call arrive in one batch.
+      if (records.some((r) => r.source === "agent")) lastAgentCall = records.filter((r) => r.source === "agent");
     },
+    lastAgentCall: () => [...lastAgentCall],
     addDiagnostics(d) {
       consoleErrors.add(d.consoleErrors);
       consoleErrors.lose(d.consoleErrorsDropped);

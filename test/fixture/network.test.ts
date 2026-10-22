@@ -117,3 +117,32 @@ describe("createNetworkHandler", () => {
     expect(createNetworkHandler([{ url: "https://a.test/x", times: 1 }])({ method: "GET", url: "https://a.test/y" })).toBeUndefined();
   });
 });
+
+describe("createNetworkHandler hits", () => {
+  const req = (url: string, method = "GET") => ({ url, method });
+
+  it("counts answers per rule, in fixture order, with the rule's own method", () => {
+    const handler = createNetworkHandler([
+      { url: "https://a.test/one" },
+      { url: "https://a.test/two", method: "post" },
+      { url: "https://a.test/never" },
+    ]);
+    expect(handler.hits()).toEqual([
+      { url: "https://a.test/one", hits: 0 },
+      { method: "post", url: "https://a.test/two", hits: 0 },
+      { url: "https://a.test/never", hits: 0 },
+    ]);
+    handler(req("https://a.test/one"));
+    handler(req("https://a.test/one"));
+    handler(req("https://a.test/two", "POST"));
+    handler(req("https://a.test/two", "GET"));
+    handler(req("https://a.test/other"));
+    expect(handler.hits().map((h) => h.hits)).toEqual([2, 1, 0]);
+  });
+
+  it("a rule with `times` stops counting at N and the next matching rule takes over", () => {
+    const handler = createNetworkHandler([{ url: "https://a.test/x", times: 2 }, { url: "https://a.test/*" }]);
+    for (let i = 0; i < 5; i += 1) handler(req("https://a.test/x"));
+    expect(handler.hits().map((h) => h.hits)).toEqual([2, 3]);
+  });
+});

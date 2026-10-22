@@ -274,3 +274,37 @@ describe("runBrowseAgent through a real controller", () => {
     expect(t.unrouted).toBe(1); // only the replace by the new apply; the failed run released none
   });
 });
+
+describe("runBrowseAgent: unmatchedMocks", () => {
+  const two: PageFixture = { version: 1, network: [{ url: "https://api.a.test/hit" }, { method: "GET", url: "https://api.a.test/v1/contacts" }] };
+  const reported = { mockHits: [{ url: "https://api.a.test/hit", hits: 3 }, { method: "GET", url: "https://api.a.test/v1/contacts", hits: 0 }] };
+  const qaBridge = (release: () => Promise<unknown>) => bridge([], { releaseFixture: release, applyFixture: async () => ({ ok: true, summary: "2 network mocks", fixtureToken: "t1" }) });
+
+  it("puts the rules that answered nothing into qa.unmatchedMocks (and into the trace qa)", async () => {
+    let trace: { qa?: { unmatchedMocks?: unknown } } | undefined;
+    const r = await runBrowseAgent("goal", {
+      model: okModel(),
+      browser: qaBridge(async () => reported),
+      fixture: two,
+      allowNetworkMocks: true,
+      qa: true,
+      trace: { onTrace: (tr) => { trace = tr; } },
+    });
+    expect(r.qa?.unmatchedMocks).toEqual([{ method: "GET", url: "https://api.a.test/v1/contacts" }]);
+    expect(trace?.qa?.unmatchedMocks).toEqual([{ method: "GET", url: "https://api.a.test/v1/contacts" }]);
+  });
+
+  it("is absent when every rule matched, when the bridge reports no counts, and without a fixture", async () => {
+    const all = { mockHits: [{ url: "https://api.a.test/hit", hits: 1 }] };
+    for (const [release, fixture] of [[async () => all, two], [async () => undefined, two], [async () => reported, undefined]] as const) {
+      const r = await runBrowseAgent("goal", { model: okModel(), browser: qaBridge(release), ...(fixture ? { fixture } : {}), allowNetworkMocks: true, qa: true });
+      expect(r.qa).toBeDefined();
+      expect("unmatchedMocks" in r.qa!).toBe(false);
+    }
+  });
+
+  it("a failed run still reports them", async () => {
+    const r = await runBrowseAgent("goal", { model: failingModel(), browser: qaBridge(async () => reported), fixture: two, allowNetworkMocks: true, qa: true });
+    expect(r.qa?.unmatchedMocks).toHaveLength(1);
+  });
+});

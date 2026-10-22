@@ -21,6 +21,38 @@ import { qaAssertDefinition, qaAssertSchema } from "../../src/agent/qa.js";
 const call = (toolName: string, input: unknown, toolCallId = "c1") => ({ toolName, input, toolCallId });
 const parse = (v: unknown) => parseQaChecks(v);
 
+describe("parseQaChecks selector guard", () => {
+  const bad = ["text=Delete", "css=.a", "xpath=//a", "role=button", 'button:has-text("Delete")', "a:text(x)", "a:text-is(x)", "button:visible", ".a >> .b", ".a>>.b"];
+  it.each(bad)("rejects %s in element, value and count", (selector) => {
+    for (const check of [{ type: "element", selector, state: "visible" }, { type: "value", selector, equals: "x" }, { type: "count", selector, min: 1 }]) {
+      const r = parse([check]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.errors[0]).toContain("Playwright syntax");
+    }
+  });
+  it("keeps valid CSS that only looks like Playwright syntax", () => {
+    for (const selector of ["[ role=dialog]", "[role=dialog]", '[data-x="a>>b"]']) {
+      expect(parse([{ type: "count", selector, min: 1 }]).ok, selector).toBe(true);
+    }
+  });
+  it("keeps plain CSS, and executeQaAssert returns the error to the agent", async () => {
+    expect(parse([{ type: "element", selector: "button.primary[data-x='text=y']", state: "visible" }]).ok).toBe(true);
+    const out = JSON.parse(await executeQaAssert({ checks: [{ type: "element", selector: "text=Delete", state: "visible" }] }, { assert: async () => ({}) }, createStepRecorder()));
+    expect(out.error).toContain("Playwright syntax");
+  });
+});
+
+describe("count visible option", () => {
+  it("describes a visible count", () => {
+    expect(describeQaCheck({ type: "count", selector: "tbody tr", visible: true, equals: 2 })).toBe("count of visible tbody tr equals 2");
+  });
+  it("parses visible, drops a false or non-true value, rejects a non-boolean", () => {
+    expect(parse([{ type: "count", selector: "tr", visible: true, min: 1 }])).toEqual({ ok: true, value: [{ type: "count", selector: "tr", visible: true, min: 1 }] });
+    expect(parse([{ type: "count", selector: "tr", visible: false, min: 1 }])).toEqual({ ok: true, value: [{ type: "count", selector: "tr", min: 1 }] });
+    expect(parse([{ type: "count", selector: "tr", visible: "yes", min: 1 }]).ok).toBe(false);
+  });
+});
+
 describe("parseQaChecks", () => {
   it("accepts every check type and drops unknown keys", () => {
     const r = parse([
@@ -291,6 +323,19 @@ describe("step recorder dropped counters", () => {
   });
 });
 
+describe("step recorder lastAgentCall", () => {
+  it("holds the records of the most recent agent batch", () => {
+    const rec = createStepRecorder();
+    const r = (text: string, passed: boolean) => ({ source: "agent" as const, check: { type: "text" as const, text }, passed });
+    expect(rec.lastAgentCall()).toEqual([]);
+    rec.addChecks([r("a", false)]);
+    rec.addChecks([r("b", true), r("c", true)]);
+    expect(rec.lastAgentCall().map((x) => x.check)).toEqual([{ type: "text", text: "b" }, { type: "text", text: "c" }]);
+    rec.addChecks([{ source: "final", check: { type: "text", text: "z" }, passed: false }]);
+    expect(rec.lastAgentCall()).toHaveLength(2);
+  });
+});
+
 describe("applyFinalChecks", () => {
   const base = (over: Partial<QaResult>): QaResult => ({ outcome: "passed", verdict: "pass", reason: "badge says 2", steps: [], ...over });
   const ok: QaCheckResult = { check: { type: "text", text: "a" }, passed: true };
@@ -320,8 +365,15 @@ describe("applyFinalChecks", () => {
     expect(r.checks).toHaveLength(1);
   });
 
+  it("fails a pass that the agent-check rule downgraded to inconclusive when a final check failed", () => {
+    const r = applyFinalChecks(base({ outcome: "inconclusive", reason: "Agent said pass, but check failed: x" }), [bad]);
+    expect(r.outcome).toBe("failed");
+    expect(r.reason).toMatch(/^Final check failed: #x is visible \(hidden\)\. Agent verdict: /);
+  });
+
   it.each(["failed", "inconclusive"] as const)("does not change outcome %s on a failed final check, but records it", (outcome) => {
-    const r = applyFinalChecks(base({ outcome, reason: "r" }), [bad]);
+    const { verdict: _v, ...noVerdict } = base({});
+    const r = applyFinalChecks({ ...noVerdict, outcome, reason: "r" }, [bad]);
     expect(r.outcome).toBe(outcome);
     expect(r.reason).toBe("r");
     expect(r.checks).toHaveLength(1);

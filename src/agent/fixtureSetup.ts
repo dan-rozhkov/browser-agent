@@ -3,12 +3,31 @@
 // `ai`-free and isomorphic, so a host that drives `createBrowseAgentSession`
 // itself (Pen Editor's frontend) uses the same logic as `runBrowseAgent`.
 import type { BrowserBridge } from "../loop/bridge.js";
-import type { PageFixture } from "../fixture/types.js";
+import type { FixtureMockHit, PageFixture } from "../fixture/types.js";
 import { boundedCall } from "../fixture/util.js";
 import { fixtureSetupBody } from "./result.js";
 import { SetupError } from "./session.js";
 
 const DEFAULT_RELEASE_TIMEOUT_MS = 10_000;
+
+/** The rules of `hits` that answered no request. Typed data for `QaResult.unmatchedMocks`; undefined or empty `hits` give an empty list. */
+export function unmatchedMocks(hits: readonly FixtureMockHit[] | undefined): Array<{ method?: string; url: string }> {
+  return (hits ?? []).filter((h) => h.hits === 0).map(({ method, url }) => ({ ...(method !== undefined ? { method } : {}), url }));
+}
+
+/** Reads `mockHits` from what a bridge's `releaseFixture` resolved to. Anything malformed gives undefined. */
+export function mockHitsOfRelease(raw: unknown): FixtureMockHit[] | undefined {
+  const list = typeof raw === "object" && raw !== null ? (raw as { mockHits?: unknown }).mockHits : undefined;
+  if (!Array.isArray(list)) return undefined;
+  const out: FixtureMockHit[] = [];
+  for (const h of list) {
+    if (typeof h !== "object" || h === null) return undefined;
+    const { method, url, hits } = h as Record<string, unknown>;
+    if (typeof url !== "string" || typeof hits !== "number" || (method !== undefined && typeof method !== "string")) return undefined;
+    out.push({ ...(method !== undefined ? { method } : {}), url, hits });
+  }
+  return out;
+}
 
 export interface FixtureSetupOptions {
   /** Host gate for `fixture.network`; passed to `applyFixture`. */
@@ -32,17 +51,25 @@ export interface FixtureSetup {
    * No-op when `setup` never ran.
    */
   release: () => Promise<void>;
+  /**
+   * Hit count per network rule, as the bridge's `releaseFixture` reported it. Undefined until `release()` has
+   * released a fixture with mocks, or when the bridge reports none (an older bridge, or an IPC layer that drops
+   * the result). Pass it to `unmatchedMocks`.
+   */
+  mockHits: () => FixtureMockHit[] | undefined;
 }
 
 export function createFixtureSetup(browser: BrowserBridge, fixture: PageFixture, opts: FixtureSetupOptions): FixtureSetup {
   const timeoutMs = opts.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS;
   let released = false;
   let token: string | undefined;
+  let hits: FixtureMockHit[] | undefined;
 
   /** Bounded: a bridge that hangs must not hold the result of a finished run. */
   async function releaseToken(t: string): Promise<void> {
     try {
-      await boundedCall(() => browser.releaseFixture?.(t), timeoutMs);
+      const raw = await boundedCall(() => browser.releaseFixture?.(t), timeoutMs);
+      if (raw.done) hits ??= mockHitsOfRelease(raw.value);
     } catch {
       // A failed release cannot change the result of the run.
     }
@@ -84,5 +111,5 @@ export function createFixtureSetup(browser: BrowserBridge, fixture: PageFixture,
     if (token !== undefined) await releaseToken(token);
   }
 
-  return { setup, release };
+  return { setup, release, mockHits: () => hits };
 }

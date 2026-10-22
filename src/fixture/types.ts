@@ -136,6 +136,19 @@ export type ParsePageFixtureResult = { ok: true; value: PageFixture } | { ok: fa
 /** A JS dialog (`alert`, `confirm`, ...) the browser handled on its own during a command. */
 export type FixtureDialog = Record<string, unknown>;
 
+/** How often one network rule answered a request. `method` is the rule's own (absent when the rule matches any). */
+export interface FixtureMockHit {
+  method?: string;
+  url: string;
+  hits: number;
+}
+
+/** What a release hands back (`BrowserController.releaseFixture`, `releaseFixture` of a bridge): the hit counts of the released mocks. */
+export interface FixtureReleaseResult {
+  /** One entry per network rule, in fixture order. Absent when the released fixture had no mocks. */
+  mockHits?: FixtureMockHit[];
+}
+
 export type FixtureApplyResult =
   /** `summary` is safe for a model: counts only, no cookie or storage data.
    * `dialogs` lists the dialogs auto-handled while the fixture ran (controller path). */
@@ -147,6 +160,8 @@ export type FixtureApplyResult =
       dialogs?: FixtureDialog[];
       /** Present when the apply installed network mocks: removes them. Idempotent. Call it when the task ends. */
       release?: () => Promise<void>;
+      /** Present when the apply installed network mocks: the hit count per rule so far, readable before and after `release`. */
+      mockHits?: () => FixtureMockHit[];
       /** Set by `BrowserController.applyFixture` when mocks are installed: hand it to `releaseFixture(token)`. Opaque, no secrets. */
       fixtureToken?: string;
     }

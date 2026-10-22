@@ -2,10 +2,12 @@
 // backend (src/ai/tools.ts). The JSON schemas the model sees must stay
 // byte-identical, so field order, descriptions and limits do not change.
 //
-// browse_screenshot is split: the package owns `annotate`; a host that lets
+// browse_screenshot is split: the package owns `annotate` and `waitFor`; a host that lets
 // the model place the capture somewhere (Pen Editor: `placeOnCanvas`, `x`,
 // `y`) adds those fields with `.extend({...})`. Extended keys come after
-// `annotate`, which is the order Pen Editor's schema has today.
+// `annotate` and `waitFor`, which is the order Pen Editor's schema has today.
+// 2026-10-22: the screenshot schema gained `waitFor` (after `annotate`, before the host
+// extensions), and the golden file was regenerated on purpose for it. Its `ms` is 0..15000.
 import { z } from "zod";
 import { VIEWPORT_DEVICES, VIEWPORT_MAX, VIEWPORT_MIN } from "../shared/viewport.js";
 
@@ -357,6 +359,21 @@ export const browseScreenshotInputSchema = z.object({
     .optional()
     .describe(
       "If true, overlays numbered labels on interactive elements and also returns snapshotId + elements for acting by index. Default false (plain screenshot).",
+    ),
+  waitFor: z
+    .object({
+      text: z.string().optional().describe("Wait until this text is visible on the page."),
+      selector: z.string().optional().describe("Wait until an element matching this CSS selector is visible. Plain CSS only."),
+      ms: z
+        .number()
+        .min(0)
+        .max(15000)
+        .optional()
+        .describe("Time limit for the wait, default 5000, max 15000. Without text or selector: a fixed pause, max 3000."),
+    })
+    .optional()
+    .describe(
+      "Wait before the capture. If the wait times out, the screenshot is still taken and the result has waitTimedOut: true.",
     ),
 });
 

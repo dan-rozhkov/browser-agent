@@ -36,6 +36,30 @@ describe("qaOutcome", () => {
   });
 });
 
+describe("qaOutcome with a failed agent check", () => {
+  const pass = { verdict: "pass" as const, reason: "all fine" };
+  const rec = (text: string, passed: boolean, source: "agent" | "final" = "agent") => ({ source, check: { type: "text" as const, text }, passed, ...(passed ? {} : { error: "bad" }) });
+  it("downgrades pass to inconclusive when the last qa_assert call had a failed check", () => {
+    expect(qaOutcome("done", pass, rec("a", false))).toBe("inconclusive");
+    const qa = qaResultOf({ status: "done", qaVerdict: pass }, [], { checks: [rec("a", false)] }, [rec("a", false)]);
+    expect(qa.outcome).toBe("inconclusive");
+    expect(qa.reason).toBe('Agent said pass, but check failed: text "a" present (bad). Agent reason: all fine');
+  });
+  it("keeps passed when the last call passed (an earlier failed call was replaced), and fail stays failed", () => {
+    const checks = [rec("a", false), rec("b", true)];
+    expect(qaResultOf({ status: "done", qaVerdict: pass }, [], { checks }, [rec("b", true)]).outcome).toBe("passed");
+    expect(qaResultOf({ status: "done", qaVerdict: pass }, [], { checks }, []).outcome).toBe("passed");
+    expect(qaResultOf({ status: "done", qaVerdict: { verdict: "fail", reason: "x" } }, [], { checks }, [rec("a", false)]).outcome).toBe("failed");
+  });
+});
+
+describe("QA_IRREVERSIBLE_LINE", () => {
+  it("allows a destructive step only when the scenario names it", () => {
+    expect(QA_IRREVERSIBLE_LINE).toContain("only when the scenario names that step");
+    expect(QA_IRREVERSIBLE_LINE).toContain("Close it or cancel it");
+  });
+});
+
 describe("qaResultOf", () => {
   const step = (i: number): QaStep => ({ index: i, tool: `t${i}`, args: {}, ok: true, ms: 9 });
 

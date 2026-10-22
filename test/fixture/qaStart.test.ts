@@ -423,6 +423,25 @@ describe("BrowserController: release lifetime", () => {
     expect(t.unrouted).toBe(1);
   });
 
+  it("releaseFixture reports the hit counts of the released mocks, once, and the result carries no mockHits", async () => {
+    const t = fakeTarget({ withNetwork: true, exec });
+    const c = new BrowserController(t);
+    const r = await c.applyFixture({ version: 1, network: [{ url: "https://api.a.test/*" }, { method: "GET", url: "https://nope.test/x" }] }, allow);
+    expect("mockHits" in r).toBe(false);
+    t.handler!({ url: "https://api.a.test/v1", method: "GET" });
+    expect(await c.releaseFixture()).toEqual({
+      mockHits: [{ url: "https://api.a.test/*", hits: 1 }, { method: "GET", url: "https://nope.test/x", hits: 0 }],
+    });
+    expect(await c.releaseFixture()).toBeUndefined();
+  });
+
+  it("a release of a fixture without mocks reports no counts", async () => {
+    const t = fakeTarget({ withNetwork: true, exec });
+    const c = new BrowserController(t);
+    await c.applyFixture({ version: 1, url: "https://a.test/" }, allow);
+    expect(await c.releaseFixture()).toBeUndefined();
+  });
+
   it("a new applyFixture releases the previous mocks first", async () => {
     const t = fakeTarget({ withNetwork: true, exec });
     const c = new BrowserController(t);

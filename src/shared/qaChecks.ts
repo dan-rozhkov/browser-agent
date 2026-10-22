@@ -20,6 +20,21 @@ export const QA_FINAL_CHECKS_TIMEOUT_MS = 30_000;
 export const QA_ELEMENT_STATES: readonly QaElementState[] = ["visible", "hidden", "exists", "absent", "enabled", "disabled", "checked", "unchecked"];
 
 export const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+/** Playwright-only selector syntax. The page script uses `document.querySelector`, so these fail there. */
+const PLAYWRIGHT_SELECTOR =
+  /(?:^|[\s>+~,(])(?:text|css|xpath|role|id|data-testid|internal:[a-z-]+)\s*=|:has-text\(|:text\(|:text-is\(|:text-matches\(|:nth-match\(|:visible\b|>>/i;
+
+/**
+ * True when `selector` holds Playwright pseudo syntax that plain CSS does not know. Best effort: quoted
+ * strings and bracketed attribute selectors are removed first, so `[role=dialog]` and `[data-x="a>>b"]`
+ * (valid CSS) pass.
+ */
+export const hasPlaywrightSelectorSyntax = (selector: string): boolean =>
+  PLAYWRIGHT_SELECTOR.test(selector.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, "").replace(/\[[^\]]*\]/g, ""));
+
+export const QA_SELECTOR_SYNTAX_ERROR =
+  'selector: Playwright syntax (text=, css=, xpath=, role=, :has-text(), :text(), :visible, >>) is not supported; use a plain CSS selector, or {type:"text", text} for text on the page, or an "index" from the latest snapshot for an element';
+
 const isCount = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 /** Drops the conflicting zero comparators of a `count` check in place. */
@@ -110,6 +125,7 @@ export function parseQaChecks(rawInput: unknown): { ok: true; value: QaCheck[] }
       const selector = str("selector");
       const index = num("index");
       if (selector !== undefined && selector.trim() === "") fail("selector: must not be empty");
+      else if (selector !== undefined && hasPlaywrightSelectorSyntax(selector)) fail(QA_SELECTOR_SYNTAX_ERROR);
       if (selector === undefined && index === undefined && errors.length === before) fail('give a "selector" or an "index"');
       return { ...(selector !== undefined ? { selector } : {}), ...(index !== undefined ? { index } : {}) };
     };
@@ -148,13 +164,15 @@ export function parseQaChecks(rawInput: unknown): { ok: true; value: QaCheck[] }
       case "count": {
         const selector = str("selector");
         if (selector === undefined || selector.trim() === "") fail('"selector" is required and must not be empty');
+        else if (hasPlaywrightSelectorSyntax(selector)) fail(QA_SELECTOR_SYNTAX_ERROR);
+        if (raw.visible !== undefined && typeof raw.visible !== "boolean") fail("visible: expected a boolean");
         const equals = num("equals");
         const min = num("min");
         const max = num("max");
         if (equals === undefined && min === undefined && max === undefined && errors.length === before) fail('give "equals", "min" or "max"');
         if (min !== undefined && max !== undefined && min > max && errors.length === before) fail("min: must not be above max");
         if (errors.length === before) {
-          value.push({ type: "count", selector: selector as string, ...(equals !== undefined ? { equals } : {}), ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) });
+          value.push({ type: "count", selector: selector as string, ...(raw.visible === true ? { visible: true } : {}), ...(equals !== undefined ? { equals } : {}), ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}) });
         }
         break;
       }
@@ -199,7 +217,7 @@ export function describeQaCheck(check: QaCheck): string {
     case "value":
       return `value of ${where(check)} ${check.equals !== undefined ? `equals "${check.equals}"` : `contains "${check.contains}"`}`;
     case "count":
-      return `count of ${check.selector}${check.equals !== undefined ? ` equals ${check.equals}` : ""}${check.min !== undefined ? ` min ${check.min}` : ""}${check.max !== undefined ? ` max ${check.max}` : ""}`;
+      return `count of ${check.visible === true ? "visible " : ""}${check.selector}${check.equals !== undefined ? ` equals ${check.equals}` : ""}${check.min !== undefined ? ` min ${check.min}` : ""}${check.max !== undefined ? ` max ${check.max}` : ""}`;
     case "url":
       return `url ${check.equals !== undefined ? `equals ${check.equals}` : check.contains !== undefined ? `contains ${check.contains}` : `matches ${check.matches}`}`;
     case "no_console_errors":

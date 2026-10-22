@@ -75,7 +75,7 @@ export function describeBrowseScreenshot(slots: BrowseDescriptionSlots = {}): st
     slots.taskHint,
     "Take a screenshot of the browser tab's current viewport (not the whole page) for visual verification — use this when the layout itself matters (does a modal actually cover the CTA, is a canvas-rendered widget visible, does this look broken) rather than just \"what's clickable\", which browse_snapshot answers more cheaply. Returns `{ url, title, width, height }` plus the image" +
       (slots.screenshotVisionNote ? "; " + slots.screenshotVisionNote : "") +
-      ". Pass `annotate: true` to additionally get numbered labels drawn over every interactive element PLUS `snapshotId` and `elements` (the same shape as browse_snapshot) in the same call — use this set-of-marks mode when you want to both see the page and act on it by index in one round trip, instead of calling browse_snapshot separately first.",
+      ". Pass `annotate: true` to additionally get numbered labels drawn over every interactive element PLUS `snapshotId` and `elements` (the same shape as browse_snapshot) in the same call — use this set-of-marks mode when you want to both see the page and act on it by index in one round trip, instead of calling browse_snapshot separately first. `waitFor`: wait for text or a CSS selector to be visible before capture; use it after an action that opens a dialog or menu. If the wait times out, the image is still returned with `waitTimedOut: true`.",
     slots.screenshotPlacement,
   );
 }

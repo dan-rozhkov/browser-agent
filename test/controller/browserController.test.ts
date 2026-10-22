@@ -2369,6 +2369,196 @@ describe("screenshot", () => {
     expect(capture).not.toHaveBeenCalled();
   });
 
+  describe("waitFor", () => {
+    const okCapture = () => vi.fn(() => Promise.resolve({ imageData: "data:image/jpeg;base64,AAAA", width: 4, height: 4 }));
+    const isSelectorPoll = (code: string) => code.includes("function penBoxVisible") && code.includes("document.querySelectorAll(") && code.includes("penBoxVisible(els[i])");
+
+    it("rejects malformed waitFor and Playwright selectors before touching the page", async () => {
+      const capture = okCapture();
+      const controller = new BrowserController(makeFakeTarget(makeFakePage({ capture })));
+      const bad: unknown[] = [
+        "dialog",
+        [],
+        { text: "" },
+        { text: 5 },
+        { selector: " " },
+        { selector: "text=Save" },
+        { selector: "button:has-text('Save')" },
+        { selector: "div >> button" },
+        { selector: "div text=Save" },
+        { selector: "li:nth-match(:visible, 2)" },
+        { ms: -1 },
+        { ms: "5" },
+      ];
+      for (const waitFor of bad) {
+        expect(await controller.screenshot({ waitFor }), JSON.stringify(waitFor)).toHaveProperty("error");
+      }
+      const pw = (await controller.screenshot({ waitFor: { selector: "text=Save" } })) as { error: string };
+      expect(pw.error).toMatch(/plain CSS selector/);
+      expect(capture).not.toHaveBeenCalled();
+    });
+
+    it("accepts ordinary CSS attribute selectors", async () => {
+      const page = makeFakePage({
+        capture: okCapture(),
+        executeJavaScript: vi.fn((code: string) => Promise.resolve(isSelectorPoll(code) ? { found: true } : { ok: true })),
+      });
+      const result = await new BrowserController(makeFakeTarget(page)).screenshot({ waitFor: { selector: '[data-testid="dlg"] .title' } });
+      expect(result).toHaveProperty("imageData");
+    });
+
+    it("waits for text until it appears, then captures without a timeout flag", async () => {
+      let polls = 0;
+      const order: string[] = [];
+      const page = makeFakePage({
+        executeJavaScript: vi.fn((code: string) => {
+          if (code.includes("indexOf(needle)")) {
+            polls++;
+            order.push("poll");
+            return Promise.resolve({ found: polls >= 3 });
+          }
+          return Promise.resolve({ ok: true });
+        }),
+        capture: vi.fn(() => {
+          order.push("capture");
+          return Promise.resolve({ imageData: "data:image/jpeg;base64,AAAA", width: 4, height: 4 });
+        }),
+      });
+      const result = (await new BrowserController(makeFakeTarget(page)).screenshot({ waitFor: { text: "Confirm" } })) as Record<string, unknown>;
+      expect(polls).toBe(3);
+      expect(order).toEqual(["poll", "poll", "poll", "capture"]);
+      expect(result.imageData).toBeTruthy();
+      expect(result).not.toHaveProperty("waitTimedOut");
+    });
+
+    it("waits for a visible selector", async () => {
+      let polls = 0;
+      const page = makeFakePage({
+        capture: okCapture(),
+        executeJavaScript: vi.fn((code: string) => {
+          if (isSelectorPoll(code)) return Promise.resolve({ found: ++polls >= 2 });
+          return Promise.resolve({ ok: true });
+        }),
+      });
+      const result = (await new BrowserController(makeFakeTarget(page)).screenshot({ waitFor: { selector: "[role=dialog]" } })) as Record<string, unknown>;
+      expect(polls).toBeGreaterThanOrEqual(2); // the poll interval is real time: do not pin the exact count
+      expect(result).not.toHaveProperty("waitTimedOut");
+    });
+
+    it("the selector poll uses the shared visibility test, which skips the cursor and marks overlays", async () => {
+      const seen: string[] = [];
+      const page = makeFakePage({
+        capture: okCapture(),
+        executeJavaScript: vi.fn((code: string) => {
+          if (isSelectorPoll(code)) {
+            seen.push(code);
+            return Promise.resolve({ found: true });
+          }
+          return Promise.resolve({ ok: true });
+        }),
+      });
+      await new BrowserController(makeFakeTarget(page)).screenshot({ waitFor: { selector: ".x" } });
+      expect(seen[0]).toContain('closest("[data-pen-cursor]")');
+      expect(seen[0]).toContain('closest("[data-pen-marks]")');
+    });
+
+    it("settles animations only when waitFor is given, ignoring the cursor and marks overlays", async () => {
+      const settleCalls = (waitFor?: unknown) => {
+        const codes: string[] = [];
+        const page = makeFakePage({
+          capture: okCapture(),
+          executeJavaScript: vi.fn((code: string) => {
+            if (code.includes("getAnimations")) codes.push(code);
+            return Promise.resolve({ ok: true, found: true });
+          }),
+        });
+        return new BrowserController(makeFakeTarget(page)).screenshot(waitFor ? { waitFor } : undefined).then(() => codes);
+      };
+      expect(await settleCalls()).toHaveLength(0);
+      const withWait = await settleCalls({ ms: 1 });
+      expect(withWait).toHaveLength(1);
+      expect(withWait[0]).toContain("[data-pen-cursor]");
+      expect(withWait[0]).toContain("[data-pen-marks]");
+    });
+
+    it("runs the wait before the stale-snapshot check", async () => {
+      const capture = okCapture();
+      const polled: string[] = [];
+      const page = makeFakePage({
+        capture,
+        executeJavaScript: vi.fn((code: string) => {
+          if (isSelectorPoll(code)) polled.push("poll");
+          return Promise.resolve({ ok: true, found: true });
+        }),
+      });
+      const r = (await new BrowserController(makeFakeTarget(page)).screenshot({ annotate: true, snapshotId: "gone", waitFor: { selector: ".x" } })) as { error?: string };
+      expect(polled).toEqual(["poll"]);
+      expect(r.error).toMatch(/stale|unknown/i);
+      expect(capture).not.toHaveBeenCalled();
+    });
+
+    it("on timeout still captures and flags waitTimedOut with a note", async () => {
+      const capture = okCapture();
+      const page = makeFakePage({
+        capture,
+        executeJavaScript: vi.fn(() => Promise.resolve({ found: false })),
+      });
+      const result = (await new BrowserController(makeFakeTarget(page)).screenshot({
+        waitFor: { text: "Never", selector: ".modal", ms: 250 },
+      })) as Record<string, unknown>;
+      expect(capture).toHaveBeenCalledTimes(1);
+      expect(result.imageData).toBeTruthy();
+      expect(result.waitTimedOut).toBe(true);
+      expect(String(result.waitNote)).toMatch(/Timed out after 250ms.*text "Never".*selector "\.modal"/);
+    });
+
+    it("returns an error for a selector the page cannot parse (no timeout wait)", async () => {
+      const capture = okCapture();
+      const page = makeFakePage({
+        capture,
+        executeJavaScript: vi.fn((code: string) =>
+          Promise.resolve(isSelectorPoll(code) ? { invalid: "'div[' is not a valid selector" } : { ok: true }),
+        ),
+      });
+      const result = (await new BrowserController(makeFakeTarget(page)).screenshot({ waitFor: { selector: "div[" } })) as { error: string };
+      expect(result.error).toMatch(/not a valid CSS selector/);
+      expect(capture).not.toHaveBeenCalled();
+    });
+
+    it("ms alone is a fixed pause capped at 3000 and never flags a timeout", async () => {
+      vi.useFakeTimers();
+      try {
+        const capture = okCapture();
+        const pending = new BrowserController(makeFakeTarget(makeFakePage({ capture }))).screenshot({ waitFor: { ms: 60_000 } });
+        await vi.advanceTimersByTimeAsync(2_900);
+        expect(capture).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(300);
+        const result = (await pending) as Record<string, unknown>;
+        expect(capture).toHaveBeenCalledTimes(1);
+        expect(result).not.toHaveProperty("waitTimedOut");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a page that never answers the animation settle does not block the capture", async () => {
+      vi.useFakeTimers();
+      try {
+        const capture = okCapture();
+        const page = makeFakePage({
+          capture,
+          executeJavaScript: vi.fn((code: string) => (code.includes("getAnimations") ? new Promise(() => {}) : Promise.resolve({ ok: true }))),
+        });
+        const pending = new BrowserController(makeFakeTarget(page)).screenshot(undefined);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(await pending).toHaveProperty("imageData");
+        expect(capture).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   describe("annotate with a caller-supplied snapshotId", () => {
     function setup(marked: number) {
       let snapshots = 0;

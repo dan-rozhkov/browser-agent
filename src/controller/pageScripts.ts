@@ -185,7 +185,7 @@ const TEXT_CLEAN_JS = `
  * relocation and the radio/checkbox label proxy all use this copy.
  * Nodes inside the cursor / marks overlays are never visible to it.
  */
-const BOX_VISIBLE_JS = `
+export const BOX_VISIBLE_JS = `
   function penBoxVisible(node) {
     if (node.closest && (node.closest("[data-pen-cursor]") || node.closest("[data-pen-marks]"))) return false;
     var r = node.getBoundingClientRect();
@@ -7740,7 +7740,11 @@ export const ASSERT_JS = `(() => {
   function checkCount(check) {
     var n;
     try {
-      n = document.querySelectorAll(check.selector).length;
+      var list = document.querySelectorAll(check.selector);
+      n = 0;
+      for (var li = 0; li < list.length; li++) {
+        if (!check.visible || penBoxVisible(list[li])) n++;
+      }
     } catch (err) {
       return { passed: false, error: "Invalid selector: " + cut(check.selector, 80) };
     }

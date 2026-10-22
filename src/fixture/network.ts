@@ -1,7 +1,7 @@
 // Network mock rules of a PageFixture: the URL matcher, rule choice with
 // `times` counting, and the response a target sends. Isomorphic and zod-free.
 // Docs: docs/specs/2026-10-15-qa-start-design.md (part 2).
-import type { FixtureMockResponse, FixtureNetworkRule, FixtureRequestInfo } from "./types.js";
+import type { FixtureMockHit, FixtureMockResponse, FixtureNetworkRule, FixtureRequestInfo } from "./types.js";
 
 const SCHEME_AND_HOST = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#*]*)([\s\S]*)$/;
 
@@ -77,13 +77,22 @@ export function buildMockResponse(rule: FixtureNetworkRule): FixtureMockResponse
   return { status: rule.status ?? 200, headers, body, ...delay };
 }
 
+/** A `routeRequests` handler that also reports how often each rule answered. */
+export type NetworkHandler = ((req: FixtureRequestInfo) => FixtureMockResponse | undefined) & {
+  /** Hit count per rule, in fixture order. Readable at any time, also after the mocks were removed. */
+  hits(): FixtureMockHit[];
+};
+
 /** A `routeRequests` handler for `rules`: counts uses, so a rule with `times` stops after N answers. */
-export function createNetworkHandler(rules: readonly FixtureNetworkRule[]): (req: FixtureRequestInfo) => FixtureMockResponse | undefined {
+export function createNetworkHandler(rules: readonly FixtureNetworkRule[]): NetworkHandler {
   const used = rules.map(() => 0);
-  return (req) => {
+  const handler = (req: FixtureRequestInfo): FixtureMockResponse | undefined => {
     const i = pickNetworkRule(rules, used, req);
     if (i < 0) return undefined;
     used[i] += 1;
     return buildMockResponse(rules[i]);
   };
+  return Object.assign(handler, {
+    hits: (): FixtureMockHit[] => rules.map((rule, i) => ({ ...(rule.method !== undefined ? { method: rule.method } : {}), url: rule.url, hits: used[i] ?? 0 })),
+  });
 }

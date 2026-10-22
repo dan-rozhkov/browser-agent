@@ -69,7 +69,15 @@ describe("runBrowseAgent: qa_assert", () => {
     expect(JSON.stringify(model.doGenerateCalls[0]!.prompt)).toContain(QA_PROMPT_SECTION.split("\n")[1]!.slice(0, 40));
   });
 
-  it("runs the checks, records them as agent checks, does not change the outcome, and may repeat", async () => {
+  it("downgrades pass to inconclusive when the last qa_assert call still has a failed check", async () => {
+    const { bridge } = assertingBrowser();
+    const model = scripted([assertStep([{ type: "text", text: "Done" }]), assertStep([{ type: "text", text: "missing" }]), verdict("pass", "saw Done"), { text: "fin" }]);
+    const qa = qaOf(await runBrowseAgent("goal", { model, browser: bridge, qa: true }));
+    expect(qa.outcome).toBe("inconclusive");
+    expect(qa.reason).toContain('Agent said pass, but check failed: text "missing" present (not found). Agent reason: saw Done');
+  });
+
+  it("runs the checks, records them as agent checks, does not change the outcome when a later call passes, and may repeat", async () => {
     const { bridge, calls } = assertingBrowser();
     const model = scripted([assertStep([{ type: "text", text: "missing" }]), assertStep([{ type: "text", text: "Done" }]), verdict("pass", "saw Done"), { text: "fin" }]);
     const r = await runBrowseAgent("goal", { model, browser: bridge, qa: true });

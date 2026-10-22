@@ -51,6 +51,8 @@ interface FixtureNetworkRule {
 
 - The matcher (`matchUrlPattern`, `pickNetworkRule`) is isomorphic and lives in `src/fixture/network.ts`.
   First matching rule wins (fixture order). Rules with exhausted `times` are skipped.
+  `createNetworkHandler(rules)` returns a handler with `hits()` (`{ method?, url, hits }` per rule); the release
+  hands the counts back, and `QaResult.unmatchedMocks` lists the rules with 0 hits.
 - Target surface: optional `BrowserTarget.routeRequests?(handler): Promise<() => Promise<void>>`.
   `handler(req: { url, method }) => FixtureMockResponse | undefined` — `undefined` lets the request
   through. The returned function removes the interception.

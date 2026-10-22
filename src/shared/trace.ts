@@ -416,6 +416,7 @@ export function parseBrowseTrace(value: unknown): { trace: BrowseTrace } | { err
   if (!optStr(value.answer) || !optStr(value.error)) return { error: "answer, error: expected strings" };
   if (value.labels !== undefined && (!isObject(value.labels) || !Object.values(value.labels).every(isStr))) return { error: "labels: expected string values" };
   if (value.qa !== undefined && (!isObject(value.qa) || !isStr(value.qa.outcome) || !Array.isArray(value.qa.steps))) return { error: "qa: invalid" };
+  if (value.qa !== undefined && value.qa.unmatchedMocks !== undefined && !(Array.isArray(value.qa.unmatchedMocks) && value.qa.unmatchedMocks.every((m) => isObject(m) && isStr(m.url) && optStr(m.method)))) return { error: "qa.unmatchedMocks: invalid" };
   if (value.dropped !== undefined && (!isObject(value.dropped) || !Object.values(value.dropped).every(isNum))) return { error: "dropped: expected numbers" };
   const problem =
     listProblem("steps", value.steps, (s) => isNum(s.index) && isStr(s.tool) && isNum(s.startedAt) && isNum(s.endedAt) && typeof s.ok === "boolean" && optStr(s.error) && optStr(s.output) && (s.actions === undefined || (Array.isArray(s.actions) && s.actions.length <= BROWSE_TRACE_MAX_ACTIONS && s.actions.every(isAction)))) ??

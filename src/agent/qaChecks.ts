@@ -122,7 +122,7 @@ function finalFailureReason(failure: string, agentReason: string): string {
 }
 
 /**
- * Adds the host's final check results to a `qa` result (source "final"). Outcome `passed` with a
+ * Adds the host's final check results to a `qa` result (source "final"). Outcome `passed` (or `inconclusive` after a pass verdict) with a
  * failed final check becomes `failed`, with reason `Final check failed: <first failure>. Agent
  * verdict: <reason>`. Other outcomes do not change; neither does a result the final checks do not apply to
  * (`setup_failed`, `aborted`, `error`): it comes back as is.
@@ -132,7 +132,8 @@ export function applyFinalChecks(qa: QaResult, results: readonly QaCheckResult[]
   const records: QaCheckRecord[] = results.map((r) => ({ source: "final" as const, ...r }));
   const next: QaResult = { ...qa, checks: [...(qa.checks ?? []), ...records] };
   const firstFailure = results.find((r) => !r.passed);
-  if (qa.outcome === "passed" && firstFailure) {
+  // A pass the agent check rule downgraded to inconclusive (verdict "pass") also fails on a failed final check.
+  if ((qa.outcome === "passed" || (qa.outcome === "inconclusive" && qa.verdict === "pass")) && firstFailure) {
     next.outcome = "failed";
     next.reason = finalFailureReason(describeQaCheckFailure(firstFailure), qa.reason ?? "pass");
   }

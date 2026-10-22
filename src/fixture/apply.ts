@@ -16,6 +16,7 @@ import {
   type FixtureDialog,
   type FixtureHookResult,
   type FixtureHooks,
+  type FixtureMockHit,
   type FixtureStage,
   type FixtureStep,
   type PageFixture,
@@ -36,6 +37,8 @@ interface Ctx {
   stage: FixtureStage;
   /** Removes the installed network mocks and clears the emulation (idempotent); undefined when none. */
   release: (() => Promise<void>) | undefined;
+  /** Hit counts of the installed network handler; undefined when no mocks. */
+  mockHits: (() => FixtureMockHit[]) | undefined;
   /** What `release` undoes, in install order. Filled through `addCleanup`. */
   cleanups: Array<() => Promise<void>>;
 }
@@ -629,8 +632,9 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   if (rules.length > 0) {
     enter(ctx, "network");
     let remove: () => Promise<void>;
+    const handler = createNetworkHandler(rules);
     try {
-      remove = await target.routeRequests!(createNetworkHandler(rules));
+      remove = await target.routeRequests!(handler);
     } catch (err) {
       // The target's message may quote a rule.
       if (signal?.aborted) throw err;
@@ -638,6 +642,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
     }
     // Set before the abort check: a failure from here on removes the mocks.
     addCleanup(ctx, remove);
+    ctx.mockHits = handler.hits;
     throwIfAborted(signal);
   }
 
@@ -750,7 +755,7 @@ async function run(ctx: Ctx, fixture: PageFixture): Promise<FixtureApplyResult> 
   // A new tab became current: the agent works on the main tab. This read is `prepare`, not the stage of the last feature.
   enter(ctx, "prepare");
   const page = await mainPage(ctx);
-  return { ok: true, url: page.getURL(), title: page.getTitle(), summary: summarize(fixture), ...(ctx.release ? { release: ctx.release } : {}) };
+  return { ok: true, url: page.getURL(), title: page.getTitle(), summary: summarize(fixture), ...(ctx.release ? { release: ctx.release } : {}), ...(ctx.mockHits ? { mockHits: ctx.mockHits } : {}) };
 }
 
 /** Per-navigation and per-settle budgets a host may know better than the standalone defaults. */
@@ -805,6 +810,7 @@ export async function applyParsedFixture(
     allowNetworkMocks: opts.allowNetworkMocks === true,
     stage: "validate",
     release: undefined,
+    mockHits: undefined,
     cleanups: [],
   };
   const withDialogs = <T extends FixtureApplyResult>(result: T): T => (ctx.dialogs.length > 0 ? { ...result, dialogs: ctx.dialogs } : result);

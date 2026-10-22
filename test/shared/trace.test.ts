@@ -258,3 +258,17 @@ describe("parseBrowseTrace: actions and requests", () => {
     expect(parseBrowseTrace({ ...base, requests: Array.from({ length: 2001 }, () => ({ at: 1, method: "GET", url: "u" })) })).toEqual({ error: "requests: too many entries" });
   });
 });
+
+describe("parseBrowseTrace: qa.unmatchedMocks", () => {
+  const qa = (extra: object) => ({ ...sample(), qa: { outcome: "passed", steps: [], ...extra } });
+
+  it("accepts a trace with and without the field", () => {
+    expect("trace" in parseBrowseTrace(qa({}))).toBe(true);
+    expect("trace" in parseBrowseTrace(qa({ unmatchedMocks: [{ url: "https://a.test/x" }, { method: "GET", url: "https://a.test/y" }] }))).toBe(true);
+  });
+
+  it("rejects a malformed field", () => {
+    expect(parseBrowseTrace(qa({ unmatchedMocks: "x" }))).toEqual({ error: "qa.unmatchedMocks: invalid" });
+    expect(parseBrowseTrace(qa({ unmatchedMocks: [{ method: "GET" }] }))).toEqual({ error: "qa.unmatchedMocks: invalid" });
+  });
+});

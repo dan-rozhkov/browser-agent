@@ -52,7 +52,7 @@ import { mergeCarriedDialogs } from "../shared/dialogs.js";
 import { createBrowseTraceRecorder, type BrowseTraceRecorder } from "./traceRecorder.js";
 import type { BrowseTrace } from "../shared/trace.js";
 import { createRunCheckpoint } from "./checkpoint.js";
-import { createFixtureSetup } from "./fixtureSetup.js";
+import { createFixtureSetup, unmatchedMocks } from "./fixtureSetup.js";
 import { browseAgentErrorMessage, type BrowseAgentMessage, type BrowseAgentMessagePart, type BrowseAgentResult } from "./result.js";
 import {
   createBrowseAgentSession,
@@ -594,17 +594,22 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     } else {
       // `qa` is an extra field: it goes before `error` and `setupStage`, and the verdict field is folded into it.
       const { error, setupStage, [QA_VERDICT_FIELD]: _verdict, ...rest } = result;
-      let qa = qaResultOf(result, trail.steps(), trail.extras());
+      let qa = qaResultOf(result, trail.steps(), trail.extras(), trail.lastAgentCall());
       if (finalChecks && finalChecksApply(qa)) {
         // The mocks live until the release in `finally`. The checks run bounded; a failure to run them fails every check.
         const finalResults = await runFinalChecks(opts.browser, finalChecks, trail);
         // The final assert drained more errors into the recorder: refresh the run-level lists (the steps did not change).
         qa = applyFinalChecks({ ...qa, ...trail.extras() }, finalResults);
       }
+      const withUnmatchedMocks = (q: QaResult): QaResult => {
+        const unmatched = unmatchedMocks(fixtureSetup?.mockHits());
+        return unmatched.length > 0 ? { ...q, unmatchedMocks: unmatched } : q;
+      };
       const assemble = (q: QaResult) =>
         ({
           ...rest,
-          qa: q,
+          // Read at assembly time, after the release in `finally` has handed the mocks' hit counts over.
+          qa: withUnmatchedMocks(q),
           ...(error !== undefined ? { error } : {}),
           ...(setupStage !== undefined ? { setupStage } : {}),
         }) as BrowseAgentResult;

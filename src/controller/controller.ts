@@ -13,7 +13,7 @@
 // (and how dispatcher.ts's ToolCallResult never rejects either).
 
 import { decideBrowserNavigation } from "./navigation.js";
-import { evaluateQaChecks, parseQaChecks } from "../shared/qaChecks.js";
+import { evaluateQaChecks, hasPlaywrightSelectorSyntax, parseQaChecks } from "../shared/qaChecks.js";
 import type { QaCheckResult } from "../shared/qaTypes.js";
 import { applyParsedFixture, fixtureBudgetMs } from "../fixture/apply.js";
 import { boundedCall, httpOrigin, redactUrl, redactUrls, withTimeout } from "../fixture/util.js";
@@ -35,7 +35,9 @@ import type {
   FixtureOrigin,
   FixtureHookResult,
   FixtureHooks,
+  FixtureMockHit,
   FixtureMockResponse,
+  FixtureReleaseResult,
   FixtureRequestInfo,
   FixtureStage,
   FixtureStep,
@@ -93,6 +95,7 @@ import {
   IFRAME_RECTS_JS,
   SELECTOR_JS,
   DOC_MARKER_JS,
+  BOX_VISIBLE_JS,
 } from "./pageScripts.js";
 
 const randomUUID = () => globalThis.crypto.randomUUID();
@@ -1139,7 +1142,7 @@ function validateIndexSnapshot(
 
 function validateScreenshotArgs(
   args: unknown,
-): { ok: true; value: { annotate: boolean; snapshotId?: string } } | { ok: false; error: string } {
+): { ok: true; value: { annotate: boolean; snapshotId?: string; waitFor?: ScreenshotWaitFor } } | { ok: false; error: string } {
   if (args !== undefined && !isRecord(args)) {
     return { ok: false, error: "browse_screenshot requires an object (or no arguments)." };
   }
@@ -1147,6 +1150,9 @@ function validateScreenshotArgs(
   if (raw.annotate !== undefined && typeof raw.annotate !== "boolean") {
     return { ok: false, error: 'browse_screenshot requires "annotate" to be a boolean when provided.' };
   }
+  const wait = validateScreenshotWaitFor(raw.waitFor);
+  if (!wait.ok) return wait;
+  const waitFor = wait.value ? { waitFor: wait.value } : {};
   if (raw.snapshotId !== undefined) {
     if (raw.annotate !== true) {
       return { ok: false, error: 'browse_screenshot accepts "snapshotId" only together with "annotate": true.' };
@@ -1154,9 +1160,81 @@ function validateScreenshotArgs(
     if (typeof raw.snapshotId !== "string" || raw.snapshotId.trim() === "") {
       return { ok: false, error: 'browse_screenshot requires "snapshotId" to be a non-empty string when provided.' };
     }
-    return { ok: true, value: { annotate: true, snapshotId: raw.snapshotId } };
+    return { ok: true, value: { annotate: true, snapshotId: raw.snapshotId, ...waitFor } };
   }
-  return { ok: true, value: { annotate: raw.annotate === true } };
+  return { ok: true, value: { annotate: raw.annotate === true, ...waitFor } };
+}
+
+/** `browse_screenshot` `waitFor`: the longest wait for text / a selector, and its default. */
+const SCREENSHOT_WAIT_DEFAULT_MS = 5_000;
+const SCREENSHOT_WAIT_MAX_MS = 15_000;
+/** `waitFor: { ms }` alone is a fixed pause; it is capped here. */
+const SCREENSHOT_PAUSE_MAX_MS = 3_000;
+/** Longest wait for CSS animations to finish before a capture (in the page, and from outside). */
+const SCREENSHOT_SETTLE_MS = 500;
+const SCREENSHOT_SETTLE_OUTER_MS = 700;
+interface ScreenshotWaitFor {
+  text?: string;
+  selector?: string;
+  /** Timeout (text/selector given) or fixed pause (alone), already clamped. */
+  ms: number;
+}
+
+function validateScreenshotWaitFor(raw: unknown): { ok: true; value: ScreenshotWaitFor | undefined } | { ok: false; error: string } {
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (!isRecord(raw) || Array.isArray(raw)) {
+    return { ok: false, error: 'browse_screenshot requires "waitFor" to be an object like { text?, selector?, ms? } when provided.' };
+  }
+  const { text, selector, ms } = raw;
+  if (text !== undefined && (typeof text !== "string" || text.trim() === "")) {
+    return { ok: false, error: 'browse_screenshot requires "waitFor.text" to be a non-empty string when provided.' };
+  }
+  if (selector !== undefined && (typeof selector !== "string" || selector.trim() === "")) {
+    return { ok: false, error: 'browse_screenshot requires "waitFor.selector" to be a non-empty string when provided.' };
+  }
+  if (typeof selector === "string" && hasPlaywrightSelectorSyntax(selector)) {
+    return {
+      ok: false,
+      error: `browse_screenshot "waitFor.selector" must be a plain CSS selector; Playwright selectors (text=, :has-text(), :visible, >>) are not supported. Use "waitFor.text" for visible text.`,
+    };
+  }
+  if (ms !== undefined && (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0)) {
+    return { ok: false, error: 'browse_screenshot requires "waitFor.ms" to be a non-negative number when provided.' };
+  }
+  const hasCondition = text !== undefined || selector !== undefined;
+  if (!hasCondition && ms === undefined) return { ok: true, value: undefined };
+  const wanted = typeof ms === "number" ? ms : SCREENSHOT_WAIT_DEFAULT_MS;
+  return {
+    ok: true,
+    value: {
+      ...(typeof text === "string" ? { text } : {}),
+      ...(typeof selector === "string" ? { selector } : {}),
+      ms: Math.min(wanted, hasCondition ? SCREENSHOT_WAIT_MAX_MS : SCREENSHOT_PAUSE_MAX_MS),
+    },
+  };
+}
+
+/** A visible match of a CSS selector ("visible" as in qa_assert: `penBoxVisible`, which skips the cursor and marks overlays). Takes the selector as a JSON string literal. */
+function selectorVisibleScript(selector: string): string {
+  return (
+    "(function(){" + BOX_VISIBLE_JS + "try{var els=document.querySelectorAll(" + JSON.stringify(selector) + ");" +
+    "for(var i=0;i<els.length;i++){if(penBoxVisible(els[i]))return {found:true};}" +
+    "return {found:false};}catch(e){return {invalid:String((e&&e.message)||e)};}})()"
+  );
+}
+
+/** Resolves when finite CSS animations that end within `maxMs` are finished. Never rejects; time-bounded in the page. */
+function animationSettleScript(maxMs: number): string {
+  return (
+    "(function(){return new Promise(function(resolve){var done=false;function end(v){if(!done){done=true;resolve(v);}}" +
+    "setTimeout(function(){end(false);}," + maxMs + ");" +
+    "try{var list=(document.getAnimations?document.getAnimations():[]).filter(function(a){" +
+    "if(a.playState!=='running')return false;var tg=a.effect&&a.effect.target;if(tg&&tg.closest&&(tg.closest('[data-pen-cursor]')||tg.closest('[data-pen-marks]')))return false;var t=a.effect&&a.effect.getComputedTiming?a.effect.getComputedTiming():null;" +
+    "if(!t||!isFinite(t.endTime))return false;return (t.endTime-(t.localTime||0))<=" + maxMs + ";});" +
+    "if(!list.length){end(true);return;}" +
+    "Promise.all(list.map(function(a){return a.finished.catch(function(){});})).then(function(){end(true);});" +
+    "}catch(e){end(false);}});})()"
+  );
 }
 
 type TabsAction = "list" | "switch" | "close" | "new";
@@ -1821,11 +1899,13 @@ export class BrowserController {
             const token = `fixture-${++this.fixtureSeq}`;
             this.fixtureActive = {
               release: applied.release,
+              ...(applied.mockHits ? { mockHits: applied.mockHits } : {}),
               token,
               ...(parsed.value.emulate && emulatedPages.size > 0 ? { emulation: { emulate: parsed.value.emulate, pages: emulatedPages } } : {}),
             };
             const rest = { ...applied, fixtureToken: token };
             delete rest.release;
+            delete rest.mockHits;
             return rest as BrowserCommandResult;
           },
           fixtureBudgetMs(parsed.value, {
@@ -1852,6 +1932,7 @@ export class BrowserController {
    */
   private fixtureActive: {
     release: () => Promise<void>;
+    mockHits?: () => FixtureMockHit[];
     token: string;
     emulation?: { emulate: FixtureEmulate; pages: Set<BrowserPageHandle> };
   } | null = null;
@@ -1878,10 +1959,13 @@ export class BrowserController {
    * newer apply replaced it (a late finally of run A must not remove the mocks
    * of run B). Without a token it releases whatever is active.
    *
+   * Resolves to `{ mockHits }` (hit count per network rule) when it released a fixture that had mocks; the
+   * `unmatchedMocks` helper turns that into the rules that answered nothing. Anything else resolves to nothing.
+   *
    * Ends with a sweep: every emulation clear the controller registered runs, so no override, init script or
    * extra header the controller installed is left on any page.
    */
-  async releaseFixture(token?: string): Promise<void> {
+  async releaseFixture(token?: string): Promise<FixtureReleaseResult | void> {
     // One generation step per release: a `viewport` action still running (a timed-out one keeps going) must not install after it.
     if (token === undefined || this.fixtureActive?.token === token) this.actGeneration += 1;
     // An apply holds the queue (and may hang until its deadline): a release without a token must reach it, not wait behind it.
@@ -1890,7 +1974,7 @@ export class BrowserController {
   }
 
   /** `releaseFixture` inside the command queue (`applyFixture` already holds it). `waitFor` replaces the in-flight apply to wait for. */
-  private async releaseFixtureUnlocked(token?: string, waitFor?: Promise<void> | null): Promise<void> {
+  private async releaseFixtureUnlocked(token?: string, waitFor?: Promise<void> | null): Promise<FixtureReleaseResult | void> {
     if (token !== undefined && this.fixtureActive?.token !== token) return;
     if (token === undefined) {
       const inFlight = waitFor !== undefined ? waitFor : this.fixtureInFlight;
@@ -1916,6 +2000,8 @@ export class BrowserController {
     } finally {
       await this.sweepEmulations();
     }
+    // The counts of the released mocks (the handler keeps them after the removal). Only the call that releases gets them.
+    return active.mockHits ? { mockHits: active.mockHits() } : undefined;
   }
 
   /**
@@ -4719,17 +4805,28 @@ export class BrowserController {
   private async screenshotUnlocked(args: unknown): Promise<BrowserCommandResult> {
     const validated = validateScreenshotArgs(args);
     if (!validated.ok) return errorResult(validated.error);
-    const { annotate, snapshotId: givenSnapshotId } = validated.value;
+    const { annotate, snapshotId: givenSnapshotId, waitFor } = validated.value;
+    // The wait gets its own budget on top of the normal one, so it never eats the capture's time.
     return this.withCommandTimeout(async () => {
       const page = this.target.currentPage();
       if (!page) return errorResult("No browser tab is open — call browse_open first.");
       if (!page.capture && !this.isEmulated(page)) return errorResult("Screenshot is not supported by this browser tab.");
-      // Reusing the caller's snapshot: refuse a stale one BEFORE touching the
-      // page. Read-only — `lastSnapshot` is neither replaced nor cleared.
+      // Before anything is drawn on the page: wait for the dialog/menu the agent just opened, then let
+      // short CSS animations finish. A timeout does not fail — the image is taken and flagged below.
+      let waitNote: string | undefined;
+      if (waitFor) {
+        const waited = await this.waitBeforeScreenshot(page, waitFor);
+        if ("error" in waited) return waited;
+        waitNote = typeof waited.note === "string" ? waited.note : undefined;
+      }
+      // Reusing the caller's snapshot: refuse a stale one BEFORE drawing on the page, and after
+      // the wait (a page change during the wait is reported as the stale snapshot). Read-only —
+      // `lastSnapshot` is neither replaced nor cleared.
       if (givenSnapshotId !== undefined) {
         const stale = this.checkSnapshotStale(givenSnapshotId, page);
         if (stale) return stale;
       }
+      if (waitFor) await this.settleAnimations(page);
 
       // The agent cursor's effects (glow, trail, ripple) must not show up in
       // a screenshot: hide the whole overlay root for the capture, restore
@@ -4831,6 +4928,10 @@ export class BrowserController {
           result.marked = marked;
           if (elements !== undefined) result.elements = elements;
         }
+        if (waitNote !== undefined) {
+          result.waitTimedOut = true;
+          result.waitNote = waitNote;
+        }
         return result;
       } finally {
         await restoreCursor();
@@ -4843,7 +4944,68 @@ export class BrowserController {
           }
         }
       }
-    });
+    }, this.timeoutMs + (waitFor ? waitFor.ms : 0) + SCREENSHOT_SETTLE_OUTER_MS);
+  }
+
+  /** `browse_screenshot` `waitFor`: polls until the text and/or visible selector is there, or `ms` passed.
+   * Returns `{ note }` on a timeout (the screenshot is still taken, flagged `waitTimedOut`), `{}` on success,
+   * and an error result for a selector the page rejects. Everything is time-bounded; no requestAnimationFrame. */
+  private async waitBeforeScreenshot(
+    page: BrowserPageHandle,
+    waitFor: ScreenshotWaitFor,
+  ): Promise<{ note?: string } | BrowserCommandResult> {
+    const { text, selector, ms } = waitFor;
+    if (text === undefined && selector === undefined) {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return {};
+    }
+    const deadline = Date.now() + ms;
+    let textOk = text === undefined;
+    let selectorOk = selector === undefined;
+    do {
+      if (!textOk) {
+        try {
+          const r = await this.executeScript(page, "WAIT_TEXT_JS", { text });
+          textOk = isRecord(r) && r.found === true;
+        } catch {
+          // transient failure (mid navigation): keep polling
+        }
+      }
+      if (!selectorOk && selector !== undefined) {
+        try {
+          const r = await page.executeJavaScript(selectorVisibleScript(selector));
+          if (isRecord(r) && typeof r.invalid === "string") {
+            return errorResult(`browse_screenshot "waitFor.selector" is not a valid CSS selector: ${r.invalid}`);
+          }
+          selectorOk = isRecord(r) && r.found === true;
+        } catch {
+          // transient failure: keep polling
+        }
+      }
+      if (textOk && selectorOk) return {};
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_INTERVAL_MS));
+    // eslint-disable-next-line no-constant-condition -- do/while runs at least once
+    } while (true);
+    const missing = [
+      ...(textOk ? [] : [`text ${JSON.stringify(text)}`]),
+      ...(selectorOk ? [] : [`selector ${JSON.stringify(selector)}`]),
+    ].join(" and ");
+    return { note: `Timed out after ${ms}ms waiting for ${missing}; the screenshot shows the page as it is now.` };
+  }
+
+  /** Lets finite CSS animations that end soon finish before a capture. Best effort, bounded by
+   * SCREENSHOT_SETTLE_MS inside the page and SCREENSHOT_SETTLE_OUTER_MS outside (a page that never answers). */
+  private async settleAnimations(page: BrowserPageHandle): Promise<void> {
+    try {
+      await withTimeout(
+        page.executeJavaScript(animationSettleScript(SCREENSHOT_SETTLE_MS)),
+        SCREENSHOT_SETTLE_OUTER_MS,
+        "animation settle timed out",
+      );
+    } catch {
+      // cosmetic: the capture goes ahead
+    }
   }
 
   /** Full browser use's `tabs` command — lists/switches/closes/opens browser

@@ -29,13 +29,34 @@
       }
     },
     "browse_screenshot": {
-      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Take a screenshot of the browser tab's current viewport (not the whole page) for visual verification — use this when the layout itself matters (does a modal actually cover the CTA, is a canvas-rendered widget visible, does this look broken) rather than just \"what's clickable\", which browse_snapshot answers more cheaply. Returns `{ url, title, width, height }` plus the image; on a text-only model this costs a second vision-model call that returns a description rather than the image itself, same as get_screenshot. Pass `annotate: true` to additionally get numbered labels drawn over every interactive element PLUS `snapshotId` and `elements` (the same shape as browse_snapshot) in the same call — use this set-of-marks mode when you want to both see the page and act on it by index in one round trip, instead of calling browse_snapshot separately first. When the user asks to capture, save, or put a browser page on the canvas or as a reference, call this tool with `placeOnCanvas: true`. The result then adds `placedNodeId`, the id of the new canvas layer, and the image is also returned to you as usual.",
+      "description": "If browse_task is in your tool set, start browser tasks with it and use this tool for finishing or follow-up; if it is not, drive the browser with this tool directly (see Browser tasks in the system prompt). Take a screenshot of the browser tab's current viewport (not the whole page) for visual verification — use this when the layout itself matters (does a modal actually cover the CTA, is a canvas-rendered widget visible, does this look broken) rather than just \"what's clickable\", which browse_snapshot answers more cheaply. Returns `{ url, title, width, height }` plus the image; on a text-only model this costs a second vision-model call that returns a description rather than the image itself, same as get_screenshot. Pass `annotate: true` to additionally get numbered labels drawn over every interactive element PLUS `snapshotId` and `elements` (the same shape as browse_snapshot) in the same call — use this set-of-marks mode when you want to both see the page and act on it by index in one round trip, instead of calling browse_snapshot separately first. `waitFor`: wait for text or a CSS selector to be visible before capture; use it after an action that opens a dialog or menu. If the wait times out, the image is still returned with `waitTimedOut: true`. When the user asks to capture, save, or put a browser page on the canvas or as a reference, call this tool with `placeOnCanvas: true`. The result then adds `placedNodeId`, the id of the new canvas layer, and the image is also returned to you as usual.",
       "jsonSchema": {
         "type": "object",
         "properties": {
           "annotate": {
             "type": "boolean",
             "description": "If true, overlays numbered labels on interactive elements and also returns snapshotId + elements for acting by index. Default false (plain screenshot)."
+          },
+          "waitFor": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Wait until this text is visible on the page."
+              },
+              "selector": {
+                "type": "string",
+                "description": "Wait until an element matching this CSS selector is visible. Plain CSS only."
+              },
+              "ms": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 15000,
+                "description": "Time limit for the wait, default 5000, max 15000. Without text or selector: a fixed pause, max 3000."
+              }
+            },
+            "additionalProperties": false,
+            "description": "Wait before the capture. If the wait times out, the screenshot is still taken and the result has waitTimedOut: true."
           },
           "placeOnCanvas": {
             "type": "boolean",

@@ -64,6 +64,7 @@ interface QaResult {
   reason?: string;     // the verdict reason; for outcome "error" with no verdict and no run `error`: why the run ended
   steps: { index, tool, args, ok, error? }[];   // the last 30
   stepsDropped?: number;
+  unmatchedMocks?: { method?: string; url: string }[];   // network mock rules that answered 0 requests; absent when none
 }
 ```
 

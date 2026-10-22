@@ -33,7 +33,7 @@ export const qaVerdictDefinition = {
 };
 
 const checkString = () => z.string().max(QA_CHECK_STRING_MAX_CHARS);
-const selectorDescribe = "CSS selector of the element. Give this or `index`.";
+const selectorDescribe = "CSS selector of the element (plain CSS only; Playwright syntax like text= or :has-text() is not supported: use a text check or `index`). Give this or `index`.";
 const indexDescribe = "Element number from the latest browse_snapshot. Give this or `selector`.";
 const ignoreDescribe = "Entries that contain one of these substrings do not count.";
 
@@ -59,7 +59,8 @@ export const qaCheckSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("count"),
-    selector: checkString().min(1).describe("CSS selector of the elements to count."),
+    selector: checkString().min(1).describe("CSS selector of the elements to count (plain CSS only; Playwright syntax like text= or :has-text() is not supported)."),
+    visible: z.boolean().optional().describe("true: count only visible elements (tables often hold a hidden empty-state row)."),
     equals: z.number().int().min(0).optional().describe("The exact number of matches."),
     min: z.number().int().min(0).optional().describe("The least number of matches."),
     max: z.number().int().min(0).optional().describe("The most matches."),

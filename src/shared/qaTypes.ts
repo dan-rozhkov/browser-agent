@@ -36,6 +36,12 @@ export interface QaResult {
   failedRequestsDropped?: number;
   /** Assertion results, in order: the agent's `qa_assert` calls, then the host's final checks. Absent when none ran. */
   checks?: QaCheckRecord[];
+  /**
+   * Network mock rules (`fixture.network`) that answered no request during the run: the rule's `url` pattern and
+   * `method`. Typically a wrong URL guess, so the mock did nothing and the app's behavior is not a mocked one.
+   * Absent when every rule matched at least once, when the fixture had no mocks, or when the browser reported no counts.
+   */
+  unmatchedMocks?: Array<{ method?: string; url: string }>;
   /** The judge's answer (docs/specs/2026-10-19-qa-judge-design.md). Present only when the judge ran. */
   judge?: QaJudgeResult;
 }
@@ -60,7 +66,8 @@ export type QaCheck =
   | { type: "element"; selector?: string; index?: number; state: QaElementState }
   /** The value of an input, textarea or select. */
   | { type: "value"; selector?: string; index?: number; equals?: string; contains?: string }
-  | { type: "count"; selector: string; equals?: number; min?: number; max?: number }
+  /** `visible: true` counts only visible elements (default false: all matches, hidden ones too). */
+  | { type: "count"; selector: string; visible?: boolean; equals?: number; min?: number; max?: number }
   /** Against the full page URL. `matches` is a JS regex source. */
   | { type: "url"; equals?: string; contains?: string; matches?: string }
   /** `ignore` lists substrings of entries to skip. */

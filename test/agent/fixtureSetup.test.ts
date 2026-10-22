@@ -1,7 +1,8 @@
 import { MockLanguageModelV3 } from "ai/test";
 import { describe, expect, it, vi } from "vitest";
 import { runBrowseAgent } from "../../src/agent/aiSdk.js";
-import { createFixtureSetup, createBrowseAgentSession, SetupError } from "../../src/agent/sessionEntry.js";
+import * as sessionEntry from "../../src/agent/sessionEntry.js";
+import { createFixtureSetup, createBrowseAgentSession, SetupError, unmatchedMocks } from "../../src/agent/sessionEntry.js";
 import type { BrowserBridge } from "../../src/loop/bridge.js";
 import type { PageFixture } from "../../src/fixture/types.js";
 
@@ -149,5 +150,42 @@ describe("runBrowseAgent abort leak", () => {
     d.resolve({ ok: true, summary: "s", fixtureToken: "late" });
     await tick();
     expect(releaseFixture).toHaveBeenCalledExactlyOnceWith("late");
+  });
+});
+
+describe("unmatchedMocks and mockHits", () => {
+  const hits = [
+    { url: "https://a.test/hit", hits: 2 },
+    { method: "GET", url: "https://a.test/miss", hits: 0 },
+    { url: "https://a.test/miss2", hits: 0 },
+  ];
+
+  it("unmatchedMocks lists the rules with zero hits, method only when the rule had one", () => {
+    expect(unmatchedMocks(hits)).toEqual([{ method: "GET", url: "https://a.test/miss" }, { url: "https://a.test/miss2" }]);
+    expect(unmatchedMocks([{ url: "u", hits: 1 }])).toEqual([]);
+    expect(unmatchedMocks(undefined)).toEqual([]);
+  });
+
+  it("is exported by the light session entry", () => {
+    expect(sessionEntry.unmatchedMocks).toBe(unmatchedMocks);
+  });
+
+  it("release keeps the hit counts the bridge reports; none before the release", async () => {
+    const fs = createFixtureSetup(bridge({ releaseFixture: async () => ({ mockHits: hits }) }), fixture, opts());
+    await fs.setup({ signal: sig() });
+    expect(fs.mockHits()).toBeUndefined();
+    await fs.release();
+    expect(fs.mockHits()).toEqual(hits);
+    await fs.release();
+    expect(fs.mockHits()).toEqual(hits);
+  });
+
+  it("a bridge that reports nothing or something malformed gives undefined", async () => {
+    for (const reported of [undefined, { ok: true }, { mockHits: "x" }, { mockHits: [{ url: 1, hits: 0 }] }, { mockHits: [{ url: "u" }] }]) {
+      const fs = createFixtureSetup(bridge({ releaseFixture: async () => reported }), fixture, opts());
+      await fs.setup({ signal: sig() });
+      await fs.release();
+      expect(fs.mockHits()).toBeUndefined();
+    }
   });
 });
