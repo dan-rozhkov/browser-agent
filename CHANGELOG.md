@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.8](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.7...v0.3.8) (2026-10-22)
+
+
+### Features
+
+* **qa:** infer the type of a QA check when it is unambiguous ([6da89a0](https://github.com/dan-rozhkov/browser-agent/commit/6da89a0e440682294a1b246a7d60292d2b5b2510))
+
 ## [0.3.7](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.6...v0.3.7) (2026-10-22)
 
 
