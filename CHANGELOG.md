@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.7](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.6...v0.3.7) (2026-10-22)
+
+
+### Features
+
+* **qa:** unmatched mocks, CSS-only checks, screenshot waitFor ([1e36b44](https://github.com/dan-rozhkov/browser-agent/commit/1e36b44f4bcb6648be73c2f39f17b7da2660475f))
+
 ## [0.3.6](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.5...v0.3.6) (2026-10-21)
 
 
