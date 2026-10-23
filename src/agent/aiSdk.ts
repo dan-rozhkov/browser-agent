@@ -8,7 +8,7 @@
 // NON-reasoning one and reasoning must be off: pass the provider's switch in
 // `providerOptions` (for example `{ openrouter: { reasoning: { effort: "none" } } }`
 // or the `reasoningEffort` of an OpenAI-compatible provider).
-import { generateObject, generateText, tool, type LanguageModel, type ToolSet } from "ai";
+import { generateText, Output, tool, type LanguageModel, type ToolSet } from "ai";
 import type { ZodTypeAny } from "zod";
 import type { CheckpointResult, PageFixture } from "../fixture/types.js";
 import type { BrowserBridge } from "../loop/bridge.js";
@@ -405,9 +405,9 @@ async function readJudgePage(opts: RunBrowseAgentOptions): Promise<QaJudgePage |
 async function askJudge(goal: string, qa: QaResult, page: QaJudgePage, judge: QaJudgeOptions, signals: (AbortSignal | undefined)[]): Promise<QaJudgeResult> {
   try {
     const timeout = AbortSignal.timeout(judge.timeoutMs ?? QA_JUDGE_TIMEOUT_MS);
-    const { object } = await generateObject({
+    const { output: object } = await generateText({
       model: judge.model,
-      schema: qaJudgeSchema,
+      output: Output.object({ schema: qaJudgeSchema }),
       system: QA_JUDGE_SYSTEM,
       prompt: buildQaJudgePrompt({ scenario: goal, ...(judge.context ? { context: judge.context } : {}), qa, page }),
       providerOptions: judge.providerOptions as never,

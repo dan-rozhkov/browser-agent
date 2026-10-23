@@ -1,4 +1,4 @@
-import { generateObject, NoObjectGeneratedError, type LanguageModel } from "ai";
+import { generateText, NoObjectGeneratedError, Output, type LanguageModel } from "ai";
 import {
   TextModelInvalidObjectError,
   type TextModel,
@@ -33,18 +33,20 @@ export function aiSdkTextModel(
     id,
     async generateObject(req) {
       try {
+        // `generateText` + `Output.object`, not the deprecated `generateObject`:
+        // both exist in AI SDK 6 and 7, so the ai peer range stays ^6 || ^7.
         const common = {
           model,
-          schema: req.schema,
+          output: Output.object({ schema: req.schema }),
           abortSignal: req.abortSignal,
           providerOptions: opts.providerOptions as never,
         };
         const result =
           typeof req.prompt === "string"
-            ? await generateObject({ ...common, prompt: req.prompt })
-            : await generateObject({ ...common, ...splitLeadingSystem(req.prompt) });
+            ? await generateText({ ...common, prompt: req.prompt })
+            : await generateText({ ...common, ...splitLeadingSystem(req.prompt) });
         return {
-          object: result.object as never,
+          object: result.output as never,
           usage: {
             inputTokens: result.usage.inputTokens,
             outputTokens: result.usage.outputTokens,
