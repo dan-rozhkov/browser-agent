@@ -6,14 +6,14 @@ import {
 } from "../policy/textModel.js";
 
 /** AI SDK 7 rejects system messages inside `messages`, so the leading ones
- * move to `system` (accepted by both 6 and 7). A system message after the
+ * move to `instructions`. A system message after the
  * first non-system one stays where it is. */
-function splitLeadingSystem(messages: TextModelMessage[]): { system?: string; messages: TextModelMessage[] } {
+function splitLeadingSystem(messages: TextModelMessage[]): { instructions?: string; messages: TextModelMessage[] } {
   const firstOther = messages.findIndex((m) => m.role !== "system");
   const cut = firstOther === -1 ? messages.length : firstOther;
   if (cut === 0) return { messages };
   return {
-    system: messages
+    instructions: messages
       .slice(0, cut)
       .map((m) => m.content)
       .join("\n\n"),
@@ -33,8 +33,7 @@ export function aiSdkTextModel(
     id,
     async generateObject(req) {
       try {
-        // `generateText` + `Output.object`, not the deprecated `generateObject`:
-        // both exist in AI SDK 6 and 7, so the ai peer range stays ^6 || ^7.
+        // `generateText` + `Output.object`, not the deprecated `generateObject`.
         const common = {
           model,
           output: Output.object({ schema: req.schema }),

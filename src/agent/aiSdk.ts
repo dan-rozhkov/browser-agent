@@ -1,5 +1,5 @@
 // `@sideform/browser-agent/agent/ai-sdk` — runs the browse subagent with the
-// AI SDK (v6) on top of the session core. Peer dependency: `ai`.
+// AI SDK (v7) on top of the session core. Peer dependency: `ai` ^7.
 //
 // The model is a plain tool loop: `generateText` with the seven browse tools
 // (each has an `execute` that maps onto a `BrowserBridge`), so there is no
@@ -267,7 +267,10 @@ export interface RunBrowseAgentOptions {
 export const IMAGE_DATA_URL = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/;
 
 type ModelOutput =
-  | { type: "content"; value: ({ type: "text"; text: string } | { type: "image-data"; data: string; mediaType: string })[] }
+  | {
+      type: "content";
+      value: ({ type: "text"; text: string } | { type: "file"; mediaType: string; data: { type: "data"; data: string } })[];
+    }
   | { type: "text"; value: string };
 
 /**
@@ -289,7 +292,8 @@ export function screenshotToModelOutput(output: unknown, opts: { attachImage?: b
       type: "content",
       value: [
         { type: "text", text: JSON.stringify(rest) },
-        { type: "image-data", data: match[2], mediaType: match[1] },
+        // AI SDK 7 shape; `image-data` is deprecated there.
+        { type: "file", mediaType: match[1], data: { type: "data", data: match[2] } },
       ],
     };
   }
@@ -408,7 +412,7 @@ async function askJudge(goal: string, qa: QaResult, page: QaJudgePage, judge: Qa
     const { output: object } = await generateText({
       model: judge.model,
       output: Output.object({ schema: qaJudgeSchema }),
-      system: QA_JUDGE_SYSTEM,
+      instructions: QA_JUDGE_SYSTEM,
       prompt: buildQaJudgePrompt({ scenario: goal, ...(judge.context ? { context: judge.context } : {}), qa, page }),
       providerOptions: judge.providerOptions as never,
       abortSignal: AbortSignal.any([timeout, ...signals.filter((s): s is AbortSignal => s !== undefined)]),
@@ -563,7 +567,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         async send(text) {
           await generateText({
             model: opts.model,
-            system,
+            instructions: system,
             prompt: text,
             tools: buildTools(session, opts, defs, [...baseTools], extras),
             // Called after a step that ended with tool results. False ends the loop.

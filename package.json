@@ -91,7 +91,7 @@
     "prepublishOnly": "node -e \"if(!process.env.GITHUB_ACTIONS){console.error('Publish only from the release workflow (.github/workflows/release.yml).');process.exit(1)}\""
   },
   "peerDependencies": {
-    "ai": "^6.0.0 || ^7.0.0",
+    "ai": "^7.0.0",
     "playwright-core": "^1.55.0"
   },
   "peerDependenciesMeta": {

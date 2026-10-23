@@ -171,7 +171,7 @@ describe("screenshotToModelOutput", () => {
   it("attachImage: splits the picture from the rest", () => {
     expect(screenshotToModelOutput(raw, { attachImage: true })).toEqual({
       type: "content",
-      value: [{ type: "text", text: '{"url":"u"}' }, { type: "image-data", data: "QUJD", mediaType: "image/jpeg" }],
+      value: [{ type: "text", text: '{"url":"u"}' }, { type: "file", mediaType: "image/jpeg", data: { type: "data", data: "QUJD" } }],
     });
   });
 
