@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.9](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.8...v0.3.9) (2026-10-23)
+
+
+### Features
+
+* accept AI SDK 7 as the ai peer ([eb8c0b0](https://github.com/dan-rozhkov/browser-agent/commit/eb8c0b08cdfa3c5dc851bbf929c7540eb1d819dc))
+
 ## [0.3.8](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.7...v0.3.8) (2026-10-22)
 
 
