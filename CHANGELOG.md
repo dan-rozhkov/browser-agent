@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.9...v0.4.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the optional ai peer dependency is now ^7.0.0 (was ^6.0.0 || ^7.0.0). Consumers of the ai-sdk adapter and agent/ai-sdk must use AI SDK 7.
+
+### Features
+
+* require AI SDK 7; browse_screenshot image as a file part ([c8d1e6b](https://github.com/dan-rozhkov/browser-agent/commit/c8d1e6bf1981cf37e12f94ac0981b7eaa3c19847))
+
+
+### Bug Fixes
+
+* use generateText with Output.object instead of deprecated generateObject ([94b06e4](https://github.com/dan-rozhkov/browser-agent/commit/94b06e4768455e92966c653479735f794c5e24bd))
+
 ## [0.3.9](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.8...v0.3.9) (2026-10-23)
 
 
