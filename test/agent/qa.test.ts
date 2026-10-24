@@ -122,6 +122,10 @@ describe("qa_verdict", () => {
     expect(QA_PROMPT_SECTION).toContain("Sign in once and keep the session.");
     expect(QA_PROMPT_SECTION).toContain("`blocked` is not a fail.");
     expect(QA_PROMPT_SECTION).toContain("only when you are about to give `fail` because a feature or an element is missing");
+    expect(QA_PROMPT_SECTION).toContain("Do not guess URLs.");
+    expect(QA_PROMPT_SECTION).toContain("A 404 on a URL you guessed is not a defect.");
+    expect(QA_PROMPT_SECTION.indexOf("Do not guess URLs.")).toBeGreaterThan(QA_PROMPT_SECTION.indexOf("Otherwise, mark it as missing"));
+    expect(QA_PROMPT_SECTION.indexOf("Do not guess URLs.")).toBeLessThan(QA_PROMPT_SECTION.indexOf("A blocked step"));
     expect(QA_PROMPT_SECTION).toContain("When the scenario has items, mark the item that the blocked step stops as `blocked`.");
   });
 });

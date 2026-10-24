@@ -61,6 +61,9 @@ The judge and the trace recorder read only `outcome` and `reason`, so they do no
   test data, make data just below, at and just above the limit and check again. Give `fail`
   only when it does not appear under its condition. Otherwise mark it as missing and name the
   condition in the reason.
+- A URL paragraph: do not guess URLs. Reach a page through the links, buttons and menus. Open a URL
+  directly only when the scenario gives it or when it was seen on a page or in a request of the
+  app. A 404 on a guessed URL is not a defect and does not prove that a feature is missing.
 - The blocked-step paragraph depends on items. No items: do not call `qa_verdict`, explain in
   the final answer. With items: mark the item that the blocked step stops as `blocked`,
   continue with the others and call `qa_verdict`. When every item is blocked, do not call it.
