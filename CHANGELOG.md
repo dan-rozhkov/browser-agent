@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.0...v0.4.1) (2026-10-24)
+
+
+### Features
+
+* **qa:** per-item results in qa_verdict, boundary rule for missing features ([a1fdffc](https://github.com/dan-rozhkov/browser-agent/commit/a1fdffc5948258063332b0348208e52965f95afa))
+
 ## [0.4.0](https://github.com/dan-rozhkov/browser-agent/compare/v0.3.9...v0.4.0) (2026-10-23)
 
 
