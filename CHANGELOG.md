@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.1...v0.4.2) (2026-10-24)
+
+
+### Features
+
+* **qa:** tell the QA subagent not to guess URLs ([077d8f8](https://github.com/dan-rozhkov/browser-agent/commit/077d8f88decd98fd7e3d8c93707d39bace2cdbe6))
+
 ## [0.4.1](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.0...v0.4.1) (2026-10-24)
 
 
