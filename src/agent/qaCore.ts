@@ -5,8 +5,8 @@
 // This is the zod-free core (exported from `agent/session` and `agent`); the zod
 // schema of `qa_verdict` is in qa.ts. Imports the session and result only.
 import { browseAgentErrorMessage, type BrowseAgentStatus } from "./result.js";
-import { QA_ASSERT_TOOL, QA_VERDICT_TOOL, REASON_MAX_CHARS, cut, describeQaCheckFailure, type QaFinalSink } from "./qaChecks.js";
-import type { QaCheckRecord, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
+import { QA_ASSERT_TOOL, QA_ITEMS_MAX, QA_ITEM_ID_MAX_CHARS, QA_ITEM_REASON_MAX_CHARS, QA_VERDICT_TOOL, REASON_MAX_CHARS, cut, isObject, describeQaCheckFailure, type QaFinalSink } from "./qaChecks.js";
+import type { QaCheckRecord, QaOutcome, QaResult, QaStep, QaVerdictItem } from "./qaTypes.js";
 import { createSeenList, harvestDiagnostics } from "../shared/diagnostics.js";
 import { parseJsonObject, singleUseTool, type BrowseAgentExtraToolHooks, type BrowseAgentToolCall } from "./session.js";
 
@@ -24,22 +24,50 @@ export const QA_STEP_TEXT_MAX_CHARS = 200;
 export const QA_PROMPT_SECTION = `You test a web app. The user message is one test scenario: do what it says in the browser, then check the expected result on the page.
 To confirm an expected result, call \`${QA_ASSERT_TOOL}\`. It runs exact checks on the page: visible text, the state of an element, the value of an input, the number of matching elements, the page URL, console errors and failed requests. Use it for each result the scenario expects, before the verdict. A failed check does not end the test: look at the page, then decide.
 When you have checked the result, call \`${QA_VERDICT_TOOL}\` exactly once, at the end. Use verdict \`pass\` when the app behaves as the scenario expects. Use verdict \`fail\` when it does not, and give the reason in one or two sentences: what you expected and what you saw. Give verdict \`pass\` only when the checks you rely on passed. Base the verdict only on what you saw on the page.
-A blocked step (a CAPTCHA, a login wall, a missing page) is not a fail. Do not call \`${QA_VERDICT_TOOL}\` then: explain in your final answer what blocked you.`;
+The scenario can list several checklist items, each with an ID. Then test all of them in this run. Sign in once and keep the session. Test the items in the order that needs the fewest steps. Give one entry in \`items\` for each listed item: \`pass\`, \`fail\`, or \`blocked\`. Use \`blocked\` when you could not test the item (an environment problem, a missing precondition, an external service that did not load). \`blocked\` is not a fail. Give verdict \`fail\` when any item failed. If you saw a defect outside the listed items (for example a crash), you can also give verdict \`fail\`. Then put that defect in \`reason\`. Otherwise give verdict \`pass\`.
+Use the next rule only when you are about to give \`fail\` because a feature or an element is missing. First find the condition that makes it appear: a date near or after a deadline, a count at a limit, an amount above a threshold, an empty or a full list. If the scenario allows test data, make data at that boundary (just below, at, and just above the limit) and check again. Give \`fail\` for a missing feature only when it does not appear under its condition. Otherwise, mark it as missing and name the condition you tried in the reason.
+A blocked step (a CAPTCHA, a login wall, a missing page) is not a fail. When the scenario has no items, do not call \`${QA_VERDICT_TOOL}\`. Explain in your final answer what blocked you. When the scenario has items, mark the item that the blocked step stops as \`blocked\`. Continue with the other items. Then call \`${QA_VERDICT_TOOL}\`. When every item is blocked, do not call \`${QA_VERDICT_TOOL}\`.`;
 
 /** The input of `qa_verdict`. */
 export interface QaVerdict {
   verdict: "pass" | "fail";
   reason: string;
+  items?: QaVerdictItem[];
 }
 
-export type { QaAssertResult, QaCheck, QaCheckRecord, QaCheckResult, QaElementState, QaOutcome, QaResult, QaStep } from "./qaTypes.js";
+export type { QaAssertResult, QaCheck, QaCheckRecord, QaCheckResult, QaElementState, QaOutcome, QaResult, QaStep, QaVerdictItem } from "./qaTypes.js";
+
+/**
+ * Strict-mode placeholders: `items: null` and `items: []` mean "no items". Both the zod schema
+ * (as a `z.preprocess`) and `parseQaVerdict` use it, so they agree.
+ */
+export function normalizeQaItems(input: unknown): unknown {
+  if (input === null || (Array.isArray(input) && input.length === 0)) return undefined;
+  return input;
+}
+
+/**
+ * The cross-field rule of `qa_verdict` (one function for the zod `superRefine` and the hand check).
+ * Returns the error text, or undefined when the verdict agrees with the items or there are no items.
+ * A `fail` verdict with no failed item is allowed (a defect outside the listed items).
+ */
+export function qaItemsRuleError(verdict: "pass" | "fail", items: readonly QaVerdictItem[] | undefined): string | undefined {
+  if (!items) return undefined;
+  if (new Set(items.map((i) => i.id)).size !== items.length) return "items: ids must be unique.";
+  const failed = items.some((i) => i.result === "fail");
+  const passed = items.some((i) => i.result === "pass");
+  if (!failed && !passed) return `items: every item is blocked. Do not call ${QA_VERDICT_TOOL}. Explain in your final answer what blocked you.`;
+  if (failed && verdict !== "fail") return 'verdict: must be "fail" because an item failed.';
+  return undefined;
+}
 
 /**
  * Checks `qa_verdict` input by hand (no zod). The rules are those of
- * `qaVerdictSchema`: verdict "pass" or "fail"; reason a string, trimmed, 1 to 500 chars.
+ * `qaVerdictSchema`: verdict "pass" or "fail"; reason a string, trimmed, 1 to 500 chars;
+ * optional `items` (1 to 20 entries; `null` and `[]` count as absent) that agree with the verdict.
  */
 export function parseQaVerdict(input: unknown): { ok: true; value: QaVerdict } | { ok: false; errors: string[] } {
-  const obj = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : undefined;
+  const obj = isObject(input) ? input : undefined;
   const errors: string[] = [];
   const verdict: "pass" | "fail" | undefined = obj?.verdict === "pass" || obj?.verdict === "fail" ? obj.verdict : undefined;
   if (verdict === undefined) errors.push('verdict: expected "pass" or "fail"');
@@ -47,8 +75,37 @@ export function parseQaVerdict(input: unknown): { ok: true; value: QaVerdict } |
   if (reason === undefined) errors.push("reason: expected a string");
   else if (reason.length < 1) errors.push("reason: must not be empty");
   else if (reason.length > REASON_MAX_CHARS) errors.push(`reason: must be at most ${REASON_MAX_CHARS} characters`);
+  const rawItems = normalizeQaItems(obj?.items);
+  let items: QaVerdictItem[] | undefined;
+  if (rawItems !== undefined) {
+    if (!Array.isArray(rawItems)) errors.push("items: expected an array");
+    else if (rawItems.length > QA_ITEMS_MAX) errors.push(`items: at most ${QA_ITEMS_MAX} items`);
+    else {
+      const parsed: QaVerdictItem[] = [];
+      rawItems.forEach((raw, i) => {
+        const at = `items[${i}]`;
+        if (!isObject(raw)) return void errors.push(`${at}: expected an object`);
+        const id = typeof raw.id === "string" ? raw.id.trim() : undefined;
+        if (id === undefined) errors.push(`${at}.id: expected a string`);
+        else if (id.length < 1) errors.push(`${at}.id: must not be empty`);
+        else if (id.length > QA_ITEM_ID_MAX_CHARS) errors.push(`${at}.id: must be at most ${QA_ITEM_ID_MAX_CHARS} characters`);
+        const result = raw.result === "pass" || raw.result === "fail" || raw.result === "blocked" ? raw.result : undefined;
+        if (result === undefined) errors.push(`${at}.result: expected "pass", "fail" or "blocked"`);
+        const itemReason = typeof raw.reason === "string" ? raw.reason.trim() : undefined;
+        if (itemReason === undefined) errors.push(`${at}.reason: expected a string`);
+        else if (itemReason.length < 1) errors.push(`${at}.reason: must not be empty`);
+        else if (itemReason.length > QA_ITEM_REASON_MAX_CHARS) errors.push(`${at}.reason: must be at most ${QA_ITEM_REASON_MAX_CHARS} characters`);
+        if (id !== undefined && result !== undefined && itemReason !== undefined) parsed.push({ id, result, reason: itemReason });
+      });
+      items = parsed;
+    }
+  }
+  if (errors.length === 0 && verdict !== undefined && items !== undefined) {
+    const rule = qaItemsRuleError(verdict, items);
+    if (rule) errors.push(rule);
+  }
   if (errors.length > 0 || verdict === undefined || reason === undefined) return { ok: false, errors };
-  return { ok: true, value: { verdict, reason } };
+  return { ok: true, value: { verdict, reason, ...(items ? { items } : {}) } };
 }
 
 /** QA variant of the irreversible-step rule: the scenario asks for submits and test data, so the subagent rule ("stop") does not apply. */
@@ -56,7 +113,7 @@ export const QA_IRREVERSIBLE_LINE =
   "- Do the steps the scenario asks for, including submitting forms and creating test data on the app under test. Do a destructive or irreversible step (delete, send, pay, confirm) only when the scenario names that step. If the scenario asks you to open, read or check a dialog, do not confirm it. Close it or cancel it. Never pay with a real payment method, never send messages to real people outside the app, and never enter real personal data: use the test data the scenario gives or obvious fake data.";
 
 /** The closing paragraph of a QA prompt. It names `qa_verdict`, so it is the last thing the model reads. */
-export const QA_AGENT_CLOSING = `When you have checked the expected result, call \`${QA_VERDICT_TOOL}\` once, unless a blocked step (a CAPTCHA, a login or anti-bot wall, a missing page) stopped you. Then give a short final answer in plain text: what you checked, what you saw, and the final URL. Do not add facts you did not see. Do not open other pages after the verdict.`;
+export const QA_AGENT_CLOSING = `When you have checked the expected result, call \`${QA_VERDICT_TOOL}\` once. Do not call it when a blocked step (a CAPTCHA, a login or anti-bot wall, a missing page) stopped the whole scenario, or when every item is blocked. Then give a short final answer in plain text: what you checked, what you saw, and the final URL. Do not add facts you did not see. Do not open other pages after the verdict.`;
 
 /** The result field the verdict tool hooks fill (`qaResultOf` folds it into `qa`). */
 export const QA_VERDICT_FIELD = "qaVerdict";
@@ -64,7 +121,7 @@ export const QA_VERDICT_FIELD = "qaVerdict";
 /**
  * Hooks of `qa_verdict`: a second call is refused by the guard before it runs,
  * the first success ends the run (`endsRun`: the session stops asking the model),
- * and puts `{ verdict, reason }` into the run result field
+ * and puts `{ verdict, reason, items? }` into the run result field
  * `qaVerdict`. A call with bad input is an error and does not use up the one
  * verdict. State is per session (`fork`).
  */
@@ -72,7 +129,7 @@ export function qaVerdictHooks(): BrowseAgentExtraToolHooks {
   return singleUseTool({
     name: QA_VERDICT_TOOL,
     isSuccess: (parsed) => parsed.ok === true,
-    fields: (parsed) => ({ [QA_VERDICT_FIELD]: { verdict: parsed.verdict, reason: parsed.reason } }),
+    fields: (parsed) => ({ [QA_VERDICT_FIELD]: { verdict: parsed.verdict, reason: parsed.reason, ...(parsed.items !== undefined ? { items: parsed.items } : {}) } }),
     endsRun: true,
     doneMessage: (parsed) => `${QA_VERDICT_TOOL} was already called. The first verdict stays: ${String(parsed.verdict)}.`,
   });
@@ -127,7 +184,8 @@ export type QaRunExtras = Pick<QaResult, "consoleErrors" | "consoleErrorsDropped
 export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown; [k: string]: unknown }, steps: readonly QaStep[], extras?: QaRunExtras, lastAgentCall?: readonly QaCheckRecord[]): QaResult {
   const verdict = verdictOf(result);
   // A pass verdict is downgraded when the agent's last qa_assert call still had a failed check.
-  const failed = verdict?.verdict === "pass" ? failedInLastCall(lastAgentCall) : undefined;
+  // Not with items: the last call covers only the last item, and the agent judged each item itself.
+  const failed = verdict?.verdict === "pass" && !verdict.items ? failedInLastCall(lastAgentCall) : undefined;
   const outcome = qaOutcome(result.status, verdict, failed);
   // The run's own `error` is on the result already; `reason` does not copy it.
   const reason = failed && verdict ? downgradedReason(failed, verdict.reason) : verdict?.reason ?? (outcome === "error" && typeof result.error !== "string" ? (STATUS_REASONS[result.status] ?? `the run ended with status ${result.status}`) : undefined);
@@ -136,6 +194,8 @@ export function qaResultOf(result: { status: BrowseAgentStatus; error?: unknown;
     outcome,
     ...(verdict ? { verdict: verdict.verdict } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    // The items stay as the agent gave them, also when a check downgraded the pass (see `applyFinalChecks`).
+    ...(verdict?.items ? { items: verdict.items } : {}),
     steps: kept.map(({ ms: _ms, ...step }) => step),
     ...(steps.length > kept.length ? { stepsDropped: steps.length - kept.length } : {}),
     ...(extras ?? {}),

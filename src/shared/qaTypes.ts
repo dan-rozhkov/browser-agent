@@ -15,6 +15,13 @@ export interface QaStep {
   ms: number;
 }
 
+/** The result of one checklist item of a `qa_verdict` call. `blocked` = the item could not be tested (not a fail). */
+export interface QaVerdictItem {
+  id: string;
+  result: "pass" | "fail" | "blocked";
+  reason: string;
+}
+
 /** The `qa` field of a run result. */
 export interface QaResult {
   outcome: QaOutcome;
@@ -22,6 +29,12 @@ export interface QaResult {
   verdict?: "pass" | "fail";
   /** The verdict reason. Without a verdict and without a run `error`, for outcome `error`: why the run ended ("request limit reached" or "deadline reached"). */
   reason?: string;
+  /**
+   * Per-item results the model gave in `qa_verdict` (one scenario with several checklist items). Absent when the verdict had
+   * no items. The host's checks (`applyFinalChecks`, the agent check rule) can downgrade `verdict`/`outcome`/`reason`, but
+   * the items stay as the agent gave them.
+   */
+  items?: QaVerdictItem[];
   /** The last `QA_RESULT_MAX_STEPS` steps. */
   steps: Omit<QaStep, "ms">[];
   /** How many earlier steps were left out. Absent when none. */

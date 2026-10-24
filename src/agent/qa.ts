@@ -3,15 +3,30 @@
 // re-exported here so `agent` keeps one QA surface. Imports `zod` (no `ai`, no `node:*`).
 import { z } from "zod";
 import type { QaJudgeVerdict, QaVerdict } from "./qaCore.js";
-import { QA_CHECKS_MAX, QA_CHECK_STRING_MAX_CHARS, QA_CHECK_TYPE_MISSING_ERROR, QA_CHECK_TYPE_UNKNOWN_ERROR, REASON_MAX_CHARS, normalizeQaChecks } from "./qaCore.js";
+import { QA_CHECKS_MAX, QA_CHECK_STRING_MAX_CHARS, QA_ITEMS_MAX, QA_ITEM_ID_MAX_CHARS, QA_ITEM_REASON_MAX_CHARS, normalizeQaItems, qaItemsRuleError, QA_CHECK_TYPE_MISSING_ERROR, QA_CHECK_TYPE_UNKNOWN_ERROR, REASON_MAX_CHARS, normalizeQaChecks } from "./qaCore.js";
 import type { QaCheck } from "./qaTypes.js";
 
 export * from "./qaCore.js";
 
-export const qaVerdictSchema = z.object({
-  verdict: z.enum(["pass", "fail"]).describe('"pass" when the app behaves as the scenario expects, "fail" when it does not.'),
-  reason: z.string().trim().min(1).max(REASON_MAX_CHARS).describe("One or two sentences: what you expected and what you saw."),
+const qaVerdictItemSchema = z.object({
+  id: z.string().trim().min(1).max(QA_ITEM_ID_MAX_CHARS).describe("The ID of the checklist item, as the scenario lists it."),
+  result: z.enum(["pass", "fail", "blocked"]).describe('"pass" when the item works as expected, "fail" when it does not, "blocked" when you could not test it. "blocked" is not a fail.'),
+  reason: z.string().trim().min(1).max(QA_ITEM_REASON_MAX_CHARS).describe("One sentence: what you expected and what you saw, or what blocked you."),
 });
+
+export const qaVerdictSchema = z
+  .object({
+    verdict: z.enum(["pass", "fail"]).describe('"pass" when the app behaves as the scenario expects, "fail" when it does not.'),
+    reason: z.string().trim().min(1).max(REASON_MAX_CHARS).describe("One or two sentences: what you expected and what you saw."),
+    // Strict-mode placeholders (null, []) are removed before validation (`normalizeQaItems`).
+    items: z
+      .preprocess(normalizeQaItems, z.array(qaVerdictItemSchema).min(1).max(QA_ITEMS_MAX).optional())
+      .describe(`Only when the scenario lists checklist items: one entry per item, at most ${QA_ITEMS_MAX}. Verdict "fail" when any item failed, otherwise "pass". Leave it out when the scenario has no items.`),
+  })
+  .superRefine((value, ctx) => {
+    const message = qaItemsRuleError(value.verdict, value.items);
+    if (message) ctx.addIssue({ code: z.ZodIssueCode.custom, message, path: message.startsWith("verdict") ? ["verdict"] : ["items"] });
+  });
 
 // The schema and the hand check in qaCore.ts must describe the same type (type-only, no emitted code).
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
@@ -28,7 +43,7 @@ export type QaJudgeTypesAgree = AssertTrue<Same<QaJudgeVerdict, z.infer<typeof q
 
 /** The description and input schema of `qa_verdict`. */
 export const qaVerdictDefinition = {
-  description: "Give the verdict of this test scenario. Call it exactly once, at the end, after you checked the expected result on the page.",
+  description: "Give the verdict of this test scenario. Call it exactly once, at the end, after you checked the expected result on the page. When the scenario lists checklist items, also give one entry in `items` for each item: pass, fail or blocked.",
   inputSchema: qaVerdictSchema,
 };
 

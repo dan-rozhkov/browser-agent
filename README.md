@@ -529,8 +529,8 @@ try {
 }
 ```
 
-With `qa` on, the model gets `qa_verdict({ verdict: "pass" | "fail", reason })` (once; a
-repeat is refused), the prompt gets a QA section (principal "a QA engineer" unless you
+With `qa` on, the model gets `qa_verdict({ verdict: "pass" | "fail", reason, items? })` (once; a
+repeat is refused; `items` is optional, 1 to 20 entries `{ id, result: "pass" | "fail" | "blocked", reason }` for a scenario with several checklist items, and it must agree with `verdict`: any `fail` item means `fail`; a `fail` verdict with no failed item is allowed (a defect outside the items, named in `reason`); all items blocked means no `qa_verdict` call; with items the agent's last-`qa_assert`-call downgrade is skipped, the final checks and the judge still apply; the items go to `qa.items` unchanged), the prompt gets a QA section (principal "a QA engineer" unless you
 set one; with `prompt` as a string, include the exported `QA_PROMPT_SECTION` and end with `QA_AGENT_CLOSING` yourself; QA also swaps the "stop before submitting a form" rule for `QA_IRREVERSIBLE_LINE`), and
 the result gets an extra `qa` field before `error`. A QA check without `type` is inferred only when unambiguous (an `element`, `count`, `url` or `text` check; never `value`, so `{selector, contains}` needs `type`); otherwise it fails with "type: missing". Outcome: `passed` / `failed` (the
 verdict), `inconclusive` (the run ended without a verdict), `error` (model error, timeout or

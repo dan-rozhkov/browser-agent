@@ -8,6 +8,12 @@ export const QA_ASSERT_TOOL = "qa_assert";
 export const QA_VERDICT_TOOL = "qa_verdict";
 /** `qa_verdict` reason: 1 to this many chars. Every `qa.reason` stays within it. */
 export const REASON_MAX_CHARS = 500;
+/** `qa_verdict` `items`: at most this many entries. */
+export const QA_ITEMS_MAX = 20;
+/** One `qa_verdict` item: `id` is 1 to this many chars. */
+export const QA_ITEM_ID_MAX_CHARS = 40;
+/** One `qa_verdict` item: `reason` is 1 to this many chars. */
+export const QA_ITEM_REASON_MAX_CHARS = 300;
 /** One `qa_assert` call (and the `checks` option) takes at most this many checks. */
 export const QA_CHECKS_MAX = 10;
 /** `actual` texts are cut to this length. */

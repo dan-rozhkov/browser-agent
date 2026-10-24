@@ -117,8 +117,85 @@ describe("qa_verdict", () => {
     expect(JSON.parse(await make().runTool({ toolName: "qa_verdict", input: { verdict: "pass", reason: "r" }, toolCallId: "4" })).ok).toBe(true);
   });
 
-  it("the prompt section names the tool", () => {
+  it("the prompt section names the tool, the items and the boundary rule", () => {
     expect(QA_PROMPT_SECTION).toContain("qa_verdict");
+    expect(QA_PROMPT_SECTION).toContain("Sign in once and keep the session.");
+    expect(QA_PROMPT_SECTION).toContain("`blocked` is not a fail.");
+    expect(QA_PROMPT_SECTION).toContain("only when you are about to give `fail` because a feature or an element is missing");
+    expect(QA_PROMPT_SECTION).toContain("When the scenario has items, mark the item that the blocked step stops as `blocked`.");
+  });
+});
+
+describe("qa_verdict items", () => {
+  const it1 = (id: string, result: "pass" | "fail" | "blocked", reason = "r") => ({ id, result, reason });
+  const errorsOf = (input: unknown) => {
+    const out = JSON.parse(executeQaVerdict(input)) as { error?: string };
+    return out.error;
+  };
+
+  it("accepts valid items, trims them, and echoes them in the output", () => {
+    const out = JSON.parse(executeQaVerdict({ verdict: "fail", reason: "x", items: [{ id: " A1 ", result: "pass", reason: " ok " }, it1("A2", "fail"), it1("A3", "blocked")] }));
+    expect(out).toEqual({ ok: true, verdict: "fail", reason: "x", items: [it1("A1", "pass", "ok"), it1("A2", "fail"), it1("A3", "blocked")] });
+  });
+
+  it("items null and [] are absent", () => {
+    for (const items of [null, []]) expect(JSON.parse(executeQaVerdict({ ...pass, items }))).toEqual({ ok: true, ...pass });
+  });
+
+  it("rejects a pass verdict with a failed item, and allows a fail verdict without a failed item", () => {
+    expect(errorsOf({ ...pass, items: [it1("A", "pass"), it1("B", "fail")] })).toContain('verdict: must be "fail"');
+    expect(errorsOf({ ...fail, items: [it1("A", "pass"), it1("B", "blocked")] })).toBeUndefined();
+    expect(errorsOf({ ...fail, items: [it1("A", "pass")] })).toBeUndefined();
+  });
+
+  it("rejects items that are all blocked and tells the model not to call the tool", () => {
+    const e = errorsOf({ ...pass, items: [it1("A", "blocked")] });
+    expect(e).toContain("every item is blocked");
+    expect(e).toContain("Do not call qa_verdict");
+  });
+
+  it("rejects duplicate ids, too many items, a long id, a long reason and a bad result", () => {
+    expect(errorsOf({ ...pass, items: [it1("A", "pass"), it1(" A", "pass")] })).toContain("ids must be unique");
+    expect(errorsOf({ ...pass, items: Array.from({ length: 21 }, (_, i) => it1(`i${i}`, "pass")) })).toContain("at most 20");
+    expect(errorsOf({ ...pass, items: [it1("x".repeat(41), "pass")] })).toContain("items[0].id");
+    expect(errorsOf({ ...pass, items: [it1("A", "pass", "x".repeat(301))] })).toContain("items[0].reason");
+    expect(errorsOf({ ...pass, items: [it1("A", "ok" as never)] })).toContain("items[0].result");
+  });
+
+  it("a rejected items call does not use up the verdict", async () => {
+    const s = createBrowseAgentSession({ extraTools: { qa_verdict: qaVerdictHooks() }, executeTool: async (c) => executeQaVerdict(c.input) });
+    expect(await s.runTool({ toolName: "qa_verdict", input: { ...pass, items: [it1("A", "fail")] }, toolCallId: "1" })).toContain("error");
+    expect(JSON.parse(await s.runTool({ toolName: "qa_verdict", input: { ...fail, items: [it1("A", "fail")] }, toolCallId: "2" })).ok).toBe(true);
+  });
+
+  it("the hooks put items into the result field, and qaResultOf carries them", async () => {
+    const items = [it1("A", "pass"), it1("B", "blocked")];
+    const s = createBrowseAgentSession({ extraTools: { qa_verdict: qaVerdictHooks() }, executeTool: async (c) => executeQaVerdict(c.input) });
+    await s.runTool({ toolName: "qa_verdict", input: { ...pass, items }, toolCallId: "1" });
+    const r = await s.run("goal", { send: async () => {}, stop() {}, messages: () => [] });
+    expect(r[QA_VERDICT_FIELD]).toEqual({ ...pass, items });
+    expect(qaResultOf(r, []).items).toEqual(items);
+  });
+
+  it("qaResultOf has no items key when the verdict had none, and carries items when it has them", () => {
+    expect("items" in qaResultOf({ status: "done", qaVerdict: pass }, [])).toBe(false);
+    const items = [it1("A", "pass")];
+    const qa = qaResultOf({ status: "done", qaVerdict: { ...pass, items } }, []);
+    expect(qa.items).toEqual(items);
+  });
+
+  it("downgrades a pass without items for a failed check in the last qa_assert call", () => {
+    const rec = { source: "agent" as const, check: { type: "text" as const, text: "a" }, passed: false, error: "bad" };
+    expect(qaResultOf({ status: "done", qaVerdict: pass }, [], undefined, [rec]).outcome).toBe("inconclusive");
+  });
+
+  it("does not downgrade a pass with items for a failed check in the last qa_assert call", () => {
+    const rec = { source: "agent" as const, check: { type: "text" as const, text: "a" }, passed: false, error: "bad" };
+    const items = [it1("A", "pass"), it1("B", "blocked")];
+    const qa = qaResultOf({ status: "done", qaVerdict: { ...pass, items } }, [], undefined, [rec]);
+    expect(qa.outcome).toBe("passed");
+    expect(qa.reason).toBe(pass.reason);
+    expect(qa.items).toEqual(items);
   });
 });
 

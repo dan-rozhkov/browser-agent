@@ -35,6 +35,34 @@ function graph(entry: string): { files: Set<string>; bare: Set<string> } {
   return { files, bare };
 }
 
+const item = (id: string, result: string, reason = "r") => ({ id, result, reason });
+function itemInputs(): unknown[] {
+  return [
+    { verdict: "pass", reason: "ok", items: [item("A", "pass")] },
+    { verdict: "pass", reason: "ok", items: [item(" A ", "pass"), item("B", "blocked")] },
+    { verdict: "fail", reason: "ok", items: [item("A", "pass"), item("B", "fail")] },
+    { verdict: "pass", reason: "ok", items: [item("A", "pass"), item("B", "fail")] },
+    { verdict: "fail", reason: "ok", items: [item("A", "pass")] },
+    { verdict: "pass", reason: "ok", items: [item("A", "blocked"), item("B", "blocked")] },
+    { verdict: "fail", reason: "ok", items: [item("A", "blocked")] },
+    { verdict: "pass", reason: "ok", items: [item("A", "pass"), item("A", "pass")] },
+    { verdict: "pass", reason: "ok", items: null },
+    { verdict: "pass", reason: "ok", items: [] },
+    { verdict: "pass", reason: "ok", items: "A" },
+    { verdict: "pass", reason: "ok", items: [null] },
+    { verdict: "pass", reason: "ok", items: Array.from({ length: 20 }, (_, i) => item(`i${i}`, "pass")) },
+    { verdict: "pass", reason: "ok", items: Array.from({ length: 21 }, (_, i) => item(`i${i}`, "pass")) },
+    { verdict: "pass", reason: "ok", items: [item("x".repeat(40), "pass")] },
+    { verdict: "pass", reason: "ok", items: [item("x".repeat(41), "pass")] },
+    { verdict: "pass", reason: "ok", items: [item("  ", "pass")] },
+    { verdict: "pass", reason: "ok", items: [item("A", "maybe")] },
+    { verdict: "pass", reason: "ok", items: [item("A", "pass", "x".repeat(300))] },
+    { verdict: "pass", reason: "ok", items: [item("A", "pass", "x".repeat(301))] },
+    { verdict: "pass", reason: "ok", items: [item("A", "pass", "  ")] },
+    { verdict: "pass", reason: "ok", items: [{ id: "A", result: "pass" }] },
+  ];
+}
+
 describe("agent/session entry", () => {
   const { files, bare } = graph(join(dir, "sessionEntry.ts"));
   const names = [...files].map((f) => f.slice(dir.length + 1));
@@ -117,6 +145,7 @@ describe("agent/session entry", () => {
       { verdict: "pass", reason: " ok " }, { verdict: "fail", reason: "x".repeat(500) }, { verdict: "fail", reason: "x".repeat(501) },
       { verdict: "pass", reason: "   " }, { verdict: "maybe", reason: "x" }, { verdict: "pass" }, { reason: "x" },
       { verdict: "pass", reason: 5 }, null, "pass", [], undefined,
+      ...itemInputs(),
     ];
     for (const input of inputs) {
       const ok = JSON.parse(sessionEntry.executeQaVerdict(input)).ok === true;
