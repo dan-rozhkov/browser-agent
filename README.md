@@ -35,7 +35,7 @@ three pen-editor repos move onto this package.
 Install it from the Git repo by tag:
 
 ```bash
-npm install github:dan-rozhkov/browser-agent#v0.4.2 # x-release-please-version
+npm install github:dan-rozhkov/browser-agent#v0.4.3 # x-release-please-version
 ```
 
 When the `NPM_TOKEN` secret is set, releases are also published to npm
