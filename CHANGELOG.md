@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.2...v0.4.3) (2026-10-26)
+
+
+### Features
+
+* **qa:** export a QA run as a Playwright test ([d2cf6c6](https://github.com/dan-rozhkov/browser-agent/commit/d2cf6c603b0093996bba02ae02320bc6bd79cbfc))
+* **trace:** DOM snapshot of a failed step ([0042019](https://github.com/dan-rozhkov/browser-agent/commit/0042019ba39517d90bd477ec51dbee3c089c90c3))
+
 ## [0.4.2](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.1...v0.4.2) (2026-10-24)
 
 
