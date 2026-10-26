@@ -5998,6 +5998,56 @@ describe("capture", () => {
     expect(await controller.capture({})).toEqual({ error: "No browser tab is open — call browse_open first." });
   });
 
+  describe("host-only budgetMs and forTrace", () => {
+    const hanging = () =>
+      makeFakePage({
+        executeJavaScript: vi.fn((code: string) => (isSignatureCall(code) ? Promise.resolve({ ok: true }) : new Promise(() => {}))),
+      });
+
+    it("budgetMs shortens the time box of the capture", async () => {
+      const result = await new BrowserController(makeFakeTarget(hanging())).capture({ budgetMs: 30 });
+      expect(result).toEqual({ error: "Browser command timed out after 30ms." });
+    });
+
+    it("budgetMs cannot lengthen the 45 s box", async () => {
+      vi.useFakeTimers();
+      try {
+        const pending = new BrowserController(makeFakeTarget(hanging())).capture({ budgetMs: 999_999 });
+        await vi.advanceTimersByTimeAsync(45_001);
+        expect(await pending).toEqual({ error: "Browser command timed out after 45000ms." });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("an invalid budgetMs is ignored", async () => {
+      for (const bad of ["x", -5, 0, Number.NaN, null]) {
+        const page = pageReturning(okResult);
+        const result = await new BrowserController(makeFakeTarget(page)).capture({ budgetMs: bad });
+        expect(result).toHaveProperty("html");
+      }
+    });
+
+    it("the answer echoes forTrace: true only when the redaction was asked for", async () => {
+      const ask = async (args: unknown) => new BrowserController(makeFakeTarget(pageReturning(okResult))).capture(args);
+      expect(await ask({ forTrace: true })).toHaveProperty("forTrace", true);
+      expect(await ask({})).not.toHaveProperty("forTrace");
+      expect(await ask({ forTrace: "yes" })).not.toHaveProperty("forTrace");
+    });
+
+    it("forTrace reaches the page script only when it is true", async () => {
+      const argsOf = async (args: unknown) => {
+        const page = pageReturning(okResult);
+        await new BrowserController(makeFakeTarget(page)).capture(args);
+        const code = (page.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0])).find((c) => c.includes('"maxChars"'))!;
+        return /"forTrace":(true|false)/.exec(code)?.[1];
+      };
+      expect(await argsOf({ forTrace: true })).toBe("true");
+      expect(await argsOf({ forTrace: "yes" })).toBeUndefined();
+      expect(await argsOf({})).toBeUndefined();
+    });
+  });
+
   it("injects whole-document args and passes the script result through", async () => {
     const page = pageReturning(okResult);
     const controller = new BrowserController(makeFakeTarget(page));
@@ -6050,6 +6100,28 @@ describe("capture", () => {
     expect(styles[1]).toBe(".inl{color:red}");
     expect(result.html).toMatch(/^<!doctype html><html><head><meta charset="utf-8"><style>/);
     expect(result.html).toMatch(/<\/head><body><p>hi<\/p><\/body><\/html>$/);
+  });
+
+  it("forTrace redacts url(...) in a fetched stylesheet and in the literal @import fallback; without it the css is unchanged", async () => {
+    const run = async (args: unknown) => {
+      const fetchText = fetching({ "https://cdn.test/css/site.css": ".used{background:url(https://u:p@a.test/b.png?token=ZZ9&w=2)}" });
+      const { page } = cssPage(
+        [
+          { kind: "link", href: "https://cdn.test/css/site.css", media: "" },
+          { kind: "link", href: "https://cdn.test/missing.css?api_key=QQ8&v=1", media: "" },
+        ],
+        () => ({ rootMatches: [], existing: [".used"], unparseable: [] }),
+        { fetchText },
+      );
+      return ((await new BrowserController(makeFakeTarget(page)).capture(args)) as { html: string }).html;
+    };
+    const traced = await run({ forTrace: true });
+    expect(traced).not.toMatch(/ZZ9|QQ8|u:p@/);
+    expect(traced).toContain("w=2");
+    expect(traced).toContain("v=1");
+    const plain = await run({});
+    expect(plain).toContain("ZZ9");
+    expect(plain).toContain("QQ8");
   });
 
   it("falls back to the literal @import when the stylesheet cannot be fetched", async () => {

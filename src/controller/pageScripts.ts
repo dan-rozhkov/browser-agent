@@ -1,3 +1,5 @@
+import { TRACE_SECRET_RULES } from "../shared/trace.js";
+
 // Scripts injected into a browser tab's real page via
 // `WebContents#executeJavaScript` (see controller.ts). Each is a plain
 // string constant — a self-invoking function expression that returns a
@@ -6881,6 +6883,96 @@ export const CAPTURE_JS = `(() => {
   ${SECRET_FIELD_JS}
   ${FIND_BY_SNAPSHOT_JS}
   var args = ${ARGS_MARKER};
+  // forTrace (host-only, the trace recorder): the capture is for structure and layout, not for page state. Every
+  // emitted element (also <html>, <body> and the canvas image) keeps ONLY the attributes of TR_ALLOW (an ALLOWLIST:
+  // a new framework attribute is dropped by default), form values are gone, hidden inputs and most <meta> are gone.
+  // The URLs that stay (and url(...) in CSS) go through the URL redaction exactly once. The secret-name rules are the
+  // trace rules of shared/trace.ts, passed in as data so the page and the host keep one rule; change them there.
+  var forTrace = args.forTrace === true;
+  var TR = ${JSON.stringify(TRACE_SECRET_RULES)};
+  var TR_KEY = new RegExp(TR.key, "i");
+  var TR_ALLOW = {};
+  ("id class style role lang dir hidden title alt type for colspan rowspan width height tabindex disabled checked " +
+    "selected readonly open multiple placeholder src srcset href action poster xlink:href data-testid data-test data-qa " +
+    "viewbox d fill stroke stroke-width points x y cx cy r rx ry x1 y1 x2 y2 transform opacity fill-rule clip-rule " +
+    "preserveaspectratio xmlns xmlns:xlink fill-opacity stroke-opacity stroke-linecap stroke-linejoin stroke-dasharray " +
+    "stroke-dashoffset stroke-miterlimit clip-path mask filter offset stop-color stop-opacity gradientunits " +
+    "gradienttransform dx dy text-anchor").split(" ").forEach(function (k) { TR_ALLOW[k] = 1; });
+  var TR_URL_ATTR = { href: 1, src: 1, action: 1, poster: 1, "xlink:href": 1 };
+  function trSecretName(name) {
+    if (TR_KEY.test(name) || /^(session|signature)/i.test(name)) return true;
+    var parts = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/[_\\-.\\s]+/);
+    for (var i = 0; i < parts.length; i++) if (TR.parts.indexOf(parts[i].toLowerCase()) >= 0) return true;
+    return false;
+  }
+  function trParams(params) {
+    var out = params.split("&");
+    for (var i = 0; i < out.length; i++) {
+      var eq = out[i].indexOf("=");
+      if (eq < 0) continue;
+      var name = out[i].slice(0, eq);
+      try {
+        name = decodeURIComponent(name);
+      } catch (err) {
+        // keep the raw name
+      }
+      if (trSecretName(name)) out[i] = out[i].slice(0, eq + 1) + "[redacted]";
+    }
+    return out.join("&");
+  }
+  function trUrl(u) {
+    if (!u || /^\\s*data:/i.test(u)) return u;
+    var hash = u.indexOf("#");
+    var base = hash < 0 ? u : u.slice(0, hash);
+    var frag = hash < 0 ? "" : u.slice(hash);
+    // user:pass@ in front of the host goes (like redactTraceUrl).
+    base = base.replace(/^([a-z][a-z0-9+.-]*:\\/\\/)[^/?#@]*@/i, "$1");
+    var q = base.indexOf("?");
+    if (q >= 0) base = base.slice(0, q + 1) + trParams(base.slice(q + 1));
+    if (frag.indexOf("=") >= 0) frag = "#" + trParams(frag.slice(1));
+    return base + frag;
+  }
+  // The value to keep for an attribute in a trace, or null to drop the attribute. Allowlist, names case-insensitive:
+  // TR_ALLOW, every aria-*; a kept <meta> (charset / viewport) also keeps charset, name and content.
+  function trAttr(name, v, el) {
+    if (!forTrace) return v;
+    var l = name.toLowerCase();
+    var keep = TR_ALLOW[l] === 1 || l.indexOf("aria-") === 0;
+    if (!keep && el && el.nodeType === 1 && el.localName === "meta") keep = l === "charset" || l === "name" || l === "content";
+    if (!keep) return null;
+    if (!v) return v;
+    if (l === "style") return trCssUrls(v);
+    if (l === "srcset") return trSrcset(v);
+    if (TR_URL_ATTR[l] === 1) return trUrl(v);
+    return v;
+  }
+  // The one attribute pass of a trace: every element the capture emits goes through it.
+  function trFilter(el) {
+    var names = [];
+    for (var i = 0; i < el.attributes.length; i++) names.push(el.attributes[i].name);
+    for (var j = 0; j < names.length; j++) {
+      var cur = el.getAttribute(names[j]);
+      var tr = trAttr(names[j], cur, el);
+      if (tr === null) el.removeAttribute(names[j]);
+      else if (tr !== cur) el.setAttribute(names[j], tr);
+    }
+  }
+  // url(...) inside CSS text goes through the same URL redaction.
+  function trCssUrls(t) {
+    if (!t) return t;
+    return t.replace(/url\\(\\s*(?:"([^"]*)"|'([^']*)'|([^)"'\\s][^)]*?))\\s*\\)/gi, function (m, a, b, c) {
+      var u = a !== undefined ? a : b !== undefined ? b : c;
+      u = (u || "").trim();
+      if (!u || u.charAt(0) === "#" || /^data:/i.test(u)) return m;
+      return 'url("' + trUrl(u).replace(/"/g, "%22") + '")';
+    });
+  }
+  function trSrcset(v) {
+    var cands = parseSrcset(v);
+    var parts = [];
+    for (var i = 0; i < cands.length; i++) parts.push(trUrl(cands[i].url) + (cands[i].desc ? " " + cands[i].desc : ""));
+    return parts.join(", ");
+  }
   try {
     var base = document.baseURI;
     // Every copied node comes from this INERT document (no browsing context):
@@ -6906,10 +6998,12 @@ export const CAPTURE_JS = `(() => {
         var u = a !== undefined ? a : b !== undefined ? b : c;
         u = (u || "").trim();
         if (!u || u.charAt(0) === "#" || /^data:/i.test(u)) return m;
-        return 'url("' + abs(u).replace(/"/g, "%22") + '")';
+        var au = abs(u);
+        return 'url("' + au.replace(/"/g, "%22") + '")';
       });
       t = t.replace(/@import\\s+(?:"([^"]*)"|'([^']*)')/gi, function (m, a, b) {
-        return '@import url("' + abs(a !== undefined ? a : b).replace(/"/g, "%22") + '")';
+        var iu = abs(a !== undefined ? a : b);
+        return '@import url("' + iu.replace(/"/g, "%22") + '")';
       });
       return t;
     }
@@ -7222,10 +7316,17 @@ export const CAPTURE_JS = `(() => {
           }
           img.setAttribute("src", data);
           if (sizeCss) img.setAttribute("style", (img.getAttribute("style") ? img.getAttribute("style") + ";" : "") + sizeCss);
+          if (forTrace) trFilter(img);
           return img;
         } catch (err) {
           // tainted canvas: fall through and clone it empty
         }
+      }
+
+      if (forTrace && tag === "input" && (n.getAttribute("type") || "").toLowerCase() === "hidden") return null;
+      if (forTrace && tag === "meta") {
+        var metaName = (n.getAttribute("name") || "").toLowerCase();
+        if (!n.hasAttribute("charset") && metaName !== "viewport") return null;
       }
 
       var c = doc.importNode(n, false);
@@ -7277,7 +7378,7 @@ export const CAPTURE_JS = `(() => {
         if (type === "checkbox" || type === "radio") {
           if (n.checked) c.setAttribute("checked", "");
           else c.removeAttribute("checked");
-        } else if (type !== "file" && !penIsSecretField(n)) {
+        } else if (type !== "file" && !penIsSecretField(n) && !forTrace) {
           c.setAttribute("value", n.value);
         } else {
           c.removeAttribute("value");
@@ -7287,8 +7388,10 @@ export const CAPTURE_JS = `(() => {
         else c.removeAttribute("selected");
       }
 
+      if (forTrace) trFilter(c);
+
       if (tag === "textarea") {
-        if (!penIsSecretField(n)) c.textContent = n.value;
+        if (!penIsSecretField(n) && !forTrace) c.textContent = n.value;
         return c;
       }
 
@@ -7330,7 +7433,8 @@ export const CAPTURE_JS = `(() => {
           var an = el.attributes[q].name;
           var lower = an.toLowerCase();
           if (lower.indexOf("on") === 0 || lower.indexOf("data-pen-") === 0) continue;
-          var v = el.attributes[q].value;
+          var v = trAttr(an, el.attributes[q].value, el);
+          if (v === null) continue;
           if (lower === "style") {
             hasStyle = true;
             v = (extraStyle ? extraStyle + ";" : "") + cssAbs(v);
@@ -7359,7 +7463,7 @@ export const CAPTURE_JS = `(() => {
         var pn = ics[k];
         if (pn.indexOf("--") !== 0) continue;
         var pv = ics.getPropertyValue(pn).trim();
-        if (pv && pv.indexOf(";") < 0 && pv.indexOf("<") < 0) parts.push(pn + ":" + cssAbs(pv));
+        if (pv && pv.indexOf(";") < 0 && pv.indexOf("<") < 0) parts.push(pn + ":" + (forTrace ? trCssUrls(cssAbs(pv)) : cssAbs(pv)));
       }
       parts.push("color:" + ics.color, "font-family:" + ics.fontFamily, "font-size:" + ics.fontSize,
         "line-height:" + ics.lineHeight, "color-scheme:" + ics.colorScheme);

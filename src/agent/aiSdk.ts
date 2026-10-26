@@ -50,6 +50,7 @@ import {
 import { qaAssertDefinition, qaJudgeSchema, qaVerdictDefinition } from "./qa.js";
 import { mergeCarriedDialogs } from "../shared/dialogs.js";
 import { createBrowseTraceRecorder, type BrowseTraceRecorder } from "./traceRecorder.js";
+import { createTraceDomSource } from "./traceDomSource.js";
 import type { BrowseTrace } from "../shared/trace.js";
 import { createRunCheckpoint } from "./checkpoint.js";
 import { createFixtureSetup, unmatchedMocks } from "./fixtureSetup.js";
@@ -249,8 +250,12 @@ export interface RunBrowseAgentOptions {
    * `qa.onScreenshot`: a throw or a rejection is ignored; an async callback is awaited for at most 15 s. It is not
    * called when the run throws. `labels` are free-form host labels. `capture: false` records no step frames and no
    * final frame. Without `browser.screenshot` the trace has no step frames.
+   * `dom: true` adds DOM snapshots of failed steps and failed `qa_assert` calls (docs/specs/2026-10-26-trace-dom-snapshot-design.md):
+   * taken INLINE at the end of the step: `browser.capture({ budgetMs: 3500, forTrace: true })` as html; when it answers
+   * `{ error }` (a native app), throws, or the bridge has no `capture`, the recorder stores the element list of the
+   * latest snapshot a step output carried, as text (kind ax, `formatSnapshotForTrace`). No extra browser call.
    */
-  trace?: { labels?: Record<string, string>; capture?: boolean; repro?: boolean; onTrace?(trace: BrowseTrace): void | Promise<void> };
+  trace?: { labels?: Record<string, string>; capture?: boolean; repro?: boolean; dom?: boolean; onTrace?(trace: BrowseTrace): void | Promise<void> };
   /**
    * Observe every tool execution: the browse tools and the host tools, also the
    * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
@@ -467,6 +472,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
         ...(opts.trace.labels ? { labels: opts.trace.labels } : {}),
         ...(opts.trace.repro ? { repro: true } : {}),
         ...(traceCapture ? { capture: () => takeScreenshot(opts.browser, TRACE_CAPTURE_MS) } : {}),
+        ...(opts.trace.dom === true ? { captureDom: createTraceDomSource(opts.browser) } : {}),
         ...(opts.browser.requests ? { requests: () => opts.browser.requests!() } : {}),
       })
     : undefined;

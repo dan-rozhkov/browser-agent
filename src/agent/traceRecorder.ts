@@ -16,6 +16,7 @@ import {
   BROWSE_TRACE_VERSION,
   REPRO_KEY,
   capTraceText,
+  domBytesToDataUrl,
   hasSecretWord,
   isSecretFieldName,
   isSecretHeaderName,
@@ -26,6 +27,7 @@ import {
   urlHasSecret,
   type BrowseTrace,
   type BrowseTraceAction,
+  type BrowseTraceDom,
   type BrowseTraceFrame,
   type BrowseTraceRepro,
   type BrowseTraceReproAction,
@@ -41,6 +43,7 @@ import type { QaCheck } from "../shared/qaTypes.js";
 import { parseQaChecks } from "../shared/qaChecks.js";
 import type { FixtureEmulate, FixtureNetworkRule, FixtureStep } from "../fixture/types.js";
 import { parseJsonObject } from "./session.js";
+import { formatSnapshotForTrace } from "./traceSnapshot.js";
 
 type FrameKind = BrowseTraceFrame["kind"];
 
@@ -96,6 +99,22 @@ export interface BrowseTraceRecorderOptions {
    * Without it a `__repro` key in an output is still removed from the recorded output, but nothing is stored.
    */
   repro?: boolean;
+  /**
+   * DOM snapshot source (docs/specs/2026-10-26-trace-dom-snapshot-design.md). Called INLINE at the end of a failed step
+   * that the default failure-frame rule frames, and of a `qa_assert` step with `passed: false`, right after the step
+   * frame; the step result waits for it, at most 5000 ms (the host should pass a smaller budget to its own call, so
+   * the bound is real). Never for a step with redacted typed text. ONE timeout stops html capture for the run. Not
+   * called when `signal` is aborted; the host-side abort aborts the `signal` it gets. Returns the page as one
+   * self-contained html document (secrets masked), or `undefined`. When it gives no html (and `domFallback` is not
+   * false), the recorder stores the element list of the latest snapshot it saw in a step output as an "ax" entry (text).
+   */
+  captureDom?: (signal: AbortSignal) => Promise<{ html: string; url?: string; title?: string; width?: number; height?: number } | undefined>;
+  /** Default true. false: no "ax" entry from the latest snapshot when `captureDom` gives no html. */
+  domFallback?: boolean;
+  /** Default 5. Snapshots past it are counted in `dropped.doms`. */
+  maxDoms?: number;
+  /** Default 2_000_000 (UTF-8 bytes of the stored text). A bigger snapshot is skipped and counted in `dropped.doms`. */
+  maxDomBytes?: number;
 }
 
 /** The browse_agent setup as `setRepro` reads it (a `PageFixture` or a bit more). Unknown fields are ignored. */
@@ -113,6 +132,8 @@ export interface BrowseTraceReproSetup {
 export interface BrowseTraceRecorder {
   readonly id: string;
   /**
+   * CONTRACT: a host MUST call the end callback this returns for every `onToolCall`, also when the call is aborted.
+   * A call without its end callback stays "in flight", so later DOM captures count as concurrent and are dropped.
    * Same shape as `StepRecorder.onToolCall`. The returned function is async:
    * await it before the result goes back to the model, so the step frame shows
    * the page right after this step. It never rejects. It resolves to `{ dialogs }` when the capture drained
@@ -154,6 +175,12 @@ function defaultCaptureAfter(tool: string, args: unknown, _ok: boolean): boolean
   }
   if (tool === "browse_tabs") return typeof input.action === "string" && TAB_CAPTURE_ACTIONS.includes(input.action);
   return false;
+}
+
+/** The failure-frame rule (default `captureAfter`, minus the "second failure in a row" memory): a failed step that gets a failure frame/DOM. */
+function failureWanted(tool: string, input: unknown, ok: boolean, error: string | undefined, parsed: Record<string, unknown>, prevFramed: boolean): boolean {
+  if (ok || !defaultCaptureAfter(tool, input, ok)) return false;
+  return !(prevFramed || (PRE_EXECUTION_ERROR.test(error ?? "") && nothingRan(parsed)));
 }
 
 /** The per-action entries of a batched `browse_act` from its parsed result; undefined when the batch did not run. */
@@ -467,6 +494,14 @@ function readRequestSource(value: unknown): { entries: unknown[]; dropped: numbe
 
 /** More than the controller's own 3000 ms for `requests()`, so its answer is not cut. */
 const REQUESTS_TIMEOUT_MS = 5000;
+/** Each DOM capture is limited to this long. */
+// The recorder's bound. The controller's own budget (TRACE_DOM_BUDGET_MS, 3500) is lower on purpose: the bridge round
+// trip and the wait for the controller lock come on top of it, so the controller gives up first and this timer (which
+// disables DOM capture for the run) stays the backstop.
+const DOM_TIMEOUT_MS = 5000;
+
+/** Tools that do not change the page: a snapshot stays fresh across them (the "ax" fallback). */
+const READ_ONLY_TOOLS = new Set(["qa_assert", "browse_read", "browse_snapshot", "browse_screenshot", "browse_find_images", "browse_capture", "qa_verdict"]);
 /** The time box of the last drain in `flush` (the run may already be over). */
 const FLUSH_TIMEOUT_MS = 2000;
 
@@ -543,6 +578,22 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
     if (signal?.aborted) return;
     requestQueue = requestQueue.then(() => drainRequests(fallback, REQUESTS_TIMEOUT_MS));
   };
+  const maxDoms = opts.maxDoms ?? 5;
+  const maxDomBytes = opts.maxDomBytes ?? 2_000_000;
+  const doms: BrowseTraceDom[] = [];
+  let droppedDoms = 0;
+  let domDisabled = false;
+  const domFallback = opts.domFallback !== false;
+  // The latest snapshot any step output carried (browse_open / browse_act / browse_snapshot / browse_screenshot): the "ax" fallback.
+  let latestSnapshot: Record<string, unknown> | undefined;
+  let latestSnapshotStep: number | undefined;
+  // A page-changing step ended after the latest snapshot was taken: the snapshot no longer describes the page.
+  let latestStale = false;
+  // Parallel steps: calls that started and did not end, and a counter of ended steps. A DOM snapshot is skipped when
+  // another call is still open, or a step that typed a secret ended after this step started.
+  let inFlight = 0;
+  let endSeq = 0;
+  const secretEndSeqs: number[] = [];
   let finished: BrowseTrace | undefined;
   const reproOn = opts.repro === true;
   let reproSetup: BrowseTraceRepro["setup"];
@@ -612,6 +663,85 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
     }
   }
 
+  /** Takes one DOM snapshot for `stepIndex`, inline. Counts it in `droppedDoms` when none is stored. Never throws. */
+  async function captureDomSnapshot(stepIndex: number, signal: AbortSignal | undefined, concurrent: boolean): Promise<void> {
+    if (!opts.captureDom || finished) return;
+    if (doms.length >= maxDoms || signal?.aborted || concurrent) {
+      droppedDoms += 1;
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const controller = new AbortController();
+    let stored = false;
+    try {
+      let html: { html: string; url?: string; title?: string; width?: number; height?: number } | undefined;
+      if (!domDisabled) {
+        const gone = Symbol("gone");
+        const got = await Promise.race([
+          Promise.resolve().then(() => opts.captureDom!(controller.signal)),
+          new Promise<typeof gone>((resolve) => {
+            timer = setTimeout(() => {
+              domDisabled = true;
+              controller.abort();
+              resolve(gone);
+            }, DOM_TIMEOUT_MS);
+            onAbort = () => {
+              controller.abort();
+              resolve(gone);
+            };
+            signal?.addEventListener("abort", onAbort, { once: true });
+          }),
+        ]).catch(() => undefined);
+        if (got !== undefined && got !== gone && typeof got === "object" && typeof got.html === "string") html = got;
+      }
+      if (finished) return;
+      let kind: BrowseTraceDom["kind"] | undefined;
+      let text = "";
+      let meta: { url?: unknown; title?: unknown } = {};
+      let width: number | undefined;
+      let height: number | undefined;
+      let sourceStepIndex: number | undefined;
+      if (html) {
+        kind = "html";
+        text = html.html;
+        meta = html;
+        width = html.width;
+        height = html.height;
+      } else if (domFallback && latestSnapshot && !latestStale && !signal?.aborted) {
+        text = formatSnapshotForTrace(latestSnapshot);
+        if (text !== "") {
+          kind = "ax";
+          meta = latestSnapshot;
+          sourceStepIndex = latestSnapshotStep;
+        }
+      }
+      if (!kind) return;
+      const encoded = new TextEncoder().encode(text);
+      if (encoded.length > maxDomBytes) return;
+      doms.push({
+        id: doms.length,
+        at: now(),
+        stepIndex,
+        kind,
+        ...(sourceStepIndex !== undefined ? { sourceStepIndex } : {}),
+        src: domBytesToDataUrl(kind, encoded),
+        ...(typeof meta.url === "string" ? { url: redactTraceUrl(meta.url) } : {}),
+        ...(typeof meta.title === "string" ? { title: capTraceText(meta.title, 300) } : {}),
+        ...(typeof width === "number" && Number.isFinite(width) ? { width } : {}),
+        ...(typeof height === "number" && Number.isFinite(height) ? { height } : {}),
+        bytes: encoded.length,
+      });
+      stored = true;
+    } catch {
+      // No entry, no error.
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+      if (!stored) droppedDoms += 1;
+    }
+  }
+
   /** The step whose [startedAt, endedAt] holds `at` (a step still open runs until now). */
   function stepAt(at: number): number | undefined {
     const t = now();
@@ -678,6 +808,8 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
     onToolCall(call, ctx) {
       const index = calls++;
       const stepStartedAt = now();
+      const startSeq = endSeq;
+      inFlight += 1;
       let args: unknown;
       let typedSecret = false;
       try {
@@ -725,6 +857,16 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
             step.ok = false;
             step.error = capTraceText(parsed.error, BROWSE_TRACE_ERROR_MAX_CHARS);
           }
+          // The latest element list the model saw: the "ax" DOM fallback needs no browser call.
+          const seen = isObject(parsed.snapshot) && Array.isArray(parsed.snapshot.elements) ? parsed.snapshot : Array.isArray(parsed.elements) ? parsed : undefined;
+          endSeq += 1;
+          if (typedSecret) secretEndSeqs.push(endSeq);
+          if (!READ_ONLY_TOOLS.has(call.toolName)) latestStale = true;
+          if (seen) {
+            latestSnapshot = seen;
+            latestSnapshotStep = frameStep;
+            latestStale = false;
+          }
           if (typeof parsed.imageData === "string") {
             const { imageData, ...rest } = parsed;
             step.output = JSON.stringify(rest);
@@ -763,7 +905,10 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
             // A throwing predicate means no frame.
           }
           // A failure frame needs a reason: not a call refused before it ran, not a second one in a row.
-          if (wanted && !step.ok && !opts.captureAfter && (prevFailureFramed || (PRE_EXECUTION_ERROR.test(step.error ?? "") && nothingRan(parsed)))) wanted = false;
+          const failureWant = failureWanted(call.toolName, call.input, step.ok, step.error, parsed, prevFailureFramed);
+          if (wanted && !step.ok && !opts.captureAfter && !failureWant) wanted = false;
+          // DOM snapshot: a failed step with a failure frame, or a failed qa_assert (not a failed step: it is evidence).
+          const domWanted = !!opts.captureDom && !typedSecret && (failureWant || (call.toolName === "qa_assert" && parsed.passed === false));
           let dialogs: unknown[] | undefined;
           // The screenshot of a step that typed a secret would show it.
           if (wanted && !typedSecret) {
@@ -771,10 +916,18 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
             dialogs = await capturePage(frameStep, ctx?.signal);
             prevFailureFramed = !step.ok && nextFrameId > framesBefore;
           } else prevFailureFramed = false;
+          // Inline, bounded: the DOM is the page of THIS step, not of a later one.
+          if (domWanted && frameStep !== undefined) {
+            // Another call still open, or a secret typed since this step started: the page is not this step's page.
+            const concurrent = inFlight > 1 || secretEndSeqs.some((q) => q > startSeq);
+            await captureDomSnapshot(frameStep, ctx?.signal, concurrent);
+          }
           scheduleDrain(ctx?.signal, frameStep);
           if (dialogs) return { dialogs };
         } catch {
           // Ignored: the recorder never throws into the host.
+        } finally {
+          inFlight -= 1;
         }
         return {};
       };
@@ -825,6 +978,7 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
         ...(consoleLog.seen.dropped() > 0 ? { console: consoleLog.seen.dropped() } : {}),
         ...(networkLog.seen.dropped() > 0 ? { network: networkLog.seen.dropped() } : {}),
         ...(droppedRequests > 0 ? { requests: droppedRequests } : {}),
+        ...(droppedDoms > 0 ? { doms: droppedDoms } : {}),
       };
       finished = {
         format: BROWSE_TRACE_FORMAT,
@@ -840,6 +994,7 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
         // Calls still pending are steps that did not finish.
         steps: slots.map((s) => (s.open ? { ...s.step, endedAt } : s.step)),
         frames,
+        ...(doms.length > 0 ? { doms } : {}),
         console: consoleLog.entries,
         network: networkLog.entries,
         ...(opts.requests ? { requests: requestLog } : {}),

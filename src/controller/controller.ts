@@ -22,7 +22,7 @@ import { captureFixture, readBaseState, type BaseState } from "../fixture/captur
 import { CHECKPOINT_GAPS, mergeStorage } from "../fixture/checkpoint.js";
 import { clearDeviceEmulation, emulationIdentity, installEmulation, layerViewport, resolveEmulation } from "../fixture/emulate.js";
 import { parseViewportArgs } from "../shared/viewport.js";
-import { REPRO_KEY, type ReproCapture, type ReproLocator } from "../shared/trace.js";
+import { REPRO_KEY, redactCssUrls, type ReproCapture, type ReproLocator } from "../shared/trace.js";
 import { JournalSession, type JournalBase, type JournalCommand, type StagedAction } from "./journal.js";
 import type {
   CheckpointJournalOptions,
@@ -1067,6 +1067,10 @@ function validateReadArgs(args: unknown): { ok: true; value: ValidatedReadArgs }
 interface ValidatedCaptureArgs {
   snapshotId: string | null;
   index: number | null;
+  /** Host-only (the trace recorder): the time box of this capture; never below 1, never above CAPTURE_BUDGET_MS. */
+  budgetMs: number | null;
+  /** Host-only (the trace recorder): the page script also removes hidden-input values, secret-field values and secret URL params. */
+  forTrace: boolean;
 }
 
 function validateCaptureArgs(args: unknown): { ok: true; value: ValidatedCaptureArgs } | { ok: false; error: string } {
@@ -1088,11 +1092,15 @@ function validateCaptureArgs(args: unknown): { ok: true; value: ValidatedCapture
   if (hasSnapshot && !hasIndex) {
     return { ok: false, error: 'browse_capture requires "index" alongside "snapshotId".' };
   }
+  // Host-only args: an invalid value is ignored (the model never sees them).
+  const budgetMs = typeof raw.budgetMs === "number" && Number.isFinite(raw.budgetMs) && raw.budgetMs > 0 ? raw.budgetMs : null;
   return {
     ok: true,
     value: {
       snapshotId: hasSnapshot ? (raw.snapshotId as string) : null,
       index: hasIndex ? (raw.index as number) : null,
+      budgetMs,
+      forTrace: raw.forTrace === true,
     },
   };
 }
@@ -4494,7 +4502,7 @@ export class BrowserController {
   private async captureUnlocked(args: unknown): Promise<BrowserCommandResult> {
     const validated = validateCaptureArgs(args);
     if (!validated.ok) return errorResult(validated.error);
-    const { snapshotId, index } = validated.value;
+    const { snapshotId, index, budgetMs, forTrace } = validated.value;
     return this.withCommandTimeout(async (deadlineAt) => {
       const page = this.target.currentPage();
       if (!page) return errorResult("No browser tab is open — call browse_open first.");
@@ -4510,7 +4518,7 @@ export class BrowserController {
           );
         }
       }
-      const captured = await this.executeScript(page, "CAPTURE_JS", { snapshotId, index, maxChars: CAPTURE_MAX_CHARS });
+      const captured = await this.executeScript(page, "CAPTURE_JS", { snapshotId, index, maxChars: CAPTURE_MAX_CHARS, ...(forTrace ? { forTrace: true } : {}) });
       if ("error" in captured) return captured;
       // The page's own pre-check (it sees the document before any CSS work).
       if (typeof captured.tooLarge === "number") return errorResult(tooLargeMessage(captured.tooLarge));
@@ -4527,6 +4535,7 @@ export class BrowserController {
         "<!doctype html>" + htmlOpen + '<head><meta charset="utf-8">' +
         sheets
           .flatMap((sh) => [...sh.fallbacks.map(importStatement), ...(sheetCss(sh).trim() ? [sheetCss(sh)] : [])])
+          .map((css) => (forTrace ? redactCssUrls(css) : css))
           .map(renderStyleTag)
           .join("") +
         "</head>" + bodyOpen + bodyHtml + "</body></html>";
@@ -4542,8 +4551,10 @@ export class BrowserController {
       if (html.length > CAPTURE_MAX_CHARS) {
         return errorResult(tooLargeMessage(html.length));
       }
-      return { html, width: captured.width, height: captured.height, url: captured.url, title: captured.title };
-    }, CAPTURE_BUDGET_MS);
+      // `forTrace: true` in the answer is the proof that the trace redaction ran: a host that needs it (the trace
+      // DOM source) discards an answer without it, because an older controller ignores the arg.
+      return { html, width: captured.width, height: captured.height, url: captured.url, title: captured.title, ...(forTrace ? { forTrace: true } : {}) };
+    }, budgetMs === null ? CAPTURE_BUDGET_MS : Math.min(budgetMs, CAPTURE_BUDGET_MS));
   }
 
   /** capture v2: one finished sheet per source (imports inlined, urls

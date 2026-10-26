@@ -379,6 +379,161 @@ describe("CAPTURE_JS", () => {
     expect(html).toContain("shoes");
   });
 
+  describe("forTrace allowlist", () => {
+    const trace = () => capture({ ...doc, forTrace: true });
+    const traceHtml = () => trace().html as string;
+
+    it("drops the attributes a denylist missed (framework, formaction, ping, data-*) and keeps the allowlist", () => {
+      document.body.innerHTML =
+        '<div id="a" class="c" style="color:red" role="x" aria-label="L" data-testid="t" data-test="u" data-qa="v" ' +
+        'wire:snapshot="WS1" hx-headers="HX1" hx-vals="HX2" x-data="XD1" :class="CL1" @click="CK1" v-model="VM1" ng-model="NG1" ' +
+        'data-card="DC1" data-auth-state="DA1" data-page=\'{"props":{"user":"PG1"}}\' data-plain="ok">t</div>' +
+        '<form action="/pay"><button formaction="/steal?FA1" type="submit">go</button></form>' +
+        '<a href="/x" ping="/track?PN1" cite="CI1" nonce="NO1" integrity="IN1">l</a>' +
+        '<table background="BG1"><tr><td colspan="2" rowspan="1">c</td></tr></table>';
+      const html = traceHtml();
+      for (const gone of ["WS1", "HX1", "HX2", "XD1", "CL1", "CK1", "VM1", "NG1", "DC1", "DA1", "PG1", "FA1", "PN1", "CI1", "NO1", "IN1", "BG1", "data-plain"]) {
+        expect(html).not.toContain(gone);
+      }
+      for (const kept of ['id="a"', 'class="c"', 'style="color:red"', 'role="x"', 'aria-label="L"', 'data-testid="t"', 'data-test="u"', 'data-qa="v"', 'href="http', 'action="/pay"', 'colspan="2"', 'rowspan="1"']) {
+        expect(html).toContain(kept);
+      }
+      // Without forTrace the canvas copy is unchanged.
+      const plain = capture().html as string;
+      expect(plain).toContain("WS1");
+      expect(plain).toContain("data-plain");
+    });
+
+    it("matches names case-insensitively and keeps the SVG drawing attributes", () => {
+      document.body.innerHTML =
+        '<svg viewBox="0 0 4 4" xmlns="http://www.w3.org/2000/svg" DATA-SECRET="S1"><path d="M0 0L4 4" fill="red" stroke-width="2" ' +
+        'fill-rule="evenodd" TRANSFORM="rotate(1)" onclick="x()"/></svg><div ID="up" TabIndex="1" HX-VALS="H1"></div>';
+      const html = traceHtml();
+      expect(html).toMatch(/viewBox="0 0 4 4"/);
+      expect(html).toMatch(/d="M0 0L4 4"/);
+      expect(html).toContain('fill-rule="evenodd"');
+      expect(html).toContain("rotate(1)");
+      expect(html).toContain('id="up"');
+      for (const gone of ["S1", "H1", "onclick"]) expect(html).not.toContain(gone);
+    });
+
+    it("keeps the attribute order", () => {
+      document.body.innerHTML = '<div title="t" data-x="1" class="c" id="i" name="n"></div>';
+      expect(traceHtml()).toContain('<div title="t" class="c" id="i"></div>');
+    });
+
+    it("applies the same rules to <html> and <body>", () => {
+      document.documentElement.setAttribute("data-csrf-token", "HTMLTOK");
+      document.documentElement.setAttribute("lang", "en");
+      document.body.setAttribute("data-page", '{"a":1}');
+      document.body.setAttribute("x-data", "XB1");
+      document.body.setAttribute("class", "bc");
+      try {
+        const res = trace();
+        const html = res.html as string;
+        for (const gone of ["HTMLTOK", "data-page", "XB1"]) expect(html).not.toContain(gone);
+        expect(res.htmlOpen).toContain('lang="en"');
+        expect(res.bodyOpen).toContain('class="bc"');
+      } finally {
+        document.documentElement.removeAttribute("data-csrf-token");
+        document.documentElement.removeAttribute("lang");
+        document.body.removeAttribute("data-page");
+        document.body.removeAttribute("x-data");
+        document.body.removeAttribute("class");
+      }
+    });
+
+    it("drops every input value and textarea text but keeps checked / selected and option text", () => {
+      document.body.innerHTML =
+        '<form><input name="q" value="shoes"><input type="text" value="typed1"><input type="checkbox" name="c" value="CV1" checked>' +
+        '<textarea name="t">TA1</textarea><input type="hidden" name="csrf" value="csrf-123">' +
+        '<select><option value="OV1" selected>Red</option><option value="OV2">Blue</option></select></form>';
+      const html = traceHtml();
+      for (const gone of ["shoes", "typed1", "CV1", "TA1", "csrf-123", "csrf", "OV1", "OV2"]) expect(html).not.toContain(gone);
+      expect(html).not.toContain('type="hidden"');
+      expect(html).toMatch(/<input type="checkbox" checked="">/);
+      expect(html).toContain("<textarea></textarea>");
+      expect(html).toMatch(/<option selected="">Red<\/option>/);
+      expect(html).toContain("Blue");
+      expect(html).toContain("<textarea></textarea>");
+      // Without forTrace the canvas copy is unchanged.
+      const plain = capture().html as string;
+      expect(plain).toContain("shoes");
+      expect(plain).toContain("TA1");
+      expect(plain).toContain("csrf-123");
+    });
+
+    it("removes <meta> except charset and viewport", () => {
+      document.body.innerHTML =
+        '<meta name="csrf-token" content="M1"><meta name="description" content="M2"><meta http-equiv="refresh" content="M3">' +
+        '<meta charset="utf-8"><meta name="viewport" content="width=device-width">';
+      const html = traceHtml();
+      for (const gone of ["M1", "M2", "M3", "csrf-token", "refresh"]) expect(html).not.toContain(gone);
+      expect(html).toContain('charset="utf-8"');
+      expect(html).toContain("width=device-width");
+    });
+
+    it("redacts urls exactly once: userinfo and secret params in href, src, action, srcset, poster, xlink:href", () => {
+      document.body.innerHTML =
+        '<a href="https://bob:pw123@a.test/p?token=T1&x=1#access_token=T2&y=2">l</a>' +
+        '<img src="https://a.test/i.png?api_key=T3&w=2" srcset="https://a.test/i.png?sessionId=T4 2x, https://a.test/j.png?w=1 1x">' +
+        '<form action="/pay?auth=T5&ok=1"></form>' +
+        '<video poster="https://a.test/p.jpg?signature=T6"></video>' +
+        '<svg><use xlink:href="https://a.test/s.svg?secret=T7#i"/></svg>';
+      const html = traceHtml();
+      for (const t of ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "pw123", "bob"]) expect(html).not.toContain(t);
+      expect(html).toContain("https://a.test/p?token=[redacted]&amp;x=1#access_token=[redacted]&amp;y=2");
+      expect(html).toContain("x=1");
+      expect(html).toContain("w=1");
+      expect(html).not.toContain("[redacted][redacted]");
+      expect(html).not.toContain("%5B");
+      expect(html).not.toContain("%25");
+      expect(capture().html as string).toContain("T1");
+      expect(capture().html as string).toContain("pw123");
+    });
+
+    it("redacts url(...) in inline styles once, with no double encoding", () => {
+      document.body.innerHTML = '<div style="background:url(\'https://a.test/i.png?api_key=S2&w=3\')">x</div>';
+      document.body.setAttribute("style", "background:url(https://u:p@a.test/b.png?token=S3)");
+      try {
+        const res = trace();
+        const html = res.html as string;
+        expect(html).not.toContain("S2");
+        expect(html).toContain("w=3");
+        expect(html).not.toContain("[redacted][redacted]");
+        expect(html).not.toContain("%22%22");
+        expect(res.bodyOpen).not.toContain("S3");
+        expect(res.bodyOpen).not.toContain("u:p@");
+        expect(capture().html as string).toContain("S2");
+      } finally {
+        document.body.removeAttribute("style");
+      }
+    });
+
+    it("applies the allowlist to the canvas image too: the rendered image and size stay, other attributes go", () => {
+      document.body.innerHTML =
+        '<canvas id="cv" class="k" width="30" height="20" data-api-key="CK9" x-data="CX9" wire:snapshot="CW9" aria-label="chart" data-testid="ct"></canvas>';
+      const canvas = document.getElementById("cv") as HTMLCanvasElement;
+      canvas.toDataURL = () => "data:image/webp;base64,AAAA";
+      const html = traceHtml();
+      for (const gone of ["CK9", "CX9", "CW9"]) expect(html).not.toContain(gone);
+      expect(html).toContain('src="data:image/webp;base64,AAAA"');
+      expect(html).toContain('id="cv"');
+      expect(html).toContain('class="k"');
+      expect(html).toContain('aria-label="chart"');
+      expect(html).toContain('data-testid="ct"');
+      expect(html).toMatch(/width:\d+px|<img/);
+      // Without forTrace the canvas copy keeps its attributes.
+      expect(capture().html as string).toContain("CK9");
+    });
+
+    it("drops a JSON data-page blob", () => {
+      document.body.innerHTML = '<div id="app" data-page=\'{"props":{"user":"SECRETUSER"}}\'></div>';
+      expect(traceHtml()).not.toContain("SECRETUSER");
+      expect(traceHtml()).toContain('id="app"');
+    });
+  });
+
   it("reports <link rel=stylesheet> and <style> as ordered sources and no longer emits them in the body", () => {
     document.head.innerHTML =
       '<link rel="stylesheet" href="/a.css"><style>.x{background:url(img/bg.png)}</style>' +

@@ -107,7 +107,7 @@ async function main(): Promise<void> {
       browser: controllerBridge(controller),
       url,
       qa: true,
-      trace: { repro: true, capture: false, onTrace: (t) => void (trace = t) },
+      trace: { repro: true, dom: true, capture: false, onTrace: (t) => void (trace = t) },
     });
     console.log(`run: status ${result.status}, qa outcome ${result.qa?.outcome}`);
   } finally {
@@ -117,6 +117,14 @@ async function main(): Promise<void> {
   const traceJson = JSON.stringify(trace, null, 2);
   writeFileSync(join(out, "trace.json"), traceJson);
   if (traceJson.includes(SECRET)) throw new Error("the typed secret is in the trace");
+  // The failed qa_assert step keeps a DOM snapshot of the page as the run saw it (docs/specs/2026-10-26-trace-dom-snapshot-design.md).
+  const dom = trace.doms?.[0];
+  if (!dom || dom.kind !== "html") throw new Error("no html DOM snapshot for the failed check");
+  const html = Buffer.from(dom.src.slice(dom.src.indexOf(",") + 1), "base64").toString("utf8");
+  if (!html.includes("Items: 1")) throw new Error("the DOM snapshot does not show the bug");
+  if (html.includes(SECRET)) throw new Error("the typed secret is in the DOM snapshot");
+  writeFileSync(join(out, "dom-0.html"), html);
+  console.log(`dom: step ${dom.stepIndex}, ${dom.bytes} bytes, shows "Items: 1", no secret`);
   const spec = browseTraceToPlaywrightSpec(trace);
   if (!spec.ok) throw new Error(spec.error);
   if (spec.code.includes(SECRET)) throw new Error("the typed secret is in the spec");

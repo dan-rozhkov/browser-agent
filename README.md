@@ -708,7 +708,18 @@ for upload); `mapTraceFrames(trace, resolve)` maps each `frame.src` (for a store
 (same rule as the controller: the output's own `dialogs` first, the carried ones after). `parseBrowseTrace(value)` is the structural check at a trust boundary and returns `{ trace }` or `{ error }`.
 A `frame.src` must be an image data URL (jpeg, png, webp), an asset path, an `https:` URL or `http://localhost`
 (or `127.0.0.1`); anything else is an error.
-`BROWSE_TRACE_ASSET_PATH` is the pattern of a valid asset path.
+`BROWSE_TRACE_ASSET_PATH` is the pattern of a valid asset path (`frames/<id>.<ext>`, `dom/<id>.html`, `dom/<id>.txt`).
+
+DOM snapshots (`docs/specs/2026-10-26-trace-dom-snapshot-design.md`): with `trace: { dom: true }` (recorder option
+`captureDom`), a failed step that gets a failure frame and a `qa_assert` call with `passed: false` also store the page
+as self-contained HTML in `trace.doms` (`kind: "html"`, from `browser.capture({ budgetMs: 4500, forTrace: true })`).
+The capture runs INLINE at the end of the step (the step result waits, at most 5 s), so it shows the page of that
+step. `forTrace` also drops hidden-input values, secret-field values and secret URL params from the HTML. When
+`capture` answers `{ error }` (a native app), throws, or the bridge has none, the entry holds the latest `snapshot` a
+step output carried, as text (`kind: "ax"`, `formatSnapshotForTrace`): no extra browser call. At most 5 per run
+(`maxDoms`), 2 MB each (`maxDomBytes`); every wanted snapshot that was not stored is counted in `dropped.doms`. A step
+with redacted typed text gets none. `splitTraceAssets` moves them to `dom/<id>.html|txt`, both with content type
+`text/plain; charset=utf-8` (a viewer renders the text in a sandboxed iframe; never serve the file as HTML).
 
 ## Playwright test from a QA run
 

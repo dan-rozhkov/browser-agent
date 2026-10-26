@@ -79,7 +79,14 @@ export interface BrowserBridge {
    * `{ html, width, height, url, title }`. Optional — absent on bridges
    * older than this feature.
    */
-  capture?(args?: { index?: number; snapshotId?: string }): Promise<unknown>;
+  capture?(args?: {
+    index?: number;
+    snapshotId?: string;
+    /** Host-only (the trace recorder): time box of this capture in ms, capped by the controller's own budget. */
+    budgetMs?: number;
+    /** Host-only (the trace recorder): also drop hidden-input values, secret-field values and secret URL params. */
+    forTrace?: boolean;
+  }): Promise<unknown>;
   /**
    * QA assertions (docs/specs/2026-10-18-qa-diagnostics-design.md, section 2): runs
    * `checks` (see `QaCheck`) against the current page and resolves to a `QaAssertResult`

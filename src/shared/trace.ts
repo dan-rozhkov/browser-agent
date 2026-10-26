@@ -10,8 +10,8 @@ export const BROWSE_TRACE_VERSION = 1;
 
 /** Valid trace ids. */
 export const BROWSE_TRACE_ID = /^[A-Za-z0-9_-]{1,64}$/;
-/** Valid published paths of frame assets (`splitTraceAssets` makes them). */
-export const BROWSE_TRACE_ASSET_PATH = /^frames\/\d{1,4}\.(jpg|png|webp)$/;
+/** Valid published paths of trace assets: frames and DOM snapshots (`splitTraceAssets` makes them). */
+export const BROWSE_TRACE_ASSET_PATH = /^(?:frames\/\d{1,4}\.(?:jpg|png|webp)|dom\/\d{1,4}\.(?:html|txt))$/;
 
 export const BROWSE_TRACE_GOAL_MAX_CHARS = 4000;
 export const BROWSE_TRACE_ANSWER_MAX_CHARS = 4000;
@@ -74,6 +74,31 @@ export interface BrowseTraceFrame {
   src: string;
   width?: number;
   height?: number;
+}
+
+/**
+ * A DOM snapshot of a moment where the run went wrong (docs/specs/2026-10-26-trace-dom-snapshot-design.md).
+ * `html`: a self-contained document (a page). `ax`: the accessibility/element list as text (a native app).
+ */
+export interface BrowseTraceDom {
+  /** 0-based, unique in the trace. */
+  id: number;
+  /** Epoch ms. */
+  at: number;
+  stepIndex: number;
+  kind: "html" | "ax";
+  /** ax only: the step whose output the accessibility tree came from (it can be an earlier step than `stepIndex`). */
+  sourceStepIndex?: number;
+  /** `data:text/html;base64,...` (html) or `data:text/plain;base64,...` (ax) in memory; `dom/<id>.html` / `dom/<id>.txt` or a URL after storage. */
+  src: string;
+  /** Redacted. */
+  url?: string;
+  /** Capped at 300 chars. */
+  title?: string;
+  width?: number;
+  height?: number;
+  /** UTF-8 length of the stored text. */
+  bytes: number;
 }
 
 export interface BrowseTraceLogEntry {
@@ -239,6 +264,8 @@ export interface BrowseTrace {
   labels?: Record<string, string>;
   steps: BrowseTraceStep[];
   frames: BrowseTraceFrame[];
+  /** DOM snapshots of failed steps and failed `qa_assert` calls, when the recorder had a `captureDom` source. */
+  doms?: BrowseTraceDom[];
   /** Console errors. */
   console: BrowseTraceLogEntry[];
   /** Failed requests (`<METHOD> <status|error> <origin><path>`). */
@@ -247,7 +274,7 @@ export interface BrowseTrace {
   /** Every network request of the run, when the recorder had a `requests` source. */
   requests?: BrowseTraceRequest[];
   /** How many entries the recorder's caps left out. */
-  dropped?: { steps?: number; frames?: number; console?: number; network?: number; requests?: number };
+  dropped?: { steps?: number; frames?: number; console?: number; network?: number; requests?: number; doms?: number };
   /** Present when the run was recorded for a Playwright export (`repro` on steps). */
   repro?: BrowseTraceRepro;
 }
@@ -340,6 +367,13 @@ function isSecretName(name: string): boolean {
   return name.split(/[_\-.\s]+|(?<=[a-z0-9])(?=[A-Z])/).some((part) => SECRET_PART.has(part.toLowerCase()));
 }
 
+/**
+ * The secret-name rules as plain data, for the CAPTURE_JS page script (`controller/pageScripts.ts`), which cannot
+ * import code: it rebuilds `SECRET_KEY`, `SECRET_FIELD` and `isSecretName` from these, so the page and the host
+ * keep one rule.
+ */
+export const TRACE_SECRET_RULES = { key: SECRET_KEY.source, field: SECRET_FIELD.source, parts: [...SECRET_PART] } as const;
+
 /** True when `name` is a secret-named key, header or query param (the one key rule of the request log). */
 export function isSecretKeyName(name: string): boolean {
   return isSecretName(name);
@@ -405,6 +439,11 @@ function redactParams(params: string): string {
 
 /** Redacts the userinfo and the secret-looking query values (and fragment params) of a url, then caps it. */
 export function redactTraceUrl(url: string): string {
+  return capTraceText(redactUrlSecrets(url), BROWSE_TRACE_REQUEST_URL_MAX_CHARS);
+}
+
+/** `redactTraceUrl` without the length cap (for urls inside HTML and CSS, which must not be cut). */
+export function redactUrlSecrets(url: string): string {
   const hash = url.indexOf("#");
   // `user:pass@` in front of the host goes.
   const base = (hash < 0 ? url : url.slice(0, hash)).replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, "$1");
@@ -413,7 +452,22 @@ export function redactTraceUrl(url: string): string {
   const out = q < 0 ? base : `${base.slice(0, q + 1)}${redactParams(base.slice(q + 1))}`;
   // A fragment that looks like `#access_token=...&x=1` is redacted the same way.
   const fragOut = frag.includes("=") ? `#${redactParams(frag.slice(1))}` : frag;
-  return capTraceText(out + fragOut, BROWSE_TRACE_REQUEST_URL_MAX_CHARS);
+  return out + fragOut;
+}
+
+/** Every `url(...)` and `@import` url in CSS text goes through the url redaction. `data:` and `#fragment` urls stay. */
+export function redactCssUrls(css: string): string {
+  const fix = (u: string): string => redactUrlSecrets(u).replace(/"/g, "%22");
+  return css
+    .replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)"'\s][^)]*?))\s*\)/gi, (m, a?: string, b?: string, c?: string) => {
+      const u = (a ?? b ?? c ?? "").trim();
+      if (!u || u.startsWith("#") || /^data:/i.test(u)) return m;
+      return `url("${fix(u)}")`;
+    })
+    .replace(/@import\s+(?:"([^"]*)"|'([^']*)')/gi, (m, a?: string, b?: string) => {
+      const u = (a ?? b ?? "").trim();
+      return !u || /^data:/i.test(u) ? m : `@import url("${fix(u)}")`;
+    });
 }
 
 /** Headers whose value is a url (a query in it can hold a token). */
@@ -507,11 +561,37 @@ export function redactTraceRequest(raw: unknown): BrowseTraceRequest | undefined
 }
 
 const DATA_URL = /^data:image\/(jpeg|png|webp);base64,/i;
+const DOM_HTML_PREFIX = "data:text/html;base64,";
+const DOM_TEXT_PREFIX = "data:text/plain;base64,";
+
+/** UTF-8 bytes as base64. Chunked, so a big text cannot overflow the argument limit of `String.fromCharCode`. Works in browsers and Node (no `Buffer`). */
+export function utf8BytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return globalThis.btoa(binary);
+}
+
+/** UTF-8 text as base64. */
+export function utf8ToBase64(text: string): string {
+  return utf8BytesToBase64(new TextEncoder().encode(text));
+}
+
+/** `data:text/html;base64,...` for an html DOM, `data:text/plain;base64,...` for an ax DOM, from the already encoded UTF-8 bytes. */
+export function domBytesToDataUrl(kind: BrowseTraceDom["kind"], bytes: Uint8Array): string {
+  return (kind === "html" ? DOM_HTML_PREFIX : DOM_TEXT_PREFIX) + utf8BytesToBase64(bytes);
+}
+
+/** `data:text/html;base64,...` for an html DOM, `data:text/plain;base64,...` for an ax DOM. */
+export function domTextToDataUrl(kind: BrowseTraceDom["kind"], text: string): string {
+  return domBytesToDataUrl(kind, new TextEncoder().encode(text));
+}
 
 /**
- * Moves data-URL frames out of the manifest. `frame.src` becomes
- * `frames/<id>.<ext>`. A frame whose `src` is not a jpeg, png or webp data URL
- * is left as it is. Returns a copy; the input is not changed.
+ * Moves data-URL frames and DOM snapshots out of the manifest. `frame.src` becomes
+ * `frames/<id>.<ext>`; a `data:text/html;base64,` DOM (kind html) becomes `dom/<id>.html`, a
+ * `data:text/plain;base64,` DOM (kind ax) `dom/<id>.txt`. Both are stored as `text/plain; charset=utf-8`
+ * (never as HTML; the viewer renders the text in a sandboxed iframe). The prefix match ignores case. A source that is not such a data URL is left as it is.
+ * Returns a copy; the input is not changed.
  */
 export function splitTraceAssets(trace: BrowseTrace): { manifest: BrowseTrace; assets: { path: string; dataUrl: string; contentType: string }[] } {
   const assets: { path: string; dataUrl: string; contentType: string }[] = [];
@@ -523,19 +603,42 @@ export function splitTraceAssets(trace: BrowseTrace): { manifest: BrowseTrace; a
     assets.push({ path, dataUrl: frame.src, contentType: `image/${type}` });
     return { ...frame, src: path };
   });
-  return { manifest: { ...trace, frames }, assets };
+  if (!trace.doms) return { manifest: { ...trace, frames }, assets };
+  const doms = trace.doms.map((dom) => {
+    // Prefix match ignores case (as `isDomSrc` does); the stored header is normalised to lower case.
+    const html = dom.kind === "html" && dom.src.slice(0, DOM_HTML_PREFIX.length).toLowerCase() === DOM_HTML_PREFIX;
+    const text = dom.kind === "ax" && dom.src.slice(0, DOM_TEXT_PREFIX.length).toLowerCase() === DOM_TEXT_PREFIX;
+    if (!html && !text) return { ...dom };
+    const path = `dom/${dom.id}.${html ? "html" : "txt"}`;
+    const prefix = html ? DOM_HTML_PREFIX : DOM_TEXT_PREFIX;
+    // Both kinds are stored as text/plain: a stored file must never be served as HTML. The viewer reads it as text.
+    assets.push({ path, dataUrl: prefix + dom.src.slice(prefix.length), contentType: "text/plain; charset=utf-8" });
+    return { ...dom, src: path };
+  });
+  return { manifest: { ...trace, frames, doms }, assets };
 }
 
-/** Maps each `frame.src` through `resolve` (for a stored manifest). Returns a copy. */
+/** Maps each `frame.src` and each `doms[].src` through `resolve` (for a stored manifest). Returns a copy. (The name predates DOM snapshots.) */
 export function mapTraceFrames(trace: BrowseTrace, resolve: (src: string) => string): BrowseTrace {
-  return { ...trace, frames: trace.frames.map((frame) => ({ ...frame, src: resolve(frame.src) })) };
+  return {
+    ...trace,
+    frames: trace.frames.map((frame) => ({ ...frame, src: resolve(frame.src) })),
+    ...(trace.doms ? { doms: trace.doms.map((dom) => ({ ...dom, src: resolve(dom.src) })) } : {}),
+  };
 }
 
 const MAX_ENTRIES = 2000;
 const SAFE_SRC = /^(?:data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+|https:\/\/[^\s]+|http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/?#][^\s]*)?)$/i;
 /** A frame source a consumer may put into an `<img>`: an image data URL, a stored asset path, an `https:` URL, or `http://localhost` / `127.0.0.1`. */
 function isFrameSrc(src: string): boolean {
-  return BROWSE_TRACE_ASSET_PATH.test(src) || SAFE_SRC.test(src);
+  return /^frames\//.test(src) ? BROWSE_TRACE_ASSET_PATH.test(src) : !/^dom\//i.test(src) && SAFE_SRC.test(src);
+}
+
+const WEB_SRC = /^(?:https:\/\/[^\s]+|http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:[/?#][^\s]*)?)$/i;
+/** A DOM source of `kind`: a matching data URL, an asset path with the right extension, an `https:` URL or `http://localhost`. */
+function isDomSrc(src: string, kind: string): boolean {
+  if (kind === "html") return /^data:text\/html;base64,[A-Za-z0-9+/=]*$/i.test(src) || /^dom\/\d{1,4}\.html$/.test(src) || WEB_SRC.test(src);
+  return /^data:text\/plain;base64,[A-Za-z0-9+/=]*$/i.test(src) || /^dom\/\d{1,4}\.txt$/.test(src) || WEB_SRC.test(src);
 }
 
 const FRAME_KINDS: readonly string[] = ["step", "screenshot", "final"];
@@ -558,11 +661,38 @@ function listProblem(name: string, list: unknown, check: (entry: Record<string, 
   return undefined;
 }
 
+/** `doms[].id` is an integer 0..9999 and unique; `doms[].url`, when present, is an `http:` or `https:` URL. */
+function domsProblem(doms: unknown): string | undefined {
+  if (!Array.isArray(doms)) return undefined;
+  const seen = new Set<number>();
+  for (const [i, d] of doms.entries()) {
+    const dom = d as Record<string, unknown>;
+    const id = dom.id as number;
+    if (!Number.isInteger(id) || id < 0 || id > 9999) return `doms[${i}]: id must be an integer 0..9999`;
+    if (seen.has(id)) return `doms[${i}]: duplicate id`;
+    seen.add(id);
+    if (dom.url !== undefined) {
+      let ok = false;
+      try {
+        const proto = new URL(dom.url as string).protocol;
+        ok = proto === "http:" || proto === "https:";
+      } catch {
+        // not a URL
+      }
+      if (!ok) return `doms[${i}]: url must be an http or https URL`;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Structural check of an unknown JSON value (the trust boundary of every
  * consumer): `format`, `version`, `id`, the arrays and their entry fields. A `frame.src` must be an image data
  * URL (jpeg, png, webp), an asset path (`BROWSE_TRACE_ASSET_PATH`), an `https:` URL or `http://localhost`;
- * anything else (`javascript:`, `file:`, another data type) is an error.
+ * anything else (`javascript:`, `file:`, another data type) is an error. A `doms[].src` follows the same rule for its kind:
+ * a matching `text/html` (html) or `text/plain` (ax) data URL, `dom/<n>.html` / `dom/<n>.txt`, an `https:` URL or `http://localhost`.
+ * A `doms[].id` is an integer 0..9999, unique; a `doms[].url` is `http:` or `https:`.
+ * A trace without `doms` (older) parses as before.
  * Extra fields (for example a stored `owner`) are kept. Returns the same value
  * typed as a trace, or an error text.
  */
@@ -582,6 +712,10 @@ export function parseBrowseTrace(value: unknown): { trace: BrowseTrace } | { err
   const problem =
     listProblem("steps", value.steps, (s) => isNum(s.index) && isStr(s.tool) && isNum(s.startedAt) && isNum(s.endedAt) && typeof s.ok === "boolean" && optStr(s.error) && optStr(s.output) && (s.actions === undefined || (Array.isArray(s.actions) && s.actions.length <= BROWSE_TRACE_MAX_ACTIONS && s.actions.every(isAction)))) ??
     listProblem("frames", value.frames, (f) => isNum(f.id) && isNum(f.at) && optNum(f.stepIndex) && isStr(f.kind) && FRAME_KINDS.includes(f.kind) && isStr(f.src) && isFrameSrc(f.src) && optNum(f.width) && optNum(f.height)) ??
+    (value.doms === undefined
+      ? undefined
+      : listProblem("doms", value.doms, (d) => isNum(d.id) && isNum(d.at) && isNum(d.stepIndex) && isStr(d.kind) && (d.kind === "html" || d.kind === "ax") && isStr(d.src) && isDomSrc(d.src, d.kind) && (d.sourceStepIndex === undefined || (Number.isInteger(d.sourceStepIndex) && (d.sourceStepIndex as number) >= 0)) && optStr(d.url) && optStr(d.title) && optNum(d.width) && optNum(d.height) && isNum(d.bytes))) ??
+    domsProblem(value.doms) ??
     listProblem("console", value.console, (e) => isNum(e.at) && optNum(e.stepIndex) && isStr(e.text)) ??
     listProblem("network", value.network, (e) => isNum(e.at) && optNum(e.stepIndex) && isStr(e.text)) ??
     (value.requests === undefined
