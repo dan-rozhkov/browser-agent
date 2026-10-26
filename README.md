@@ -710,6 +710,31 @@ A `frame.src` must be an image data URL (jpeg, png, webp), an asset path, an `ht
 (or `127.0.0.1`); anything else is an error.
 `BROWSE_TRACE_ASSET_PATH` is the pattern of a valid asset path.
 
+## Playwright test from a QA run
+
+A QA run (`qa: true`) ends with a verdict, and the next run is a new LLM run. To keep a failing run as a regression
+test, record it with `repro` and render the trace as a Playwright `.spec.ts` file. The file replays the run without an
+LLM. Design: `docs/specs/2026-10-26-playwright-spec-export-design.md`.
+
+```ts
+import { browseTraceToPlaywrightSpec } from "@sideform/browser-agent/agent/session";   // zod-free, also in `/agent`
+
+const out = browseTraceToPlaywrightSpec(trace, { title: "Cart keeps the item" });
+if (out.ok) {
+  await writeFile(out.fileName, out.code);          // e.g. cart-keeps-the-item.spec.ts
+  console.log(out.actions, out.gaps, out.failingChecks);
+} else {
+  console.error(out.error);                         // for example: the trace was recorded without repro
+}
+```
+
+Every `qa_assert` check becomes an `expect`, passing or failing. A check that failed in the run carries a
+`// FAILED in the run: ...` comment, so the test is red until the bug is fixed. A step the file cannot replay
+(an iframe, an upload, tabs, an Electron app) is a visible `// GAP:` comment and is counted in the header.
+Secret text becomes `process.env.QA_SECRET_<n>`; cookies and storage are not exported. Network mocks become
+`page.route` and the emulation becomes `test.use`. The renderer checks every field it reads, so a hand-edited trace
+gives gaps and never broken code.
+
 ## Page fixtures
 
 A `PageFixture` is the state of a browser before a task: cookies, localStorage,

@@ -14,7 +14,7 @@
 
 import { decideBrowserNavigation } from "./navigation.js";
 import { evaluateQaChecks, hasPlaywrightSelectorSyntax, parseQaChecks } from "../shared/qaChecks.js";
-import type { QaCheckResult } from "../shared/qaTypes.js";
+import type { QaCheck, QaCheckResult } from "../shared/qaTypes.js";
 import { applyParsedFixture, fixtureBudgetMs } from "../fixture/apply.js";
 import { boundedCall, httpOrigin, redactUrl, redactUrls, withTimeout } from "../fixture/util.js";
 import { parsePageFixture } from "../fixture/parse.js";
@@ -22,6 +22,7 @@ import { captureFixture, readBaseState, type BaseState } from "../fixture/captur
 import { CHECKPOINT_GAPS, mergeStorage } from "../fixture/checkpoint.js";
 import { clearDeviceEmulation, emulationIdentity, installEmulation, layerViewport, resolveEmulation } from "../fixture/emulate.js";
 import { parseViewportArgs } from "../shared/viewport.js";
+import { REPRO_KEY, type ReproCapture, type ReproLocator } from "../shared/trace.js";
 import { JournalSession, type JournalBase, type JournalCommand, type StagedAction } from "./journal.js";
 import type {
   CheckpointJournalOptions,
@@ -94,6 +95,7 @@ import {
   BOT_CHECK_JS,
   IFRAME_RECTS_JS,
   SELECTOR_JS,
+  LOCATOR_JS,
   DOC_MARKER_JS,
   BOX_VISIBLE_JS,
 } from "./pageScripts.js";
@@ -141,6 +143,7 @@ const SCRIPT_TEMPLATES = {
   BOT_CHECK_JS,
   IFRAME_RECTS_JS,
   SELECTOR_JS,
+  LOCATOR_JS,
   DOC_MARKER_JS,
 } as const;
 
@@ -2505,11 +2508,80 @@ export class BrowserController {
   async act(args: unknown): Promise<BrowserCommandResult> {
     return this.runExclusive(async () => {
       this.relocatedThisCommand = false;
-      const result = this.withRelocated(await this.actUnlocked(args));
+      // `repro` is a host-only flag (Playwright spec export): taken out before the action sees the args.
+      let actArgs = args;
+      let repro = false;
+      if (isRecord(args) && "repro" in args) {
+        repro = args.repro === true;
+        const { repro: _flag, ...rest } = args;
+        actArgs = rest;
+      }
+      // The locator is computed BEFORE the action (a click can remove the element).
+      const capture = repro ? await this.captureActRepro(actArgs) : undefined;
+      let result = this.withRelocated(await this.actUnlocked(actArgs));
+      if (capture && !("error" in result)) {
+        const viewport = isRecord(result.viewport) ? result.viewport : undefined;
+        const extra: ReproCapture =
+          isRecord(actArgs) && actArgs.action === "viewport"
+            ? typeof viewport?.width === "number" && typeof viewport.height === "number"
+              ? { viewport: { width: viewport.width, height: viewport.height } }
+              : {}
+            : capture;
+        if (Object.keys(extra).length > 0) result = { ...result, [REPRO_KEY]: extra };
+      }
       // Wave 3 reliability, item 3: drained once, at the outermost public
       // entry point — see mergeDiagnostics's doc comment.
       return this.mergeDiagnostics(result, this.target.currentPage());
     });
+  }
+
+  /**
+   * Playwright spec export: the locator of the element an `act` is about to act on, or a gap.
+   * Never throws and never runs longer than `JOURNAL_MARKER_TIMEOUT_MS`. Returns `undefined` for
+   * an action that names no element (goto-like, scroll, wait, back, a key-only press, viewport).
+   */
+  private async captureActRepro(args: unknown): Promise<ReproCapture | undefined> {
+    if (!isRecord(args)) return undefined;
+    const action = args.action;
+    if (action === "viewport") return {};
+    if (action !== "click" && action !== "type" && action !== "select" && action !== "press" && action !== "hover") return undefined;
+    const target = typeof args.target === "string" && args.target.trim() !== "" ? args.target : undefined;
+    const index = typeof args.index === "number" ? args.index : undefined;
+    const snapshotId = typeof args.snapshotId === "string" ? args.snapshotId : undefined;
+    const byIndex = index !== undefined && snapshotId !== undefined;
+    if (!byIndex && target === undefined) return action === "press" ? undefined : { gap: "not-found" };
+    try {
+      const page = this.target.currentPage();
+      if (!page) return { gap: "not-found" };
+      if (byIndex) {
+        if (this.checkSnapshotStale(snapshotId, page)) return { gap: "not-found" };
+        if (this.resolveFrameRoute(index).frameId !== null) return { gap: "iframe" };
+      }
+      const outcome = await boundedCall(
+        () =>
+          this.executeScript(page, "LOCATOR_JS", {
+            ...(byIndex ? { index, snapshotId } : { target }),
+            op: action,
+            ...(action === "select" && typeof args.text === "string" ? { optionText: args.text } : {}),
+          }),
+        JOURNAL_MARKER_TIMEOUT_MS,
+      );
+      return outcome.done ? this.reproFromAnswer(outcome.value) : { gap: "not-found" };
+    } catch {
+      return { gap: "not-found" };
+    }
+  }
+
+  /** A `LOCATOR_JS` answer as a `ReproCapture`. */
+  private reproFromAnswer(answer: BrowserCommandResult): ReproCapture {
+    if (answer.ok === true && isRecord(answer.locator) && typeof answer.locator.kind === "string") {
+      return {
+        locator: answer.locator as unknown as ReproLocator,
+        ...(answer.secret === true ? { secret: true as const } : {}),
+        ...(typeof answer.value === "string" ? { value: answer.value } : {}),
+      };
+    }
+    return { gap: typeof answer.reason === "string" ? answer.reason : "not-found" };
   }
 
   private async actUnlocked(args: unknown): Promise<BrowserCommandResult> {
@@ -5269,13 +5341,45 @@ export class BrowserController {
       // The two history checks: evaluated here on what this call drained (the agent layer adds the run history).
       const evaluated = evaluateQaChecks({ results, consoleErrors: diagnostics.consoleErrors, failedRequests: diagnostics.failedRequests }, checks);
       const finalResults = evaluated.ok ? evaluated.results : results;
+      const reproChecks = args.repro === true ? await this.captureAssertRepro(page, checks, snapshotId) : undefined;
       return {
         ok: true,
         passed: finalResults.every((r) => r.passed),
         results: finalResults,
         ...diagnostics,
+        ...(reproChecks ? { [REPRO_KEY]: { checks: reproChecks } satisfies ReproCapture } : {}),
       };
     });
+  }
+
+  /** Playwright spec export: one locator (or gap) per check with an `index`, `null` for the others. Never throws. */
+  private async captureAssertRepro(
+    page: BrowserPageHandle,
+    checks: QaCheck[],
+    snapshotId: string | undefined,
+  ): Promise<NonNullable<ReproCapture["checks"]>> {
+    const out: NonNullable<ReproCapture["checks"]> = [];
+    for (const check of checks) {
+      const index = (check.type === "element" || check.type === "value") && check.selector === undefined ? check.index : undefined;
+      if (index === undefined) {
+        out.push(null);
+        continue;
+      }
+      const capture = await this.captureIndexLocator(page, index, snapshotId);
+      out.push(capture.locator ? { locator: capture.locator } : { gap: capture.gap ?? "not-found" });
+    }
+    return out;
+  }
+
+  private async captureIndexLocator(page: BrowserPageHandle, index: number, snapshotId: string | undefined): Promise<ReproCapture> {
+    try {
+      if (snapshotId === undefined || this.checkSnapshotStale(snapshotId, page)) return { gap: "not-found" };
+      if (this.resolveFrameRoute(index).frameId !== null) return { gap: "iframe" };
+      const outcome = await boundedCall(() => this.executeScript(page, "LOCATOR_JS", { index, snapshotId, op: "assert" }), JOURNAL_MARKER_TIMEOUT_MS);
+      return outcome.done ? this.reproFromAnswer(outcome.value) : { gap: "not-found" };
+    } catch {
+      return { gap: "not-found" };
+    }
   }
 
   private drainList(drain: () => string[] | undefined): string[] {

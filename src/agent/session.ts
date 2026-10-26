@@ -150,6 +150,22 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 /** Keys the session owns. A host field with one of these names cannot replace them. */
 const CORE_KEYS: ReadonlySet<string> = new Set(["status", "answer", "steps", "error"]);
 
+/**
+ * Removes the top-level `__repro` key (the Playwright export capture) from a JSON object output.
+ * Anything without that text, and anything that is not a JSON object, comes back unchanged.
+ */
+export function stripRepro(output: string): string {
+  if (typeof output !== "string" || !output.includes('"__repro"')) return output;
+  try {
+    const parsed: unknown = JSON.parse(output);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !("__repro" in parsed)) return output;
+    const { __repro: _drop, ...rest } = parsed as Record<string, unknown>;
+    return JSON.stringify(rest);
+  } catch {
+    return output;
+  }
+}
+
 /** Returns `value` when it is a positive number (`Infinity` too); else throws a `RangeError` that names it. */
 export function positiveNumber(name: string, value: number): number {
   if (typeof value !== "number" || Number.isNaN(value) || value <= 0) {
@@ -187,7 +203,8 @@ export function createBrowseAgentSession(opts: BrowseAgentSessionOptions): Brows
 
   async function execute(call: BrowseAgentToolCall): Promise<string> {
     try {
-      return await opts.executeTool(call, { signal });
+      // The host's executeTool (and its observers, the trace recorder) saw `__repro`; the model does not.
+      return stripRepro(await opts.executeTool(call, { signal }));
     } catch (err) {
       return JSON.stringify({ error: browseAgentErrorMessage(err) });
     }

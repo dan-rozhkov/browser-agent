@@ -11,6 +11,7 @@ export * from "./tools.js";
 export * from "./session.js";
 export * from "./traceRecorder.js";
 export * from "../shared/trace.js";
+export * from "../shared/playwrightSpec.js";
 export { mergeCarriedDialogs } from "../shared/dialogs.js";
 export { executeBrowseTool } from "./execute.js";
 export * from "./qa.js";

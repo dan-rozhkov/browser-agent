@@ -173,6 +173,16 @@ describe("applyLoopGuard", () => {
     expect(JSON.parse(r3)).toHaveProperty("loopWarning");
   });
 
+  it("ignores the host-only __repro capture when it compares results", () => {
+    resetLoopGuard("chat-1");
+    const args = { action: "click", index: 0 };
+    const results = ["css-a", "css-b", "css-c"].map((value) =>
+      applyLoopGuard("browse_act", args, JSON.stringify({ matched: "Search", changed: false, __repro: { locator: { kind: "css", value } } }), "chat-1"),
+    );
+
+    expect(JSON.parse(results[2]!)).toHaveProperty("loopWarning");
+  });
+
   it("still resets the ring for a mutating call whose NORMALIZED result genuinely differs, ignoring snapshotId churn", () => {
     resetLoopGuard("chat-1");
     const args = { action: "click", index: 0 };

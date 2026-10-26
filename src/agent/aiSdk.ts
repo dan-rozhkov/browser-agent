@@ -250,7 +250,7 @@ export interface RunBrowseAgentOptions {
    * called when the run throws. `labels` are free-form host labels. `capture: false` records no step frames and no
    * final frame. Without `browser.screenshot` the trace has no step frames.
    */
-  trace?: { labels?: Record<string, string>; capture?: boolean; onTrace?(trace: BrowseTrace): void | Promise<void> };
+  trace?: { labels?: Record<string, string>; capture?: boolean; repro?: boolean; onTrace?(trace: BrowseTrace): void | Promise<void> };
   /**
    * Observe every tool execution: the browse tools and the host tools, also the
    * pre-open of `url` (`call.preOpen` is true; the id is `${runId}:open`). Called when the
@@ -460,10 +460,12 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   }
   const trail = qaOn ? createStepRecorder() : undefined;
   const traceCapture = opts.trace !== undefined && opts.trace.capture !== false && !!opts.browser.screenshot;
+  const reproOn = opts.trace?.repro === true;
   const recorder: BrowseTraceRecorder | undefined = opts.trace
     ? createBrowseTraceRecorder({
         goal,
         ...(opts.trace.labels ? { labels: opts.trace.labels } : {}),
+        ...(opts.trace.repro ? { repro: true } : {}),
         ...(traceCapture ? { capture: () => takeScreenshot(opts.browser, TRACE_CAPTURE_MS) } : {}),
         ...(opts.browser.requests ? { requests: () => opts.browser.requests!() } : {}),
       })
@@ -473,7 +475,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
     ...(qaOn && trail
       ? {
           [QA_VERDICT_TOOL]: { ...qaVerdictHooks(), ...qaVerdictDefinition, execute: async (input: unknown) => executeQaVerdict(input) },
-          [QA_ASSERT_TOOL]: { ...qaAssertDefinition, execute: async (input: unknown) => executeQaAssert(input, opts.browser, trail) },
+          [QA_ASSERT_TOOL]: { ...qaAssertDefinition, execute: async (input: unknown) => executeQaAssert(input, opts.browser, trail, { repro: reproOn }) },
         }
       : {}),
   };
@@ -508,7 +510,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
       const extra = extras[call.toolName];
       const output = extra
         ? await extra.execute(call.input, { toolCallId: call.toolCallId, signal: ctx.signal })
-        : await executeBrowseTool(opts.browser, call.toolName, call.input);
+        : await executeBrowseTool(opts.browser, call.toolName, call.input, reproOn ? { repro: true } : {});
       ended({ output });
       // The trace screenshot drained the page's JS dialogs: the model gets them in this output, as without tracing.
       const carried = await traceEnd?.({ output }).catch(() => undefined);
@@ -538,6 +540,7 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const parts: BrowseAgentMessagePart[] = [];
   const messages: BrowseAgentMessage[] = [{ role: "assistant", parts }];
   // The release covers the token of THIS run's apply only, also when the apply resolves after the run ended.
+  if (opts.fixture) recorder?.setRepro({ setup: opts.fixture });
   const fixtureSetup = opts.fixture
     ? createFixtureSetup(opts.browser, opts.fixture, {
         allowNetworkMocks: opts.allowNetworkMocks === true,

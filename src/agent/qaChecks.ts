@@ -5,13 +5,14 @@
 // schema of `qa_assert` is in qa.ts and must agree with `parseQaChecks`.
 import { QA_ASSERT_TOOL, QA_FINAL_CHECKS_TIMEOUT_MS, REASON_MAX_CHARS, cut, describeQaCheckFailure, evaluateQaChecks, isObject, parseQaChecks } from "../shared/qaChecks.js";
 import type { QaCheck, QaCheckRecord, QaCheckResult, QaResult } from "./qaTypes.js";
+import { REPRO_KEY } from "../shared/trace.js";
 import type { QaDiagnosticsHistory } from "../shared/qaChecks.js";
 
 export * from "../shared/qaChecks.js";
 
 /** What a browser needs to run checks: the bridge `assert`. */
 export interface QaAssertBrowser {
-  assert?(args: { checks: QaCheck[] }): Promise<unknown>;
+  assert?(args: { checks: QaCheck[]; repro?: boolean }): Promise<unknown>;
 }
 
 /** Where `executeQaAssert` and `runFinalChecks` read the history and write their records. A `StepRecorder` is one. */
@@ -26,13 +27,13 @@ export interface QaCheckSink extends QaDiagnosticsHistory {
  * error. The drained `consoleErrors` and `failedRequests` stay in the output, so the step
  * recorder harvests them.
  */
-export async function executeQaAssert(input: unknown, browser: QaAssertBrowser, sink: QaCheckSink): Promise<string> {
+export async function executeQaAssert(input: unknown, browser: QaAssertBrowser, sink: QaCheckSink, opts: { repro?: boolean } = {}): Promise<string> {
   const parsed = parseQaChecks(isObject(input) ? input.checks : undefined);
   if (!parsed.ok) return JSON.stringify({ error: `${QA_ASSERT_TOOL}: ${parsed.errors.join("; ")}` });
   if (!browser.assert) return JSON.stringify({ error: `${QA_ASSERT_TOOL}: this browser does not support assertions.` });
   let answer: unknown;
   try {
-    answer = await browser.assert({ checks: parsed.value });
+    answer = await browser.assert({ checks: parsed.value, ...(opts.repro ? { repro: true } : {}) });
   } catch (err) {
     return JSON.stringify({ error: `${QA_ASSERT_TOOL}: ${err instanceof Error ? err.message : String(err)}` });
   }
@@ -43,6 +44,8 @@ export async function executeQaAssert(input: unknown, browser: QaAssertBrowser, 
     return JSON.stringify({ error: `${QA_ASSERT_TOOL}: ${evaluated.error}` });
   }
   sink.addChecks(evaluated.results.map((r) => ({ source: "agent" as const, ...r })));
+  // The controller's capture for the Playwright export (`repro: true`): kept at the top level for the trace recorder.
+  const capture = opts.repro && isObject(answer) ? answer[REPRO_KEY] : undefined;
   return JSON.stringify({
     passed: evaluated.passed,
     results: evaluated.results,
@@ -50,6 +53,7 @@ export async function executeQaAssert(input: unknown, browser: QaAssertBrowser, 
     ...(evaluated.failedRequests ? { failedRequests: evaluated.failedRequests } : {}),
     ...(evaluated.consoleErrorsDropped ? { consoleErrorsDropped: evaluated.consoleErrorsDropped } : {}),
     ...(evaluated.failedRequestsDropped ? { failedRequestsDropped: evaluated.failedRequestsDropped } : {}),
+    ...(capture !== undefined ? { [REPRO_KEY]: capture } : {}),
   });
 }
 

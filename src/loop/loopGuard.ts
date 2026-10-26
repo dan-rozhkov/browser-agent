@@ -86,7 +86,8 @@ function stripSnapshotIds(value: unknown): unknown {
   if (value && typeof value === "object") {
     const stripped: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "snapshotId") continue;
+      // `__repro` (Playwright export capture) is host-only data the model never sees: it must not split equal results.
+      if (key === "snapshotId" || key === "__repro") continue;
       stripped[key] = stripSnapshotIds(val);
     }
     return stripped;

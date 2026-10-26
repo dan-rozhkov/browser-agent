@@ -14,16 +14,32 @@ import {
   BROWSE_TRACE_ID,
   BROWSE_TRACE_OUTPUT_MAX_CHARS,
   BROWSE_TRACE_VERSION,
+  REPRO_KEY,
   capTraceText,
+  hasSecretWord,
+  isSecretFieldName,
+  isSecretHeaderName,
+  isSecretKeyName,
   redactTraceArgsTracked,
   redactTraceRequest,
+  redactTraceUrl,
+  urlHasSecret,
   type BrowseTrace,
   type BrowseTraceAction,
   type BrowseTraceFrame,
+  type BrowseTraceRepro,
+  type BrowseTraceReproAction,
+  type ReproCapture,
+  type ReproFixtureStep,
+  type ReproLocator,
+  type ReproNetworkRule,
   type BrowseTraceLogEntry,
   type BrowseTraceRequest,
   type BrowseTraceStep,
 } from "../shared/trace.js";
+import type { QaCheck } from "../shared/qaTypes.js";
+import { parseQaChecks } from "../shared/qaChecks.js";
+import type { FixtureEmulate, FixtureNetworkRule, FixtureStep } from "../fixture/types.js";
 import { parseJsonObject } from "./session.js";
 
 type FrameKind = BrowseTraceFrame["kind"];
@@ -74,6 +90,24 @@ export interface BrowseTraceRecorderOptions {
   requests?: () => Promise<unknown>;
   /** Default 500. Entries past it are counted in `dropped.requests`. */
   maxRequests?: number;
+  /**
+   * Playwright export recording (docs/specs/2026-10-26-playwright-spec-export-design.md). Default false. When true,
+   * steps get `repro` and `finish()` writes `trace.repro`. The host also passes `repro: true` to the executor.
+   * Without it a `__repro` key in an output is still removed from the recorded output, but nothing is stored.
+   */
+  repro?: boolean;
+}
+
+/** The browse_agent setup as `setRepro` reads it (a `PageFixture` or a bit more). Unknown fields are ignored. */
+export interface BrowseTraceReproSetup {
+  network?: FixtureNetworkRule[];
+  url?: unknown;
+  steps?: unknown;
+  tabs?: unknown;
+  emulate?: FixtureEmulate;
+  storage?: unknown;
+  cookies?: unknown;
+  app?: unknown;
 }
 
 export interface BrowseTraceRecorder {
@@ -95,6 +129,8 @@ export interface BrowseTraceRecorder {
    * only when their start lies inside a step. No-op without the option, or after `finish`. Never rejects.
    */
   flush(signal?: AbortSignal): Promise<void>;
+  /** Stores the run setup for the Playwright export. No-op unless the `repro` option is on. Never throws. */
+  setRepro(repro: { setup?: BrowseTraceReproSetup }): void;
   /** Builds the trace. Idempotent: a second call returns the same object. Never throws. */
   finish(end: { status: string; answer?: string; error?: string; qa?: QaResult }): BrowseTrace;
 }
@@ -136,6 +172,279 @@ function batchActions(args: unknown, input: unknown, parsed: Record<string, unkn
     const result = parsed.results[at];
     const error = isObject(result) && typeof result.error === "string" ? result.error : typeof parsed.error === "string" ? parsed.error : undefined;
     out.push({ action: nameAt(at), ok: false, ...(error !== undefined ? { error: capTraceText(error, BROWSE_TRACE_ERROR_MAX_CHARS) } : {}) });
+  }
+  return out;
+}
+
+
+// ---- Playwright export (repro) ----
+
+function describeLocator(l: ReproLocator): string {
+  switch (l.kind) {
+    case "role":
+      return l.name !== undefined ? `${l.role} "${l.name}"` : l.role;
+    case "attr":
+      return `${l.name} "${l.value}"`;
+    default:
+      return `${l.kind} "${l.value}"`;
+  }
+}
+
+function note(text: string): string {
+  return capTraceText(text, 120);
+}
+
+function asCapture(v: unknown): ReproCapture | undefined {
+  return isObject(v) ? (v as ReproCapture) : undefined;
+}
+
+/** The repro actions of ONE `browse_act` entry. `redacted` is the entry as the (redacted) step args hold it. */
+function actReproOf(entry: Record<string, unknown>, redacted: Record<string, unknown> | undefined, cap: ReproCapture | undefined): BrowseTraceReproAction[] {
+  const action = typeof entry.action === "string" ? entry.action : "";
+  const hasTarget = (typeof entry.target === "string" && entry.target !== "") || entry.index != null || (typeof entry.element === "string" && entry.element.trim() !== "");
+  const gap = (reason: string, n?: string): BrowseTraceReproAction[] => [{ op: "gap", gap: reason, ...(n ? { note: note(n) } : {}) }];
+  const targeted = (op: "click" | "hover" | "fill" | "select" | "press", extra: Partial<BrowseTraceReproAction>): BrowseTraceReproAction[] => {
+    if (cap?.gap !== undefined) return gap(String(cap.gap), `${action} (${String(cap.gap)})`);
+    if (!cap?.locator) return gap("not-found", `${action} (no locator)`);
+    const where = describeLocator(cap.locator);
+    return [{ op, locator: cap.locator, ...extra, note: note(`${op} ${where}`) }];
+  };
+  switch (action) {
+    case "click":
+    case "hover":
+      return targeted(action, {});
+    case "type": {
+      // The text is kept only when the host's redacted args hold exactly the same text at the same place.
+      // Anything else (masked, dropped, changed, no redacted copy) is a secret.
+      const text = typeof entry.text === "string" ? entry.text : "";
+      const secret = cap?.secret === true || (typeof entry.text === "string" && redacted?.text !== entry.text);
+      return targeted("fill", secret ? { secret: true } : { text });
+    }
+    case "select":
+      if (cap?.gap === undefined && cap?.locator && typeof cap.value !== "string") return gap("not-found", "select (no option value)");
+      return targeted("select", typeof cap?.value === "string" ? { value: cap.value } : {});
+    case "press": {
+      const key = typeof entry.key === "string" ? entry.key : "";
+      if (!hasTarget) return [{ op: "press", key, note: note(`press ${key}`) }];
+      return targeted("press", { key });
+    }
+    case "back":
+    case "forward":
+    case "reload":
+      return [{ op: action, note: action }];
+    case "viewport":
+      return cap?.viewport ? [{ op: "viewport", viewport: cap.viewport, note: "viewport" }] : [];
+    case "upload":
+      return gap("upload", "upload");
+    default:
+      return [];
+  }
+}
+
+/** The repro actions of the completed entries of a batched `browse_act`; `partial` adds a gap for the entry it stopped at. */
+function batchRepro(list: unknown[], red: Record<string, unknown>, parsed: Record<string, unknown>, capture: unknown, partial: boolean): BrowseTraceReproAction[] {
+  const cap = isObject(capture) ? capture : {};
+  const caps = Array.isArray(cap.batch) ? cap.batch : [];
+  const redList = Array.isArray(red.actions) ? red.actions : [];
+  const completed = typeof parsed.completed === "number" ? Math.max(0, Math.min(Math.floor(parsed.completed), BROWSE_TRACE_MAX_ACTIONS)) : 0;
+  const out: BrowseTraceReproAction[] = [];
+  for (let i = 0; i < completed; i++) {
+    const entry = list[i];
+    if (!isObject(entry)) continue;
+    out.push(...actReproOf(entry, isObject(redList[i]) ? redList[i] : undefined, asCapture(caps[i])));
+  }
+  if (partial) {
+    const at = typeof parsed.stoppedAt === "number" && parsed.stoppedAt >= 0 ? Math.floor(parsed.stoppedAt) : completed;
+    const result = Array.isArray(parsed.results) ? parsed.results[at] : undefined;
+    const error = isObject(result) && typeof result.error === "string" ? result.error : typeof parsed.error === "string" ? parsed.error : "unknown error";
+    out.push({ op: "gap", gap: `batch stopped at action ${at + 1}: ${capTraceText(error.replace(/\s+/g, " ").trim(), 120)}` });
+  }
+  return out;
+}
+
+/** The repro actions of a batched `browse_act` that stopped part-way (the step failed), or undefined when nothing completed. */
+function partialBatchRepro(input: unknown, redactedArgs: unknown, parsed: Record<string, unknown>, capture: unknown): BrowseTraceReproAction[] | undefined {
+  if (!isObject(input) || !Array.isArray(input.actions)) return undefined;
+  if (typeof parsed.completed !== "number" || parsed.completed <= 0) return undefined;
+  return batchRepro(input.actions, isObject(redactedArgs) ? redactedArgs : {}, parsed, capture, true);
+}
+
+/** Maps a finished, ok step to repro actions. Returns undefined for read-only tools (nothing to record). */
+function reproOfStep(tool: string, input: unknown, redactedArgs: unknown, parsed: Record<string, unknown>, capture: unknown): BrowseTraceReproAction[] | undefined {
+  const inp = isObject(input) ? input : {};
+  switch (tool) {
+    case "browse_open": {
+      if (typeof inp.app === "string" && inp.app.trim() !== "") return [{ op: "gap", gap: "electron app", note: "open app" }];
+      const url = typeof parsed.url === "string" && parsed.url !== "" ? parsed.url : typeof inp.url === "string" ? inp.url : undefined;
+      if (url === undefined) return [{ op: "gap", gap: "not-found", note: "open (no url)" }];
+      return [{ op: "goto", url: redactTraceUrl(url), ...(urlHasSecret(url) ? { urlRedacted: true as const } : {}), note: "goto" }];
+    }
+    case "browse_act": {
+      const red = isObject(redactedArgs) ? redactedArgs : {};
+      if (Array.isArray(inp.actions)) return batchRepro(inp.actions, red, parsed, capture, false);
+      return actReproOf(inp, red, asCapture(capture));
+    }
+    case "browse_screenshot": {
+      const waitFor = inp.waitFor;
+      if (isObject(waitFor) && typeof waitFor.text === "string" && waitFor.text !== "") {
+        const check: QaCheck = { type: "text", text: waitFor.text } as QaCheck;
+        return [{ op: "expect", check, passed: parsed.waitTimedOut !== true, note: note(`wait for text "${waitFor.text}"`) }];
+      }
+      return undefined;
+    }
+    case "qa_assert": {
+      const parsedChecks = parseQaChecks(inp.checks);
+      const checks: unknown[] = parsedChecks.ok ? parsedChecks.value : Array.isArray(inp.checks) ? inp.checks : [];
+      const results = Array.isArray(parsed.results) ? parsed.results : [];
+      const caps = isObject(capture) && Array.isArray(capture.checks) ? capture.checks : [];
+      const out: BrowseTraceReproAction[] = [];
+      checks.forEach((check, i) => {
+        const r = isObject(results[i]) ? results[i] : {};
+        const c = caps[i];
+        const checkLocator = isObject(c) && isObject(c.locator) ? (c.locator as unknown as ReproLocator) : undefined;
+        out.push({
+          op: "expect",
+          check: check as QaCheck,
+          passed: r.passed === true,
+          ...(typeof r.error === "string" && r.error !== "" ? { error: capTraceText(r.error, 200) } : {}),
+          ...(typeof r.actual === "string" ? { actual: capTraceText(r.actual, 200) } : {}),
+          ...(checkLocator ? { checkLocator } : {}),
+          note: note(`assert ${isObject(check) && typeof check.type === "string" ? check.type : "check"}`),
+        });
+      });
+      return out;
+    }
+    case "browse_tabs": {
+      const a = typeof inp.action === "string" ? inp.action : "";
+      return a === "new" || a === "switch" || a === "close" ? [{ op: "gap", gap: "tabs", note: `tabs ${a}` }] : undefined;
+    }
+    case "browse_snapshot":
+    case "browse_read":
+    case "browse_find_images":
+    case "browse_capture":
+    case "qa_verdict":
+      return undefined;
+    default:
+      return [{ op: "gap", gap: tool, note: note(tool) }];
+  }
+}
+
+const MOCK_BODY_MAX_CHARS = 200_000;
+const MOCK_BODY_MAX_DEPTH = 40;
+const REDACTED_VALUE = "[redacted]";
+
+/** Deep copy of a JSON value; the value of a secret-named key becomes "[redacted]". Throws when too deep. */
+function redactMockJson(value: unknown, depth: number, hit: { redacted: boolean }): unknown {
+  if (!value || typeof value !== "object") return value;
+  if (depth >= MOCK_BODY_MAX_DEPTH) throw new Error("too deep");
+  if (Array.isArray(value)) return value.map((v) => redactMockJson(v, depth + 1, hit));
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (isSecretKeyName(key)) {
+      out[key] = REDACTED_VALUE;
+      hit.redacted = true;
+    } else out[key] = redactMockJson(v, depth + 1, hit);
+  }
+  return out;
+}
+
+/**
+ * A mock rule of the setup as the trace keeps it. Never throws.
+ * - url: kept as given (a pattern must stay a pattern). A secret query value, fragment value or userinfo marks the rule
+ *   `gap` and the stored url is the redacted one.
+ * - body: an object, or a string that parses as a JSON object or array: deep copy, secret-named keys lose their value
+ *   (`bodyRedacted`); over 200 KB of JSON: `gap`. Any other string stays unless it holds a secret-looking word (`gap`).
+ * - headers: a secret-named header is removed (`headersRedacted`).
+ */
+function redactRule(rule: FixtureNetworkRule): ReproNetworkRule {
+  const out: ReproNetworkRule = { ...rule };
+  try {
+    delete out.headers;
+    delete out.body;
+    const url = String(rule.url);
+    if (urlHasSecret(url)) {
+      out.url = redactTraceUrl(url);
+      out.gap = "mock url had a secret query value";
+    } else out.url = url;
+    if (rule.headers && typeof rule.headers === "object") {
+      const headers: Record<string, string> = {};
+      for (const [name, value] of Object.entries(rule.headers)) {
+        if (typeof value !== "string") continue;
+        if (isSecretHeaderName(name)) out.headersRedacted = true;
+        else headers[name] = value;
+      }
+      out.headers = headers;
+    }
+    if (rule.body === undefined) return out;
+    let json: unknown;
+    let isJsonString = false;
+    if (typeof rule.body === "string") {
+      try {
+        const parsed: unknown = JSON.parse(rule.body.replace(/^\uFEFF/, ""));
+        if (parsed && typeof parsed === "object") {
+          json = parsed;
+          isJsonString = true;
+        }
+      } catch {
+        // Not JSON.
+      }
+      if (!isJsonString) {
+        if (hasSecretWord(rule.body)) out.gap ??= "mock body has a secret-looking word";
+        else if (rule.body.length > MOCK_BODY_MAX_CHARS) out.gap ??= "mock body too large";
+        else out.body = rule.body;
+        return out;
+      }
+    } else json = rule.body;
+    const hit = { redacted: false };
+    const copy = redactMockJson(json, 0, hit);
+    const text = JSON.stringify(copy);
+    if (text.length > MOCK_BODY_MAX_CHARS) out.gap ??= "mock body too large";
+    else {
+      out.body = isJsonString ? text : (copy as object);
+      if (hit.redacted) out.bodyRedacted = true;
+    }
+  } catch {
+    out.gap ??= "mock rule could not be recorded";
+    delete out.body;
+  }
+  return out;
+}
+
+const FIXTURE_STEP_ACTIONS = new Set(["goto", "click", "type", "select", "press", "waitFor", "wait"]);
+
+/** The fixture steps as the trace keeps them: urls redacted, the text typed into a secret-looking field dropped. */
+function reproFixtureSteps(steps: unknown): ReproFixtureStep[] | undefined {
+  if (!Array.isArray(steps)) return undefined;
+  const out: ReproFixtureStep[] = [];
+  for (const raw of steps.slice(0, 100)) {
+    if (!isObject(raw) || typeof raw.action !== "string" || !FIXTURE_STEP_ACTIONS.has(raw.action)) continue;
+    const st = raw as unknown as FixtureStep;
+    switch (st.action) {
+      case "goto":
+        if (typeof st.url === "string") out.push({ action: "goto", url: redactTraceUrl(st.url), ...(urlHasSecret(st.url) ? { urlRedacted: true as const } : {}) });
+        break;
+      case "type":
+        if (typeof st.selector === "string") {
+          const secret = isSecretFieldName(st.selector) || typeof st.text !== "string";
+          out.push({ action: "type", selector: st.selector, ...(secret ? { secret: true as const } : { text: st.text }) });
+        }
+        break;
+      case "click":
+        if (typeof st.selector === "string") out.push({ action: "click", selector: st.selector });
+        break;
+      case "waitFor":
+        if (typeof st.selector === "string") out.push({ action: "waitFor", selector: st.selector, ...(typeof st.timeoutMs === "number" ? { timeoutMs: st.timeoutMs } : {}) });
+        break;
+      case "select":
+        if (typeof st.selector === "string" && typeof st.value === "string") out.push({ action: "select", selector: st.selector, value: st.value });
+        break;
+      case "press":
+        if (typeof st.key === "string") out.push({ action: "press", key: st.key, ...(typeof st.selector === "string" ? { selector: st.selector } : {}) });
+        break;
+      case "wait":
+        if (typeof st.ms === "number") out.push({ action: "wait", ms: st.ms });
+        break;
+    }
   }
   return out;
 }
@@ -235,6 +544,8 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
     requestQueue = requestQueue.then(() => drainRequests(fallback, REQUESTS_TIMEOUT_MS));
   };
   let finished: BrowseTrace | undefined;
+  const reproOn = opts.repro === true;
+  let reproSetup: BrowseTraceRepro["setup"];
 
   const addFrame: BrowseTraceRecorder["addFrame"] = (frame) => {
     try {
@@ -390,6 +701,7 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
           const endedAt = now();
           const step: BrowseTraceStep = { index, tool: call.toolName, args, startedAt: stepStartedAt, endedAt, ok: true };
           let parsed: Record<string, unknown> = {};
+          let reproCapture: unknown;
           if (end.error !== undefined) {
             step.ok = false;
             step.error = textOfError(end.error);
@@ -401,6 +713,13 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
             step.output = JSON.stringify(end.output);
           } else if (end.output !== undefined) {
             step.output = String(end.output);
+          }
+          // The capture is read, then removed from the recorded output: it is not part of what the model saw.
+          if (REPRO_KEY in parsed) {
+            reproCapture = parsed[REPRO_KEY];
+            const { [REPRO_KEY]: _capture, ...withoutRepro } = parsed;
+            parsed = withoutRepro;
+            step.output = JSON.stringify(withoutRepro);
           }
           if (typeof parsed.error === "string") {
             step.ok = false;
@@ -420,6 +739,14 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
           if (call.toolName === "browse_act") {
             const actions = batchActions(args, call.input, parsed);
             if (actions) step.actions = actions;
+          }
+          if (reproOn && step.ok) {
+            const repro = reproOfStep(call.toolName, call.input, args, parsed, reproCapture);
+            if (repro) step.repro = repro;
+          } else if (reproOn && call.toolName === "browse_act") {
+            // A batch that stopped part-way: its completed actions did run. A single failed action is a dead end.
+            const repro = partialBatchRepro(call.input, args, parsed, reproCapture);
+            if (repro) step.repro = repro;
           }
           if (step.output !== undefined) step.output = capTraceText(step.output, BROWSE_TRACE_OUTPUT_MAX_CHARS);
           const fresh = harvestDiagnostics(parsed, consoleLog.seen, networkLog.seen);
@@ -451,6 +778,27 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
         }
         return {};
       };
+    },
+    setRepro(repro) {
+      try {
+        if (!reproOn || finished) return;
+        const setup = repro?.setup;
+        const out: NonNullable<BrowseTraceRepro["setup"]> = {};
+        if (setup && Array.isArray(setup.network) && setup.network.length > 0) out.network = setup.network.map(redactRule);
+        if (setup && typeof setup.url === "string" && setup.url !== "") {
+          out.url = redactTraceUrl(setup.url);
+          if (urlHasSecret(setup.url)) out.urlRedacted = true;
+        }
+        const steps = setup ? reproFixtureSteps(setup.steps) : undefined;
+        if (steps && steps.length > 0) out.steps = steps;
+        if (setup && Array.isArray(setup.tabs) && setup.tabs.length > 0) out.tabs = setup.tabs.length;
+        if (setup && isObject(setup.emulate)) out.emulate = { ...(setup.emulate as FixtureEmulate) };
+        if (setup && setup.app) out.app = true;
+        if (setup && (setup.storage || setup.cookies)) out.storage = true;
+        reproSetup = out;
+      } catch {
+        // Ignored: the recorder never throws into the host.
+      }
     },
     async flush() {
       try {
@@ -496,6 +844,7 @@ export function createBrowseTraceRecorder(opts: BrowseTraceRecorderOptions): Bro
         network: networkLog.entries,
         ...(opts.requests ? { requests: requestLog } : {}),
         ...(end.qa ? { qa: qaWithoutArgs(end.qa) } : {}),
+        ...(reproOn ? { repro: reproSetup ? { setup: reproSetup } : {} } : {}),
         ...(Object.keys(dropped).length > 0 ? { dropped } : {}),
       };
       for (const s of slots) s.open = false;

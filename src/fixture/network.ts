@@ -12,7 +12,7 @@ const SCHEME_AND_HOST = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#*]*)([\s\S]*)$/;
  * percent-encoding is normalized, a pattern matches the URL as the browser
  * sends it (encoded).
  */
-function normalizePattern(pattern: string): string {
+export function normalizePattern(pattern: string): string {
   const m = SCHEME_AND_HOST.exec(pattern);
   if (!m) return pattern;
   if (m[3].startsWith("*")) return `${m[1].toLowerCase()}://${m[2]}${m[3]}`;

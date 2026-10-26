@@ -7638,6 +7638,198 @@ export const SELECTOR_JS = `(() => {
 })()`;
 
 /**
+ * Playwright spec export (docs/specs/2026-10-26-playwright-spec-export-design.md,
+ * "Locator"): a Playwright locator description for the element an action is
+ * about to act on, computed BEFORE the action. The element is found by the same
+ * `locateTarget` every action script uses (`skipReveal: true`: no scrolling).
+ *
+ * Candidates, in order; the first that matches exactly that one element in the
+ * document wins: `data-testid`; `data-test` / `data-qa`; role + accessible name
+ * (the explicit `role` attribute or the implicit role of a native element, and
+ * `accessibleNameOf`, whitespace-normalized, 1..80 chars; role alone is never
+ * used); placeholder; label; alt; exact text of a leaf element; title; then the
+ * journal's CSS (`selectorFor`: stable `#id`, `tag[data-*|name|aria-label]`,
+ * nth-of-type path). Scans are capped at 5000 elements (over the cap: not unique).
+ *
+ * Answer: `{ ok: true, locator, secret?: true, value?: string }` or
+ * `{ ok: false, reason }` with reason `not-found`, `shadow`, `iframe` or
+ * `no-unique`. `secret` marks a secret field (its typed text must not be
+ * recorded). For `args.op === "select"`, `value` is the value of the first
+ * option whose text equals `args.optionText`.
+ */
+export const LOCATOR_JS = `(() => {
+  var args = ${ARGS_MARKER};
+  ${SECRET_FIELD_JS}
+
+  ${LOCATE_TARGET_JS}
+
+  var SCAN_CAP = 5000;
+  var MAX_LEN = 80;
+
+  function esc(s) {
+    s = String(s);
+    if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(s);
+    return s.replace(/[^a-zA-Z0-9_\\u00A0-\\uFFFF-]/g, function (c) { return "\\\\" + c; });
+  }
+  function quoted(s) { return '"' + esc(s) + '"'; }
+  function norm(s) { return String(s == null ? "" : s).replace(/\\s+/g, " ").trim(); }
+  function usable(s) { return s !== "" && s.length <= MAX_LEN; }
+  function uniqueFor(el, sel) {
+    try {
+      var found = document.querySelectorAll(sel);
+      return found.length === 1 && found[0] === el;
+    } catch (err) {
+      return false;
+    }
+  }
+  function stableId(id) {
+    if (!id) return false;
+    if (/[0-9]{4,}/.test(id) || /[0-9a-f]{8,}/i.test(id)) return false;
+    if (id.charAt(0) === ":" || /^(radix|headlessui|react-aria|mui|ember|ext-gen)[-_]?/i.test(id)) return false;
+    return true;
+  }
+  function idSelector(el) {
+    var id = el.getAttribute("id");
+    if (!stableId(id)) return null;
+    var sel = "#" + esc(id);
+    return uniqueFor(el, sel) ? sel : null;
+  }
+  function nthPath(el) {
+    var parts = [];
+    var node = el;
+    while (node && node.nodeType === 1) {
+      var anchor = node !== el ? idSelector(node) : null;
+      if (anchor) { parts.unshift(anchor); return parts.join(" > "); }
+      var tag = node.tagName.toLowerCase();
+      if (tag === "body" || tag === "html") { parts.unshift(tag); return parts.join(" > "); }
+      var n = 1;
+      for (var sib = node.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        if (sib.tagName === node.tagName) n++;
+      }
+      parts.unshift(tag + ":nth-of-type(" + n + ")");
+      node = node.parentElement;
+    }
+    return null;
+  }
+  function selectorFor(el) {
+    var byId = idSelector(el);
+    if (byId) return byId;
+    var tag = el.tagName.toLowerCase();
+    var attrs = ["data-testid", "data-test", "data-qa", "name", "aria-label"];
+    for (var i = 0; i < attrs.length; i++) {
+      var v = el.getAttribute(attrs[i]);
+      if (!v) continue;
+      var sel = tag + "[" + attrs[i] + "=" + quoted(v) + "]";
+      if (uniqueFor(el, sel)) return sel;
+    }
+    var path = nthPath(el);
+    return path && uniqueFor(el, path) ? path : null;
+  }
+
+  // The role Playwright's getByRole would match: the first token of the role attribute, else the implicit role of a native element.
+  function roleOf(el) {
+    var explicit = norm(el.getAttribute("role")).split(" ")[0];
+    if (explicit) return explicit;
+    var tag = el.tagName.toLowerCase();
+    if (tag === "button") return "button";
+    if (tag === "a") return el.hasAttribute("href") ? "link" : "";
+    if (tag === "select") return el.multiple || Number(el.getAttribute("size")) > 1 ? "listbox" : "combobox";
+    if (tag === "textarea") return "textbox";
+    if (/^h[1-6]$/.test(tag)) return "heading";
+    if (tag === "img") return el.hasAttribute("alt") && el.getAttribute("alt") === "" ? "" : "img";
+    if (tag === "input") {
+      var type = (el.getAttribute("type") || "text").toLowerCase();
+      if (type === "checkbox" || type === "radio") return type;
+      if (type === "button" || type === "submit" || type === "reset" || type === "image") return "button";
+      if (type === "range") return "slider";
+      if (type === "number") return "spinbutton";
+      if (type === "search" || type === "text" || type === "email" || type === "tel" || type === "url") return el.hasAttribute("list") ? "combobox" : "textbox";
+    }
+    return "";
+  }
+
+  // True when el is the only element of the selector's matches that passes test (over the cap: false).
+  function onlyMe(selector, test, el) {
+    var all = document.querySelectorAll(selector);
+    if (all.length > SCAN_CAP) return false;
+    var n = 0;
+    for (var i = 0; i < all.length; i++) {
+      if (all[i] === el || test(all[i])) n++;
+    }
+    return n === 1;
+  }
+
+  function labelTextOf(node) {
+    var labels = node.labels;
+    return labels && labels.length > 0 ? norm(labels[0].textContent) : "";
+  }
+
+  function hasTextChild(el) {
+    for (var c = el.firstElementChild; c; c = c.nextElementSibling) {
+      if (norm(c.textContent) !== "") return true;
+    }
+    return false;
+  }
+
+  function locatorFor(el) {
+    var v = el.getAttribute("data-testid");
+    if (v && uniqueFor(el, "[data-testid=" + quoted(v) + "]")) return { kind: "testid", value: v };
+    var names = ["data-test", "data-qa"];
+    for (var ni = 0; ni < names.length; ni++) {
+      var av = el.getAttribute(names[ni]);
+      if (av && uniqueFor(el, "[" + names[ni] + "=" + quoted(av) + "]")) return { kind: "attr", name: names[ni], value: av };
+    }
+    var role = roleOf(el);
+    if (role) {
+      var name = norm(accessibleNameOf(el));
+      if (usable(name) && onlyMe("*", function (o) { return roleOf(o) === role && norm(accessibleNameOf(o)) === name; }, el)) {
+        return { kind: "role", role: role, name: name };
+      }
+    }
+    var ph = norm(el.getAttribute("placeholder"));
+    if (usable(ph) && onlyMe("[placeholder]", function (o) { return norm(o.getAttribute("placeholder")) === ph; }, el)) return { kind: "placeholder", value: ph };
+    var label = labelTextOf(el);
+    if (usable(label) && onlyMe("input, select, textarea, button, meter, output, progress, [aria-label]", function (o) { return labelTextOf(o) === label || norm(o.getAttribute("aria-label")) === label; }, el)) {
+      return { kind: "label", value: label };
+    }
+    var alt = norm(el.getAttribute("alt"));
+    if (usable(alt) && onlyMe("[alt]", function (o) { return norm(o.getAttribute("alt")) === alt; }, el)) return { kind: "alt", value: alt };
+    var text = norm(el.textContent);
+    if (usable(text) && !hasTextChild(el) && onlyMe("*", function (o) { return norm(o.textContent) === text && !hasTextChild(o); }, el)) {
+      return { kind: "text", value: text };
+    }
+    var title = norm(el.getAttribute("title"));
+    if (usable(title) && onlyMe("[title]", function (o) { return norm(o.getAttribute("title")) === title; }, el)) return { kind: "title", value: title };
+    var css = selectorFor(el);
+    return css ? { kind: "css", value: css } : null;
+  }
+
+  function lookup() {
+    var located = locateTarget({ target: args.target, index: args.index, snapshotId: args.snapshotId, fingerprint: args.fingerprint, skipReveal: true });
+    var el = located.el;
+    if (!el) return { ok: false, reason: "not-found" };
+    if (el.ownerDocument && el.ownerDocument !== document) return { ok: false, reason: "iframe" };
+    if (el.getRootNode && el.getRootNode() !== document) return { ok: false, reason: "shadow" };
+    var locator = locatorFor(el);
+    if (!locator) return { ok: false, reason: "no-unique" };
+    var out = { ok: true, locator: locator };
+    if (penIsSecretField(el)) out.secret = true;
+    if (args.op === "select" && String(el.tagName).toLowerCase() === "select" && typeof args.optionText === "string") {
+      for (var oi = 0; oi < el.options.length; oi++) {
+        if (el.options[oi].text === args.optionText) { out.value = el.options[oi].value; break; }
+      }
+    }
+    return out;
+  }
+
+  try {
+    return lookup();
+  } catch (err) {
+    return { ok: false, reason: "not-found" };
+  }
+})()`;
+
+/**
  * Checkpoint journal: the marker of the current DOCUMENT. The first run plants a
  * random token on a non-enumerable, non-writable `window` property and returns
  * it; a later run on the same document returns the same token. A new document

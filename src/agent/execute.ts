@@ -8,6 +8,7 @@
 import type { BrowserBridge } from "../loop/bridge.js";
 import { parseViewportArgs } from "../shared/viewport.js";
 import { resultError, takeSnapshot, type SnapshotResult } from "../loop/shared.js";
+import { REPRO_KEY, type ReproCapture } from "../shared/trace.js";
 
 const MAX_BATCH_ACTIONS = 10;
 /** A batch may start no new entry after this time (the client-side tool-call budget is 120 s). */
@@ -73,6 +74,14 @@ export interface ExecuteBrowseToolOptions {
     /** browse_open got `app` but the bridge has no `launchApp`. */
     appLaunchMissing?: string;
   };
+  /**
+   * Playwright export recording: add `repro: true` to the args of every `browser.act` (single, element-resolved and
+   * each batch entry). The controller then answers with `__repro` (a `ReproCapture`), which stays in the tool output
+   * (top level of the JSON) for the trace recorder; the session strips it before the model sees it.
+   * A batch output carries `__repro: { batch: (ReproCapture | null)[] }`: one entry per COMPLETED action, in order
+   * (`null` when the action gave no capture). The per-entry `__repro` is removed from `results`.
+   */
+  repro?: boolean;
   /** Runs after `browse_screenshot` when the input has `placeOnCanvas: true`. */
   afterScreenshot?: (ctx: AfterScreenshotContext) => Promise<string>;
 }
@@ -169,7 +178,7 @@ async function resolveByElement(
   }
 
   if (located.outcome === "found" && typeof located.index === "number") {
-    const actArgs: Record<string, unknown> = { ...rest, action, index: located.index, snapshotId: snapshot.snapshotId };
+    const actArgs: Record<string, unknown> = { ...rest, action, index: located.index, snapshotId: snapshot.snapshotId, ...(opts.repro ? { repro: true } : {}) };
     delete actArgs.target;
 
     const result = await callBridge(() => browser.act(actArgs), opts);
@@ -236,7 +245,7 @@ async function performOne(
     if (refusal) return err(refusal);
   }
   if (!browser) return err(opts.texts?.notAvailable ?? NOT_AVAILABLE_DEFAULT);
-  return callBridge(() => browser.act(rest), opts);
+  return callBridge(() => browser.act(opts.repro ? { ...rest, repro: true } : rest), opts);
 }
 
 /**
@@ -342,6 +351,7 @@ export async function runActionsBatch(
 
   const deadline = clock() + BATCH_DEADLINE_MS;
   const results: unknown[] = [];
+  const reproBatch: (ReproCapture | null)[] = [];
   let completed = 0;
   let stoppedAt: number | undefined;
   let batchError: string | undefined;
@@ -364,6 +374,9 @@ export async function runActionsBatch(
     if (entry.snapshotId == null && topSnapshotId != null && entry.index != null) entry.snapshotId = topSnapshotId;
 
     const parsed = parseResultObject(await performOne(browser, entry, opts));
+    // The capture is kept once, in the top-level `__repro.batch`, not in each result.
+    const capture = parsed[REPRO_KEY];
+    delete parsed[REPRO_KEY];
     results.push(parsed);
     const entryError = resultError(parsed);
     if (entryError) {
@@ -371,6 +384,7 @@ export async function runActionsBatch(
       stoppedAt = i;
       break;
     }
+    reproBatch.push(capture && typeof capture === "object" && !Array.isArray(capture) ? (capture as ReproCapture) : null);
     completed++;
   }
 
@@ -379,6 +393,7 @@ export async function runActionsBatch(
     completed,
     ...(stoppedAt != null ? { stoppedAt } : {}),
     ...(batchError ? { error: batchError } : {}),
+    ...(opts.repro ? { [REPRO_KEY]: { batch: reproBatch } } : {}),
   };
   return JSON.stringify(clock() >= deadline ? out : await attachSnapshot(browser, out));
 }

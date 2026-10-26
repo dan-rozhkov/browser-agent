@@ -2,7 +2,8 @@
 // types, constants and pure helpers. Zod-free, no imports except types, so the
 // zod-free `agent/session` entry and any consumer (viewer, backend, desktop
 // main) can use them. The recorder is in src/agent/traceRecorder.ts.
-import type { QaResult } from "./qaTypes.js";
+import type { QaCheck, QaResult } from "./qaTypes.js";
+import type { FixtureEmulate, FixtureNetworkRule } from "../fixture/types.js";
 
 export const BROWSE_TRACE_FORMAT = "sideform.browse-trace";
 export const BROWSE_TRACE_VERSION = 1;
@@ -57,6 +58,8 @@ export interface BrowseTraceStep {
    * the call failed before the batch ran, and for every other tool.
    */
   actions?: BrowseTraceAction[];
+  /** Replayable actions of this step (docs/specs/2026-10-26-playwright-spec-export-design.md). Absent when recording was off, the step failed, or the tool does nothing replayable. */
+  repro?: BrowseTraceReproAction[];
 }
 
 export interface BrowseTraceFrame {
@@ -77,6 +80,117 @@ export interface BrowseTraceLogEntry {
   at: number;
   stepIndex?: number;
   text: string;
+}
+
+/**
+ * A Playwright locator, computed in the live page BEFORE the action
+ * (docs/specs/2026-10-26-playwright-spec-export-design.md, "Locator").
+ */
+export type ReproLocator =
+  | { kind: "testid"; value: string }
+  | { kind: "attr"; name: "data-test" | "data-qa"; value: string }
+  | { kind: "role"; role: string; name?: string }
+  | { kind: "placeholder"; value: string }
+  | { kind: "label"; value: string }
+  | { kind: "alt"; value: string }
+  | { kind: "text"; value: string }
+  | { kind: "title"; value: string }
+  | { kind: "css"; value: string };
+
+/** Why a step cannot be replayed (the page script's reasons, plus the recorder's). */
+export type ReproGapReason = "iframe" | "shadow" | "not-found" | "no-unique" | string;
+
+/** What the controller adds to an `act` / `assert` result when `args.repro` is true. Never reaches the model. */
+export interface ReproCapture {
+  /** `act`: the target element. */
+  locator?: ReproLocator;
+  /** `act`: the element could not be named. */
+  gap?: ReproGapReason;
+  /** `act` select: the value of the chosen option. */
+  value?: string;
+  /** `act` type: the field is a secret field (password, OTP, card); the text must not be recorded. */
+  secret?: true;
+  /** `act` viewport: the size after the action. */
+  viewport?: { width: number; height: number };
+  /** `assert`: one entry per check, in order; null for a check without an `index`. */
+  checks?: Array<{ locator: ReproLocator } | { gap: ReproGapReason } | null>;
+}
+
+/** The result key that carries a `ReproCapture`. */
+export const REPRO_KEY = "__repro";
+
+export type ReproOp = "goto" | "click" | "fill" | "select" | "press" | "hover" | "back" | "forward" | "reload" | "viewport" | "expect" | "gap";
+
+/** One replayable action of a trace step. */
+export interface BrowseTraceReproAction {
+  op: ReproOp;
+  locator?: ReproLocator;
+  /** goto: redacted url. */
+  url?: string;
+  /** fill: the typed text. Absent when `secret`. */
+  text?: string;
+  secret?: true;
+  /** select: the option value. */
+  value?: string;
+  /** press: the key. */
+  key?: string;
+  viewport?: { width: number; height: number };
+  /** expect: the check as the agent gave it. */
+  check?: QaCheck;
+  /** expect: the live result in the run. */
+  passed?: boolean;
+  /** expect: why it failed in the run (the check's `actual`). */
+  actual?: string;
+  /** expect with an `index`: the element as a locator. */
+  checkLocator?: ReproLocator;
+  /** gap: why this step cannot be replayed. */
+  gap?: ReproGapReason;
+  /** goto: a secret query value was removed from `url` by redaction. */
+  urlRedacted?: true;
+  /** expect: the check could not run in the run (a tool error: invalid selector, refused value, ...). */
+  error?: string;
+  /** A short human text for the comment line. */
+  note?: string;
+}
+
+/** A fixture step as the trace stores it: typed text of a secret field is not kept. */
+export type ReproFixtureStep =
+  | { action: "goto"; url: string; urlRedacted?: true }
+  | { action: "click"; selector: string }
+  | { action: "type"; selector: string; text?: string; secret?: true }
+  | { action: "select"; selector: string; value: string }
+  | { action: "press"; key: string; selector?: string }
+  | { action: "waitFor"; selector: string; timeoutMs?: number }
+  | { action: "wait"; ms: number };
+
+/** A network mock rule as the trace stores it. */
+export interface ReproNetworkRule extends FixtureNetworkRule {
+  /** The rule cannot be exported (secret in the url, body too large or secret-looking). The renderer emits a GAP with this text. */
+  gap?: string;
+  /** A secret-named key of the body had its value replaced by "[redacted]". */
+  bodyRedacted?: true;
+  /** A secret header was removed. */
+  headersRedacted?: true;
+}
+
+/** Run-level data of a Playwright export. */
+export interface BrowseTraceRepro {
+  setup?: {
+    /** Network mocks of the QA setup. Bodies: secret-named keys lose their value; url and headers see `ReproNetworkRule`. */
+    network?: ReproNetworkRule[];
+    /** The fixture start url (redacted). The session runs the fixture instead of a pre-open, so there is no second goto. */
+    url?: string;
+    urlRedacted?: true;
+    /** The fixture's deterministic steps on the main tab. */
+    steps?: ReproFixtureStep[];
+    /** The fixture opened this many extra tabs: not exported. */
+    tabs?: number;
+    emulate?: FixtureEmulate;
+    /** The run started an Electron app: a Playwright web test cannot replay it. */
+    app?: true;
+    /** The setup had storage or cookies; they are NOT exported. */
+    storage?: true;
+  };
 }
 
 /** One network request of the run (docs/specs/2026-10-20-browse-run-trace-design.md, "v1 additions"). */
@@ -134,6 +248,8 @@ export interface BrowseTrace {
   requests?: BrowseTraceRequest[];
   /** How many entries the recorder's caps left out. */
   dropped?: { steps?: number; frames?: number; console?: number; network?: number; requests?: number };
+  /** Present when the run was recorded for a Playwright export (`repro` on steps). */
+  repro?: BrowseTraceRepro;
 }
 
 /** Cuts `text` to `max` chars. */
@@ -222,6 +338,51 @@ const REDACTED = "[redacted]";
 function isSecretName(name: string): boolean {
   if (SECRET_KEY.test(name) || /^(session|signature)/i.test(name)) return true;
   return name.split(/[_\-.\s]+|(?<=[a-z0-9])(?=[A-Z])/).some((part) => SECRET_PART.has(part.toLowerCase()));
+}
+
+/** True when `name` is a secret-named key, header or query param (the one key rule of the request log). */
+export function isSecretKeyName(name: string): boolean {
+  return isSecretName(name);
+}
+
+/** True when the typed text of a field named `name` (a selector, a label) must not be stored: the `SECRET_FIELD` rule. */
+export function isSecretFieldName(name: string): boolean {
+  return SECRET_FIELD.test(name);
+}
+
+/** True when `text` holds a secret-looking word (the args key rule, anywhere in the text). */
+export function hasSecretWord(text: string): boolean {
+  return SECRET_KEY.test(text);
+}
+
+/** True when a header name is secret (the request-log rule). */
+export function isSecretHeaderName(name: string): boolean {
+  return SECRET_HEADER.test(name) || isSecretName(name);
+}
+
+function paramsHaveSecret(params: string): boolean {
+  return params.split("&").some((part) => {
+    const eq = part.indexOf("=");
+    if (eq < 0) return false;
+    let name = part.slice(0, eq);
+    try {
+      name = decodeURIComponent(name);
+    } catch {
+      // keep the raw name
+    }
+    return isSecretName(name);
+  });
+}
+
+/** True when `redactTraceUrl` would change `url` for a secret reason: userinfo, or a secret-named query or fragment param. (The length cap does not count.) */
+export function urlHasSecret(url: string): boolean {
+  const hash = url.indexOf("#");
+  const base = hash < 0 ? url : url.slice(0, hash);
+  if (/^[a-z][a-z0-9+.-]*:\/\/[^/?#@]*@/i.test(base)) return true;
+  const q = base.indexOf("?");
+  if (q >= 0 && paramsHaveSecret(base.slice(q + 1))) return true;
+  const frag = hash < 0 ? "" : url.slice(hash);
+  return frag.includes("=") && paramsHaveSecret(frag.slice(1));
 }
 
 /** `a=1&b=2` with the value of each secret-named param replaced. */
