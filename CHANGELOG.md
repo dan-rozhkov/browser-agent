@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.4](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.3...v0.4.4) (2026-10-27)
+
+
+### Bug Fixes
+
+* **qa:** judge sees which element a check addressed and the page at the last check ([9f981c2](https://github.com/dan-rozhkov/browser-agent/commit/9f981c2ab94cc9837387c150136e025abf77a41a))
+
 ## [0.4.3](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.2...v0.4.3) (2026-10-26)
 
 
