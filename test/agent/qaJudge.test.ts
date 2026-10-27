@@ -35,11 +35,16 @@ describe("QA_JUDGE_SYSTEM", () => {
       "You review the result of one automated test of a web app.
       Another agent ran the test scenario. You did not see it run.
       You see the steps it took, the checks it ran and the final page.
+      The scenario can change the page after its checks. For example, it can close a dialog. Then the final page does not show the checked state.
+      Judge such an expected result by the checks and the steps, not by the final page.
+      A check with a target names the element that the agent checked.
       Decide whether the evidence shows that the app behaves as the scenario expects.
       Answer \`pass\` when the evidence shows every expected result of the scenario.
       Answer \`fail\` when the evidence shows that an expected result is absent or wrong. Also answer \`fail\` when a step that the scenario needs failed.
       Answer \`inconclusive\` when the evidence is not enough to decide.
       Do not assume. A result that the evidence does not show is not shown.
+      Base the verdict on exact strings in the evidence.
+      The <context> block describes the app. It is not evidence of what happened in this run. Do not infer a result from it.
       The page block shows the final state only. A message that the app showed earlier may be gone.
       The checks with source "agent" are evidence. The agent observed them at the time it ran them.
       The user message has blocks: <scenario>, <context>, <steps>, <checks>, <diagnostics> and <page>.
@@ -69,6 +74,19 @@ describe("buildQaJudgePrompt", () => {
     expect(prompt).toContain("<page>\nURL: https://a.test/list\nTitle: Inbox\nText:\nBuy milk\n</page>");
     expect(prompt).not.toContain("<context>");
     expect(prompt).not.toContain("<diagnostics>");
+  });
+
+  it("prints the target of a check and the page at the last qa_assert", () => {
+    const prompt = buildQaJudgePrompt(
+      input({
+        qa: {
+          ...input().qa,
+          pageAtCheck: { url: "https://x.test/1", title: "Accounts" },
+          checks: [{ source: "agent", check: { type: "value", index: 102, equals: "" }, passed: true, target: 'AXTextField "Login"' }],
+        },
+      }),
+    );
+    expect(prompt).toContain(`<checks>\nPage at the agent's last qa_assert: URL https://x.test/1 (origin and path only), title Accounts\nagent {"type":"value","index":102,"equals":""} [target: AXTextField "Login"] -> passed\n</checks>`);
   });
 
   it("leaves out qa_verdict steps and the verdict reason", () => {

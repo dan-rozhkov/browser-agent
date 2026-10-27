@@ -3,6 +3,10 @@
 // the run history. Lives in src/shared so the controller layer and the agent layer
 // both import it (the controller must not depend on the agent). Zod-free, imports types only.
 import type { QaCheck, QaCheckResult, QaElementState } from "./qaTypes.js";
+import { normalizeTarget, oneLine } from "./qaTargets.js";
+import { redactUrl } from "./redactUrl.js";
+
+export { QA_TARGET_MAX_CHARS, cutWhole } from "./qaTargets.js";
 
 export const QA_ASSERT_TOOL = "qa_assert";
 export const QA_VERDICT_TOOL = "qa_verdict";
@@ -354,7 +358,17 @@ export interface QaDiagnosticsHistory {
 }
 
 export type QaEvaluation =
-  | { ok: true; passed: boolean; results: QaCheckResult[]; consoleErrors?: string[]; failedRequests?: string[]; consoleErrorsDropped?: number; failedRequestsDropped?: number }
+  | {
+      ok: true;
+      passed: boolean;
+      results: QaCheckResult[];
+      /** `url` (redacted; "" when absent) and `title` of the answer. Present when the answer carried either: the controller is target-capable. */
+      page?: { url: string; title: string };
+      consoleErrors?: string[];
+      failedRequests?: string[];
+      consoleErrorsDropped?: number;
+      failedRequestsDropped?: number;
+    }
   | { ok: false; error: string };
 
 /**
@@ -380,13 +394,21 @@ export function evaluateQaChecks(result: unknown, checks: readonly QaCheck[], hi
         ? { check, passed: true }
         : { check, passed: false, actual: cut(`${bad.length} ${isConsole ? "console error" : "failed request"}${bad.length === 1 ? "" : "s"}: ${bad[0]}`) };
     }
+    const target = normalizeTarget(r.target);
     return {
       check,
       passed: r.passed === true,
+      ...(target !== undefined ? { target } : {}),
       ...(typeof r.actual === "string" ? { actual: cut(r.actual) } : {}),
       ...(typeof r.error === "string" ? { error: cut(r.error, 200) } : {}),
     };
   });
+  // A target-capable controller sends `url` and/or `title`. The URL is redacted here as well: a host answer is not trusted to do it.
+  const rawUrl = oneLine(result.url);
+  const rawTitle = oneLine(result.title);
+  const pageSeen = rawUrl !== undefined || rawTitle !== undefined;
+  const pageUrl = rawUrl !== undefined ? cut(redactUrl(rawUrl), 300) : "";
+  const pageTitle = rawTitle !== undefined ? cut(rawTitle, 200) : "";
   const dropped = (v: unknown): number => (typeof v === "number" && Number.isInteger(v) && v > 0 ? v : 0);
   const consoleDropped = dropped(result.consoleErrorsDropped);
   const requestsDropped = dropped(result.failedRequestsDropped);
@@ -394,6 +416,7 @@ export function evaluateQaChecks(result: unknown, checks: readonly QaCheck[], hi
     ok: true,
     passed: results.every((r) => r.passed),
     results,
+    ...(pageSeen ? { page: { url: pageUrl, title: pageTitle } } : {}),
     ...(consoleNow.length > 0 ? { consoleErrors: consoleNow } : {}),
     ...(requestsNow.length > 0 ? { failedRequests: requestsNow } : {}),
     ...(consoleDropped > 0 ? { consoleErrorsDropped: consoleDropped } : {}),

@@ -78,6 +78,8 @@ is `judge: { error: "aborted" }` (the outcome stays `passed`).
    model's verdict and reason). Each line: index, tool, args as JSON, `ok` or the
    error. `qa_assert` steps stay.
 4. `checks`: every record of `qa.checks` (source, check, passed, actual, error).
+   A record of a check by `index` also has `target` (see "Targets" below). The block
+   starts with `Page at the agent's last qa_assert: URL ... (origin and path only), title ...` when `qa.pageAtCheck` is known.
 5. `consoleErrors`, `failedRequests` and their `...Dropped` counts, when present.
 6. `page`: the FULL page text, the final URL and the title from one `browse_read`
    (`{ maxChars: QA_JUDGE_PAGE_MAX_CHARS }`). `QA_JUDGE_PAGE_MAX_CHARS = 20_000` is
@@ -101,6 +103,54 @@ count. The `<` of any opening or closing block tag inside data (any case, with
 spaces, newlines or attributes) is replaced with `&lt;`, so data cannot end or
 open a block.
 
+### Targets and the page at the last check
+
+An index in a check (`{"type":"value","index":102}`) means nothing to the judge. Each check by
+`index` therefore carries a `target` in `QaCheckRecord`: `role "label"`, at most 80 characters in
+total (for example `AXTextField "Login"`). The role falls back to the tag, the label to
+name, text, placeholder. The LABEL is cut first (with `...`, never inside a surrogate pair), then
+quoted, so the text is always well formed. The one formatter is `describeElement`
+(`src/shared/qaTargets.ts`, exported from `@sideform/browser-agent/controller`); a host with its own controller mirrors it.
+
+**Authoritative source: the assert answer.** Each entry of `results` in a `browser.assert` answer
+MAY carry `target?: string`, the element the controller actually checked. `evaluateQaChecks`
+copies a valid string into the result (`normalizeTarget`: whitespace and newlines collapsed, at most 80 chars),
+so agent `qa_assert` records and the host's final checks (`runFinalChecks`/`applyFinalChecks`) both get it.
+The package's controller fills `target` only for an index check that really RAN against its element: not for a
+selector check, and not for a check that got an error result (no snapshot, stale snapshot, element in a frame,
+element not found). It resolves the index against `index -> description` strings it computed when it took the
+snapshot (a copy; a caller that changes the returned element list cannot change a target). An index check
+(`isIndexCheck`, `src/shared/qaTargets.ts`) has a numeric `index` and no selector (absent or blank; the
+parser rejects a blank selector and drops the placeholder `index: 0` next to a real selector). The controller and
+the recorder use this one function.
+
+The answer MAY also carry top-level `url` and `title` (the package's controller and the desktop host always do).
+`evaluateQaChecks` redacts the URL to origin and path (`redactUrl`, `src/shared/redactUrl.ts`, the same
+function as the controller's) and collapses the title to one line; they give `QaResult.pageAtCheck`
+(`{ url, title }` at the agent's last `qa_assert` call). An answer with a top-level `url` or `title` is
+TARGET-CAPABLE: the recorder then does NOT use its tracker, and an index check without `target` stays unnamed
+(the controller left it out on purpose). If the answer has only a title, `pageAtCheck` is absent.
+
+**Fallback: the step recorder's tracker**, only for an answer with neither `target`-capability signal
+(no top-level `url` or `title`; a host with an old controller). It names the index checks (`isIndexCheck`) from the
+latest element list the model received. It observes every output the model sees: tool outputs (with the tool
+name), the pre-open `browse_open` and the snapshot of a fixture setup. It keeps `index -> description` and
+`{ url, title }` only, not the outputs; the URL is redacted to origin and path and the title is one line. The element
+map is dropped by a new URL without a snapshot, and by the output of a page-changing tool (`browse_open`,
+`browse_act`, `browse_tabs`) that carries no snapshot, even with the same URL. Read-only tools (`browse_read`,
+`browse_screenshot`, `qa_assert`, `browse_find_images`, `browse_capture`) keep it. It is best effort: with parallel
+tool calls the latest snapshot can be the wrong one. No snapshot or no such index: no `target`. The judge prompt
+does not show which source gave the target.
+
+In the judge prompt the line is `Page at the agent's last qa_assert: URL <url> (origin and path only), title <title>`.
+It is the page when the agent checked, not the page of the host's final checks, and its URL is redacted, so
+it is not compared literally with the unredacted `<page>` URL.
+
+The page block is the FINAL page. A scenario can change the page after its checks (open a
+dialog, check it, close it). The system prompt tells the judge to judge such an expected
+result by the checks and the steps, and to base the verdict on exact strings in the evidence.
+`<context>` is app vocabulary, not evidence of this run.
+
 ## Judge prompt
 
 `QA_JUDGE_SYSTEM` (exported constant, golden-tested). Content, in short:
@@ -116,7 +166,11 @@ open a block.
 - The page block shows the final state only. A message that the app showed earlier
   may be gone. The checks with source "agent" are evidence that the agent
   observed at the time.
-- Do not assume. A result that the evidence does not show is not shown.
+- The scenario can change the page after its checks. Judge such an expected result
+  by the checks and the steps, not by the final page. A check with a target names
+  the element that the agent checked.
+- Do not assume. A result that the evidence does not show is not shown. Base the
+  verdict on exact strings in the evidence. `<context>` is not evidence of this run.
 - The reason: one or two sentences, what the scenario expects and what the
   evidence shows.
 

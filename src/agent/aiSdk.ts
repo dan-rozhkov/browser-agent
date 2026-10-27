@@ -550,7 +550,11 @@ export async function runBrowseAgent(goal: string, opts: RunBrowseAgentOptions):
   const fixtureSetup = opts.fixture
     ? createFixtureSetup(opts.browser, opts.fixture, {
         allowNetworkMocks: opts.allowNetworkMocks === true,
-        snapshot: () => executeBrowseTool(opts.browser, "browse_snapshot", {}),
+        snapshot: async () => {
+          const snap = await executeBrowseTool(opts.browser, "browse_snapshot", {});
+          trail?.observeOutput(snap, "browse_snapshot");
+          return snap;
+        },
       })
     : undefined;
 

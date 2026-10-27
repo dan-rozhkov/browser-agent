@@ -12,6 +12,7 @@ import {
 } from "../../src/agent/qa.js";
 import { BROWSE_AGENT_ERROR_MAX_CHARS } from "../../src/agent/limits.js";
 import { buildBrowseAgentPrompt, BROWSE_AGENT_CLOSING, SUBAGENT_IRREVERSIBLE_LINE } from "../../src/agent/prompt.js";
+import { describeElement, isIndexCheck, normalizeTarget } from "../../src/shared/qaTargets.js";
 import { QA_AGENT_CLOSING, QA_IRREVERSIBLE_LINE } from "../../src/agent/qaCore.js";
 import { createBrowseAgentSession } from "../../src/agent/session.js";
 
@@ -200,6 +201,148 @@ describe("qa_verdict items", () => {
     expect(qa.outcome).toBe("passed");
     expect(qa.reason).toBe(pass.reason);
     expect(qa.items).toEqual(items);
+  });
+});
+
+describe("createStepRecorder targets (fallback)", () => {
+  const snap = (id: string, label: string, extra: object = {}) => JSON.stringify({ snapshotId: id, url: `https://x.test/${id}`, title: `T-${id}`, elements: [{ index: 102, role: "AXTextField", label }], ...extra });
+  const agentCheck = (check: object) => ({ source: "agent" as const, check: check as never, passed: true });
+  const byIndex = (index: number) => agentCheck({ type: "value", index, equals: "" });
+
+  it("names the element of an index check from the latest snapshot, and the page", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_snapshot", {}, "a"))({ output: snap("s1", "Account name") });
+    rec.onToolCall(call("browse_act", {}, "b"))({ output: JSON.stringify({ changed: true, snapshot: JSON.parse(snap("s2", "Login")) }) });
+    rec.addChecks([byIndex(102), byIndex(999), agentCheck({ type: "text", text: "x" })]);
+    const checks = rec.extras().checks!;
+    expect(checks[0]!.target).toBe('AXTextField "Login"');
+    expect(checks[1]).not.toHaveProperty("target");
+    expect(checks[2]).not.toHaveProperty("target");
+    expect(rec.extras().pageAtCheck).toEqual({ url: "https://x.test/s2", title: "T-s2" });
+  });
+
+  it("gives a selector check no target, even with an index next to it", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_snapshot", {}))({ output: snap("s1", "Login") });
+    rec.addChecks([agentCheck({ type: "value", selector: "#a", index: 102, equals: "" }), agentCheck({ type: "value", selector: " ", index: 102, equals: "" })]);
+    const checks = rec.extras().checks!;
+    expect(checks[0]).not.toHaveProperty("target");
+    expect(checks[1]!.target).toBe('AXTextField "Login"');
+  });
+
+  it("keeps the target of the answer and prefers the page of the answer", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_snapshot", {}))({ output: snap("s1", "Login") });
+    rec.addChecks([{ ...byIndex(102), target: 'button "Save"' }], { url: "https://x.test/answer", title: "From answer" });
+    expect(rec.extras().checks![0]!.target).toBe('button "Save"');
+    expect(rec.extras().pageAtCheck).toEqual({ url: "https://x.test/answer", title: "From answer" });
+  });
+
+  it("observes the pre-open snapshot and the fixture-setup snapshot", () => {
+    const pre = createStepRecorder();
+    pre.onToolCall(call("browse_open", { url: "u" }, "o", true))({ output: snap("s0", "Pre") });
+    pre.addChecks([byIndex(102)]);
+    expect(pre.extras().checks![0]!.target).toBe('AXTextField "Pre"');
+    const fx = createStepRecorder();
+    fx.observeOutput(snap("s0", "Fixture"));
+    fx.addChecks([byIndex(102)]);
+    expect(fx.extras().checks![0]!.target).toBe('AXTextField "Fixture"');
+    expect(fx.extras().pageAtCheck).toEqual({ url: "https://x.test/s0", title: "T-s0" });
+  });
+
+  it("drops the element map when a new URL arrives without a snapshot", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_snapshot", {}, "a"))({ output: snap("s1", "Login") });
+    rec.onToolCall(call("browse_act", {}, "b"))({ output: JSON.stringify({ changed: true, url: "https://x.test/other", title: "Other" }) });
+    rec.addChecks([byIndex(102)]);
+    expect(rec.extras().checks![0]).not.toHaveProperty("target");
+    expect(rec.extras().pageAtCheck).toEqual({ url: "https://x.test/other", title: "Other" });
+  });
+
+  it("keeps the map for a read-only tool with an unchanged URL, and updates the title", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_snapshot", {}, "a"))({ output: snap("s1", "Login") });
+    rec.onToolCall(call("browse_read", {}, "b"))({ output: JSON.stringify({ url: "https://x.test/s1", title: "New title" }) });
+    rec.addChecks([byIndex(102)]);
+    expect(rec.extras().checks![0]!.target).toBe('AXTextField "Login"');
+    expect(rec.extras().pageAtCheck).toEqual({ url: "https://x.test/s1", title: "New title" });
+  });
+
+  it("drops the element map on a page-changing tool output without a snapshot or URL, keeps it for read-only tools", () => {
+    for (const tool of ["browse_act", "browse_tabs", "browse_open"]) {
+      const rec = createStepRecorder();
+      rec.onToolCall(call("browse_snapshot", {}, "a"))({ output: snap("s1", "Login") });
+      rec.onToolCall(call(tool, {}, "b"))({ output: JSON.stringify({ changed: true }) });
+      rec.addChecks([byIndex(102)]);
+      expect(rec.extras().checks![0], tool).not.toHaveProperty("target");
+    }
+    for (const tool of ["browse_read", "browse_screenshot", "qa_assert", "browse_find_images", "browse_capture"]) {
+      const rec = createStepRecorder();
+      rec.onToolCall(call("browse_snapshot", {}, "a"))({ output: snap("s1", "Login") });
+      rec.onToolCall(call(tool, {}, "b"))({ output: JSON.stringify({ ok: true }) });
+      rec.addChecks([byIndex(102)]);
+      expect(rec.extras().checks![0]!.target, tool).toBe('AXTextField "Login"');
+    }
+  });
+
+  it("does not use the tracker when the answer carried url or title (target-capable controller)", () => {
+    for (const page of [{ url: "https://x.test/a", title: "A" }, { url: "", title: "Only title" }]) {
+      const rec = createStepRecorder();
+      rec.onToolCall(call("browse_snapshot", {}))({ output: snap("s1", "Login") });
+      rec.addChecks([byIndex(102)], page);
+      expect(rec.extras().checks![0]).not.toHaveProperty("target");
+    }
+  });
+
+  it("redacts the URL of the tracked page and puts a one-line title", () => {
+    const rec = createStepRecorder();
+    rec.onToolCall(call("browse_snapshot", {}))({ output: snap("s1", "Login", { url: "https://x.test/s1?token=SECRET#h", title: "Multi\nline  title" }) });
+    rec.addChecks([byIndex(102)]);
+    expect(rec.extras().pageAtCheck).toEqual({ url: "https://x.test/s1", title: "Multi line title" });
+  });
+
+  it("omits target and page without any snapshot", () => {
+    const rec = createStepRecorder();
+    rec.addChecks([byIndex(102)]);
+    expect(rec.extras().checks![0]).not.toHaveProperty("target");
+    expect(rec.extras()).not.toHaveProperty("pageAtCheck");
+  });
+});
+
+describe("isIndexCheck / normalizeTarget", () => {
+  it("is an index check with a numeric index and no non-blank selector", () => {
+    expect(isIndexCheck({ type: "value", index: 0 })).toBe(true);
+    expect(isIndexCheck({ type: "value", index: 3, selector: "  " })).toBe(true);
+    expect(isIndexCheck({ type: "value", index: 3, selector: "#a" })).toBe(false);
+    expect(isIndexCheck({ type: "value", selector: "#a" })).toBe(false);
+    expect(isIndexCheck({ type: "value", index: "3" })).toBe(false);
+  });
+
+  it("normalizeTarget gives one line of at most 80 chars, or undefined", () => {
+    expect(normalizeTarget(" a\n b\t c ")).toBe("a b c");
+    expect(normalizeTarget("  ")).toBeUndefined();
+    expect(normalizeTarget(5)).toBeUndefined();
+    expect(normalizeTarget("x".repeat(300))!.length).toBe(80);
+  });
+});
+
+describe("describeElement", () => {
+  it("cuts the label before quoting: at most 80 chars, quote closed, no split emoji", () => {
+    for (const label of ["L".repeat(200), `${"a".repeat(50)}${"😀".repeat(20)}`, `${"b".repeat(60)}"quoted" tail text`]) {
+      const t = describeElement({ role: "AXTextField", label })!;
+      expect(t.length).toBeLessThanOrEqual(80);
+      expect(t).toMatch(/^AXTextField ".*"$/su);
+      expect(t).not.toMatch(/[\ud800-\udbff]"$|[\ud800-\udbff]\.\.\./);
+    }
+    expect(describeElement({ role: "AXTextField", label: "L".repeat(200) })).toMatch(/\.\.\."$/);
+  });
+
+  it("falls back to tag and name/text/placeholder, and gives role or label alone", () => {
+    expect(describeElement({ tag: "input", placeholder: "Search" })).toBe('input "Search"');
+    expect(describeElement({ role: "button", name: "Go" })).toBe('button "Go"');
+    expect(describeElement({ role: "button" })).toBe("button");
+    expect(describeElement({ text: "Hi" })).toBe('"Hi"');
+    expect(describeElement({})).toBeUndefined();
   });
 });
 

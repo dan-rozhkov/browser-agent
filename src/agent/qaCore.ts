@@ -6,11 +6,13 @@
 // schema of `qa_verdict` is in qa.ts. Imports the session and result only.
 import { browseAgentErrorMessage, type BrowseAgentStatus } from "./result.js";
 import { QA_ASSERT_TOOL, QA_ITEMS_MAX, QA_ITEM_ID_MAX_CHARS, QA_ITEM_REASON_MAX_CHARS, QA_VERDICT_TOOL, REASON_MAX_CHARS, cut, isObject, describeQaCheckFailure, type QaFinalSink } from "./qaChecks.js";
+import { createSnapshotTracker, isIndexCheck } from "../shared/qaTargets.js";
 import type { QaCheckRecord, QaOutcome, QaResult, QaStep, QaVerdictItem } from "./qaTypes.js";
 import { createSeenList, harvestDiagnostics } from "../shared/diagnostics.js";
 import { parseJsonObject, singleUseTool, type BrowseAgentExtraToolHooks, type BrowseAgentToolCall } from "./session.js";
 
 export * from "./qaChecks.js";
+export * from "../shared/qaTargets.js";
 export * from "./qaJudge.js";
 
 /** The principal of the QA prompt ("You are a browsing subagent working for a QA engineer"). */
@@ -175,7 +177,7 @@ function downgradedReason(failed: QaCheckRecord, agentReason: string): string {
 }
 
 /** The run-level lists a step recorder collects (`StepRecorder.extras()`): console errors, failed requests, check records. */
-export type QaRunExtras = Pick<QaResult, "consoleErrors" | "consoleErrorsDropped" | "failedRequests" | "failedRequestsDropped" | "checks">;
+export type QaRunExtras = Pick<QaResult, "consoleErrors" | "consoleErrorsDropped" | "failedRequests" | "failedRequestsDropped" | "checks" | "pageAtCheck">;
 
 /**
  * Builds the `qa` field from a run result (any object with `status`, `error`
@@ -227,6 +229,8 @@ export interface StepRecorder extends QaFinalSink {
   onToolCall(call: BrowseAgentToolCall): (result: { output?: string; error?: unknown }) => void;
   /** The check records of the agent's most recent `qa_assert` call (empty when none ran). */
   lastAgentCall(): QaCheckRecord[];
+  /** Feeds the tracker with a tool output the model saw outside `onToolCall` (the snapshot of a fixture setup). Never throws. */
+  observeOutput(output: unknown, tool?: string): void;
   /** The steps so far in call order. A call that has not ended is not ok. */
   steps(): QaStep[];
   /** The run-level lists for `qaResultOf`: deduped, first-seen order, capped, with dropped counters. Empty lists are absent. */
@@ -246,13 +250,29 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
   const failedRequests = createSeenList(DIAGNOSTICS_MEMORY, QA_RESULT_MAX_DIAGNOSTICS);
   const checks: QaCheckRecord[] = [];
   let lastAgentCall: QaCheckRecord[] = [];
+  // Fallback for an assert answer without `target`: the latest element list the model received. Best effort; with parallel
+  // tool calls "latest" can be the wrong snapshot. The authoritative source is the `target` in the answer.
+  const snapshots = createSnapshotTracker();
+  let pageAtCheck: { url: string; title: string } | undefined;
   return {
     seenConsoleErrors: () => consoleErrors.list(),
     seenFailedRequests: () => failedRequests.list(),
-    addChecks(records) {
-      checks.push(...records);
+    addChecks(records, page) {
+      // An answer with top-level `url` or `title` comes from a target-capable controller: its `target`s are all there is,
+      // an index check without one stays unnamed on purpose (not evaluated). Only an answer with neither gets the tracker.
+      const named = page
+        ? records
+        : records.map((r) => {
+            if (r.target !== undefined || !isIndexCheck(r.check)) return r;
+            const target = snapshots.describe((r.check as { index: number }).index);
+            return target !== undefined ? { ...r, target } : r;
+          });
+      checks.push(...named);
       // The agent's records of one call arrive in one batch.
-      if (records.some((r) => r.source === "agent")) lastAgentCall = records.filter((r) => r.source === "agent");
+      if (named.some((r) => r.source === "agent")) {
+        lastAgentCall = named.filter((r) => r.source === "agent");
+        pageAtCheck = page ? (page.url !== "" ? { ...page } : undefined) : snapshots.page();
+      }
     },
     lastAgentCall: () => [...lastAgentCall],
     addDiagnostics(d) {
@@ -268,13 +288,17 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
         ...(failedRequests.list().length > 0 ? { failedRequests: failedRequests.kept() } : {}),
         ...(failedRequests.dropped() > 0 ? { failedRequestsDropped: failedRequests.dropped() } : {}),
         ...(checks.length > 0 ? { checks: [...checks] } : {}),
+        ...(pageAtCheck ? { pageAtCheck } : {}),
       };
     },
     onToolCall(call) {
       if (call.preOpen) {
         // No step, but the page load of the start page is the first thing the run saw: its errors count.
         return (result) => {
-          if (result.error === undefined) harvestDiagnostics(parseJsonObject(result.output ?? ""), consoleErrors, failedRequests);
+          if (result.error !== undefined) return;
+          const parsed = parseJsonObject(result.output ?? "");
+          harvestDiagnostics(parsed, consoleErrors, failedRequests);
+          snapshots.observe(parsed, call.toolName);
         };
       }
       // The slot is taken when the call starts, so parallel calls keep their order.
@@ -288,6 +312,7 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
         } else {
           const parsed = parseJsonObject(result.output ?? "");
           harvestDiagnostics(parsed, consoleErrors, failedRequests);
+          snapshots.observe(parsed, call.toolName);
           const error = parsed.error;
           if (typeof error === "string") {
             step.ok = false;
@@ -297,6 +322,13 @@ export function createStepRecorder(now: () => number = Date.now): StepRecorder {
         slot.step = step;
         slot.open = false;
       };
+    },
+    observeOutput(output, tool) {
+      try {
+        snapshots.observe(typeof output === "string" ? parseJsonObject(output) : output, tool);
+      } catch {
+        // Best effort.
+      }
     },
     steps() {
       return slots.map((s) => (s.open ? { ...s.step, ms: Math.max(0, now() - s.started) } : s.step));

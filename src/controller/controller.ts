@@ -14,6 +14,7 @@
 
 import { decideBrowserNavigation } from "./navigation.js";
 import { evaluateQaChecks, hasPlaywrightSelectorSyntax, parseQaChecks } from "../shared/qaChecks.js";
+import { describeElements, isIndexCheck } from "../shared/qaTargets.js";
 import type { QaCheck, QaCheckResult } from "../shared/qaTypes.js";
 import { applyParsedFixture, fixtureBudgetMs } from "../fixture/apply.js";
 import { boundedCall, httpOrigin, redactUrl, redactUrls, withTimeout } from "../fixture/util.js";
@@ -1410,6 +1411,8 @@ export class BrowserController {
     // performUnlocked) since the overlay can't resolve or scroll to an
     // element inside a frame's own document.
     frameRects: Map<number, { x: number; y: number; width: number; height: number }>;
+    // `index -> role "label"` of the element table the model got (for `assert`'s `target`). A copy, not the returned array.
+    described: Map<number, string>;
     // Re-mount recovery (booking.com finding): for each TOP-document
     // interactive element, the `{ tag, label, role? }` the snapshot's element
     // table reported (label already truncated by SNAPSHOT_JS). Every
@@ -4713,7 +4716,7 @@ export class BrowserController {
     for (const [, f] of candidatesFp) fpCounts.set(fpKey(f), (fpCounts.get(fpKey(f)) ?? 0) + 1);
     for (const [i, f] of candidatesFp) if (fpCounts.get(fpKey(f)) === 1) fingerprints.set(i, f);
 
-    this.lastSnapshot = { id: snapshotId, page, frameMap, frameRects, fingerprints };
+    this.lastSnapshot = { id: snapshotId, page, frameMap, frameRects, described: describeElements(elements), fingerprints };
     const { __modalFrames: _internal, ...publicResult } = result;
     void _internal;
     return { ...publicResult, elements, snapshotId };
@@ -5287,7 +5290,7 @@ export class BrowserController {
       checks.forEach((check, i) => {
         if (check.type === "text" || check.type === "count") return void domIndexes.push(i);
         if (check.type !== "element" && check.type !== "value") return;
-        if (check.selector !== undefined || check.index === undefined) return void domIndexes.push(i);
+        if (!isIndexCheck(check)) return void domIndexes.push(i);
         if (snapshotId === undefined) snapshotError = "No snapshot yet: call browse_snapshot before a check by index.";
         else if (snapshotError === undefined) snapshotError = (this.checkSnapshotStale(snapshotId, page) as { error?: string } | null)?.error;
         if (snapshotError !== undefined) {
@@ -5347,6 +5350,16 @@ export class BrowserController {
         // The URL may hold a secret in its query or hash: report origin + pathname only.
         results[i] = passed ? { check, passed } : { check, passed, actual: `url ${redactUrl(url)}` };
       });
+      // `target` for the checks that actually ran against the element they name by index, from the snapshot they were resolved against.
+      checks.forEach((check, i) => {
+        if (!domIndexes.includes(i) || (check.type !== "element" && check.type !== "value") || !isIndexCheck(check)) return;
+        const result = results[i]!;
+        if (result.error !== undefined) return;
+        const snap = this.lastSnapshot;
+        if (!snap || snap.id !== snapshotId || snap.page !== page) return;
+        const target = snap.described.get(check.index!);
+        if (target !== undefined) results[i] = { ...result, target };
+      });
       // Same drain as act/perform: deduped, the last 20, with dropped counters.
       const diagnostics = this.drainDiagnostics(page);
       // The two history checks: evaluated here on what this call drained (the agent layer adds the run history).
@@ -5357,6 +5370,8 @@ export class BrowserController {
         ok: true,
         passed: finalResults.every((r) => r.passed),
         results: finalResults,
+        url: redactUrl(page.getURL()),
+        title: page.getTitle(),
         ...diagnostics,
         ...(reproChecks ? { [REPRO_KEY]: { checks: reproChecks } satisfies ReproCapture } : {}),
       };

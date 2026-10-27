@@ -199,6 +199,27 @@ describe("evaluateQaChecks", () => {
     expect(r.ok && r.passed).toBe(false);
   });
 
+  it("carries a string target from the answer (capped), drops the others, and takes url and title", () => {
+    const two: QaCheck[] = [{ type: "value", index: 1, equals: "" }, { type: "value", index: 2, equals: "" }, { type: "value", index: 3, equals: "" }];
+    const answer = { url: "https://a.test/p", title: "P", results: [{ passed: true, target: 'AXTextField "Login"' }, { passed: true, target: 5 }, { passed: true, target: "x".repeat(300) }] };
+    const r = evaluateQaChecks(answer, two);
+    expect(r.ok && r.results[0]!.target).toBe('AXTextField "Login"');
+    expect(r.ok && r.results[1]).not.toHaveProperty("target");
+    expect(r.ok && r.results[2]!.target!.length).toBe(80);
+    expect(r.ok && r.page).toEqual({ url: "https://a.test/p", title: "P" });
+  });
+
+  it("redacts the answer URL, collapses the title and the target to one line, and sees a title-only answer", () => {
+    const one: QaCheck[] = [{ type: "value", index: 1, equals: "" }];
+    const r = evaluateQaChecks({ url: "https://a.test/p?token=SECRET#x", title: "A\n  B", results: [{ passed: true, target: "button\n\"Save\"" }] }, one);
+    expect(r.ok && r.page).toEqual({ url: "https://a.test/p", title: "A B" });
+    expect(r.ok && r.results[0]!.target).toBe('button "Save"');
+    const t = evaluateQaChecks({ title: "Only", results: [{ passed: true }] }, one);
+    expect(t.ok && t.page).toEqual({ url: "", title: "Only" });
+    const n = evaluateQaChecks({ results: [{ passed: true }] }, one);
+    expect(n.ok && n).not.toHaveProperty("page");
+  });
+
   it("adds what this call drained and passes when nothing is left after ignore", () => {
     const answer = { results: [{ passed: true }, { passed: true }, { passed: true }], consoleErrors: ["x"], failedRequests: ["GET 404 https://a.test/favicon.ico"] };
     const r = evaluateQaChecks(answer, checks);
@@ -550,5 +571,25 @@ describe("normalizeQaChecks strict-mode placeholders and inference", () => {
     expect(one({ type: "text", text: "Hi", absent: false, selector: "" })).toEqual({ type: "text", text: "Hi", absent: false });
     expect(one({ type: "element", index: 0, state: "visible" })).toEqual({ type: "element", index: 0, state: "visible" });
     expect(one({ type: "element", selector: "#a", index: 0, state: "visible" })).toEqual({ type: "element", selector: "#a", state: "visible" });
+  });
+});
+
+describe("targets of the assert answer", () => {
+  const idx: QaCheck[] = [{ type: "element", index: 4, state: "visible" }];
+  const answer = { url: "https://a.test/p", title: "P", results: [{ passed: true, target: 'button "Save"' }] };
+
+  it("agent qa_assert records the target and the page of the answer", async () => {
+    const rec = createStepRecorder();
+    const out = JSON.parse(await executeQaAssert({ checks: idx }, { assert: async () => answer }, rec));
+    expect(out.results[0].target).toBe('button "Save"');
+    expect(rec.extras().checks![0]).toMatchObject({ source: "agent", target: 'button "Save"' });
+    expect(rec.extras().pageAtCheck).toEqual({ url: "https://a.test/p", title: "P" });
+  });
+
+  it("final checks carry the target into the final records", async () => {
+    const results = await runFinalChecks({ assert: async () => answer }, idx, createStepRecorder());
+    expect(results[0]!.target).toBe('button "Save"');
+    const qa = { outcome: "passed", verdict: "pass", reason: "ok", steps: [] } as unknown as QaResult;
+    expect(applyFinalChecks(qa, results).checks![0]).toMatchObject({ source: "final", target: 'button "Save"' });
   });
 });

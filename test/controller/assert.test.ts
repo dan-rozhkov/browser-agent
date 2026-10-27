@@ -126,6 +126,63 @@ describe("controller.assert", () => {
     expect(stale.results[0]!.error).toContain("snapshot");
   });
 
+  it("names the element of an index check (target), not of a selector check, and adds url and title", async () => {
+    const dom = domAnswers([{ passed: true }, { passed: true }]);
+    const page = fakePage({
+      executeJavaScript: vi.fn((code: string) => {
+        if (code.includes("function checkElement")) return dom.run(code);
+        if (code.includes("data-pen-snap")) return Promise.resolve({ title: "Example", url: "u", elements: [{ index: 0, tag: "input", role: "textbox", label: "Email" }] });
+        return Promise.resolve({ ok: true });
+      }),
+    });
+    const c = new BrowserController(targetOf(page));
+    await c.snapshot();
+    const r = (await c.assert({
+      checks: [
+        { type: "value", index: 0, equals: "" },
+        { type: "value", selector: "#email", equals: "" },
+      ],
+    })) as { results: { target?: string }[]; url: string; title: string };
+    expect(r.results[0]!.target).toBe('textbox "Email"');
+    expect(r.results[1]).not.toHaveProperty("target");
+    expect(r.url).toBe("https://example.com/orders/42");
+    expect(r.title).toBe("Example");
+  });
+
+  const snapPage = (dom: ReturnType<typeof domAnswers>) =>
+    fakePage({
+      executeJavaScript: vi.fn((code: string) => {
+        if (code.includes("function checkElement")) return dom.run(code);
+        if (code.includes("data-pen-snap")) return Promise.resolve({ title: "Example", url: "u", elements: [{ index: 0, tag: "input", role: "textbox", label: "Email" }] });
+        return Promise.resolve({ ok: true });
+      }),
+    });
+
+  it("gives no target to an index check that did not run on its element (not found, stale, no snapshot)", async () => {
+    const notFound = new BrowserController(targetOf(snapPage(domAnswers([{ passed: false, error: "Element 0 was not found." }]))));
+    await notFound.snapshot();
+    const r = (await notFound.assert({ checks: [{ type: "value", index: 0, equals: "" }] })) as { results: { target?: string; error?: string }[] };
+    expect(r.results[0]!.error).toBeDefined();
+    expect(r.results[0]).not.toHaveProperty("target");
+    const stale = new BrowserController(targetOf(snapPage(domAnswers([{ passed: true }]))));
+    await stale.snapshot();
+    const s = (await stale.assert({ snapshotId: "old", checks: [{ type: "value", index: 0, equals: "" }] })) as { results: { target?: string; error?: string }[] };
+    expect(s.results[0]!.error).toBeDefined();
+    expect(s.results[0]).not.toHaveProperty("target");
+    const none = new BrowserController(targetOf(snapPage(domAnswers([{ passed: true }]))));
+    const n = (await none.assert({ checks: [{ type: "value", index: 0, equals: "" }] })) as { results: { target?: string }[] };
+    expect(n.results[0]).not.toHaveProperty("target");
+  });
+
+  it("is not affected by a caller changing the elements of the returned snapshot", async () => {
+    const c = new BrowserController(targetOf(snapPage(domAnswers([{ passed: true }]))));
+    const snap = (await c.snapshot()) as { elements: { label: string }[] };
+    snap.elements[0]!.label = "Changed";
+    snap.elements.length = 0;
+    const r = (await c.assert({ checks: [{ type: "value", index: 0, equals: "" }] })) as { results: { target?: string }[] };
+    expect(r.results[0]!.target).toBe('textbox "Email"');
+  });
+
   it("is forwarded by controllerBridge", async () => {
     const dom = domAnswers([{ passed: true }]);
     const c = new BrowserController(targetOf(fakePage({ executeJavaScript: dom.run })));

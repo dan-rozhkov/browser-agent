@@ -4,6 +4,7 @@
 import type { BrowserPageHandle } from "../controller/controller.js";
 import { summarizeEmulation } from "./emulate.js";
 import type { FixtureEmulate } from "./types.js";
+import { redactUrl } from "../shared/redactUrl.js";
 
 /** Longest wait for one page script of a fixture. */
 export const SCRIPT_TIMEOUT_MS = 10_000;
@@ -12,15 +13,7 @@ export function toMessage(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).slice(0, 300);
 }
 
-/** `origin + pathname` of a URL ("[url]" when it does not parse). */
-export function redactUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return `${parsed.origin}${parsed.pathname}`;
-  } catch {
-    return "[url]";
-  }
-}
+export { redactUrl };
 
 /** `URL.origin` of an http(s) URL; undefined for anything else (about:blank, data:, a non-URL). */
 export function httpOrigin(url: string): string | undefined {

@@ -49,6 +49,8 @@ export interface QaResult {
   failedRequestsDropped?: number;
   /** Assertion results, in order: the agent's `qa_assert` calls, then the host's final checks. Absent when none ran. */
   checks?: QaCheckRecord[];
+  /** URL (origin and path only) and title of the page at the agent's last `qa_assert` call. Absent when unknown. The judge reads it. */
+  pageAtCheck?: { url: string; title: string };
   /**
    * Network mock rules (`fixture.network`) that answered no request during the run: the rule's `url` pattern and
    * `method`. Typically a wrong URL guess, so the mock did nothing and the app's behavior is not a mocked one.
@@ -93,6 +95,11 @@ export interface QaCheckResult {
   passed: boolean;
   actual?: string;
   error?: string;
+  /**
+   * Set by the controller for a check resolved by `index`: the element it checked, `role "label"` (at most 80 chars;
+   * see `describeElement` in shared/qaTargets.ts). Absent for a selector check or when unknown.
+   */
+  target?: string;
 }
 
 /** What the controller command `assert` returns. */
@@ -100,6 +107,9 @@ export interface QaAssertResult {
   ok: true;
   passed: boolean;
   results: QaCheckResult[];
+  /** The page at the check (the URL is redacted to origin and path). */
+  url?: string;
+  title?: string;
   consoleErrors?: string[];
   failedRequests?: string[];
 }
@@ -111,4 +121,6 @@ export interface QaCheckRecord {
   passed: boolean;
   actual?: string;
   error?: string;
+  /** For a check by `index`: the element that index named in the agent's snapshot, e.g. `AXTextField "Login"` (at most 80 chars). Absent when unknown. */
+  target?: string;
 }

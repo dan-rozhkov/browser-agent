@@ -17,7 +17,8 @@ export interface QaAssertBrowser {
 
 /** Where `executeQaAssert` and `runFinalChecks` read the history and write their records. A `StepRecorder` is one. */
 export interface QaCheckSink extends QaDiagnosticsHistory {
-  addChecks(records: QaCheckRecord[]): void;
+  /** `page`: the URL and title the `assert` answer carried. An answer that carried either is target-capable: the recorder then does not use its tracker. */
+  addChecks(records: QaCheckRecord[], page?: { url: string; title: string }): void;
 }
 
 /**
@@ -43,7 +44,7 @@ export async function executeQaAssert(input: unknown, browser: QaAssertBrowser, 
     (sink as Partial<QaFinalSink>).addDiagnostics?.(diagnosticsOf(answer));
     return JSON.stringify({ error: `${QA_ASSERT_TOOL}: ${evaluated.error}` });
   }
-  sink.addChecks(evaluated.results.map((r) => ({ source: "agent" as const, ...r })));
+  sink.addChecks(evaluated.results.map((r) => ({ source: "agent" as const, ...r })), evaluated.page);
   // The controller's capture for the Playwright export (`repro: true`): kept at the top level for the trace recorder.
   const capture = opts.repro && isObject(answer) ? answer[REPRO_KEY] : undefined;
   return JSON.stringify({

@@ -25,11 +25,16 @@ export const QA_JUDGE_TIMEOUT_MS = 60_000;
 export const QA_JUDGE_SYSTEM = `You review the result of one automated test of a web app.
 Another agent ran the test scenario. You did not see it run.
 You see the steps it took, the checks it ran and the final page.
+The scenario can change the page after its checks. For example, it can close a dialog. Then the final page does not show the checked state.
+Judge such an expected result by the checks and the steps, not by the final page.
+A check with a target names the element that the agent checked.
 Decide whether the evidence shows that the app behaves as the scenario expects.
 Answer \`pass\` when the evidence shows every expected result of the scenario.
 Answer \`fail\` when the evidence shows that an expected result is absent or wrong. Also answer \`fail\` when a step that the scenario needs failed.
 Answer \`inconclusive\` when the evidence is not enough to decide.
 Do not assume. A result that the evidence does not show is not shown.
+Base the verdict on exact strings in the evidence.
+The <context> block describes the app. It is not evidence of what happened in this run. Do not infer a result from it.
 The page block shows the final state only. A message that the app showed earlier may be gone.
 The checks with source "agent" are evidence. The agent observed them at the time it ran them.
 The user message has blocks: <scenario>, <context>, <steps>, <checks>, <diagnostics> and <page>.
@@ -54,7 +59,7 @@ export interface QaJudgeInput {
   /** The host's app vocabulary. */
   context?: string;
   /** The run's `qa` field. Its `qa_verdict` steps and its verdict reason are never shown to the judge. */
-  qa: Pick<QaResult, "steps" | "stepsDropped" | "checks" | "consoleErrors" | "consoleErrorsDropped" | "failedRequests" | "failedRequestsDropped">;
+  qa: Pick<QaResult, "steps" | "stepsDropped" | "checks" | "pageAtCheck" | "consoleErrors" | "consoleErrorsDropped" | "failedRequests" | "failedRequestsDropped">;
   page: QaJudgePage;
 }
 
@@ -82,9 +87,11 @@ function stepLines(qa: QaJudgeInput["qa"]): string {
 
 function checkLines(qa: QaJudgeInput["qa"]): string {
   const lines = (qa.checks ?? []).map(
-    (c) => `${c.source} ${JSON.stringify(c.check)} -> ${c.passed ? "passed" : "FAILED"}${c.actual !== undefined ? ` (actual: ${c.actual})` : ""}${c.error !== undefined ? ` (error: ${c.error})` : ""}`,
+    (c) => `${c.source} ${JSON.stringify(c.check)}${c.target !== undefined ? ` [target: ${c.target}]` : ""} -> ${c.passed ? "passed" : "FAILED"}${c.actual !== undefined ? ` (actual: ${c.actual})` : ""}${c.error !== undefined ? ` (error: ${c.error})` : ""}`,
   );
-  return lines.length > 0 ? lines.join("\n") : "(no checks)";
+  if (lines.length === 0) return "(no checks)";
+  const at = qa.pageAtCheck;
+  return [...(at ? [`Page at the agent's last qa_assert: URL ${at.url} (origin and path only), title ${at.title}`] : []), ...lines].join("\n");
 }
 
 function diagnosticLines(qa: QaJudgeInput["qa"]): string | undefined {
