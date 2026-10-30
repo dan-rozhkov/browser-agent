@@ -258,9 +258,56 @@ describe("createBrowseTraceRecorder", () => {
     await r.onToolCall({ toolName: "browse_act", input: { action: "click", index: 3 } })({ output: "{}" });
     await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "visible" } })({ output: "{}" });
     const t = r.finish({ status: "done" });
-    expect(t.steps.map((s) => (s.args as any).text ?? (s.args as any).actions?.[0].text)).toEqual([undefined, "[redacted]", "shoes", "more shoes", undefined, "[redacted]", undefined, "visible"]);
-    // Frames: click Password, search type, type more shoes, click Card, click index, type visible. Not the two secret types.
-    expect(t.frames.map((f) => f.stepIndex)).toEqual([0, 2, 3, 4, 6, 7]);
+    expect(t.steps.map((s) => (s.args as any).text ?? (s.args as any).actions?.[0].text)).toEqual([undefined, "[redacted]", "shoes", "[redacted]", undefined, "[redacted]", undefined, "[redacted]"]);
+    // A blind type is always redacted (a Tab may have moved the focus to a password field), even after a named non-secret target.
+    // Frames: click Password, search type, click Card, click index. Not the four secret types.
+    expect(t.frames.map((f) => f.stepIndex)).toEqual([0, 2, 4, 6]);
+  });
+
+  it("coordinates: x and y stay in the args; text typed at a point or into the unknown focus is redacted", async () => {
+    const r = make();
+    await r.onToolCall({ toolName: "browse_act", input: { action: "click", x: 120, y: 80, button: "right", clicks: 2 } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "hunter2", x: 30, y: 40 } })({ output: "{}" });
+    // The run starts with a blind type: nothing named the focused field, so it may be a password.
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "blind" } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { actions: [{ action: "click", x: 1, y: 2 }, { action: "type", text: "batch" }] } })({ output: "{}" });
+    // Even after a click on a named, non-secret field, a blind type stays redacted.
+    await r.onToolCall({ toolName: "browse_act", input: { action: "click", target: "Search" } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "shoes" } })({ output: "{}" });
+    const t = r.finish({ status: "done" });
+    const args = t.steps.map((s) => s.args as any);
+    expect(args[0]).toEqual({ action: "click", x: 120, y: 80, button: "right", clicks: 2 });
+    expect(args[1]).toEqual({ action: "type", text: "[redacted]", x: 30, y: 40 });
+    expect(args[2].text).toBe("[redacted]");
+    expect(args[3].actions[0]).toEqual({ action: "click", x: 1, y: 2 });
+    expect(args[3].actions[1].text).toBe("[redacted]");
+    expect(args[5].text).toBe("[redacted]");
+  });
+
+  it("a blind type after click Email, press Tab is redacted (the Tab moved the focus to the password field)", async () => {
+    const r = make();
+    await r.onToolCall({ toolName: "browse_act", input: { action: "click", target: "Email" } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", target: "Email", text: "a@b.c" } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "press", key: "Tab" } })({ output: "{}" });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "hunter2" } })({ output: "{}" });
+    const t = r.finish({ status: "done" });
+    const args = t.steps.map((s) => s.args as any);
+    expect(args[1].text).toBe("a@b.c");
+    expect(args[3].text).toBe("[redacted]");
+    expect(JSON.stringify(t)).not.toContain("hunter2");
+  });
+
+  it("coordinates: a repro of click and type at a point does not throw and holds no text", async () => {
+    const r = make({ repro: true } as Partial<BrowseTraceRecorderOptions>);
+    const out = JSON.stringify({ changed: true, __repro: { gap: "not-found" } });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "click", x: 5, y: 6 } })({ output: out });
+    await r.onToolCall({ toolName: "browse_act", input: { action: "type", text: "hunter2", x: 5, y: 6 } })({ output: out });
+    await r.onToolCall({ toolName: "browse_act", input: { actions: [{ action: "click", x: 1, y: 2 }, { action: "type", text: "x", x: 1, y: 2 }] } })({
+      output: JSON.stringify({ results: [{}, {}], completed: 2 }),
+    });
+    const t = r.finish({ status: "done" });
+    expect(JSON.stringify(t)).not.toContain("hunter2");
+    expect(t.steps).toHaveLength(3);
   });
 
   it("an abort during a capture ends the wait at once and stops the captures", async () => {

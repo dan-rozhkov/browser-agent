@@ -230,6 +230,7 @@ function actReproOf(entry: Record<string, unknown>, redacted: Record<string, unk
   const action = typeof entry.action === "string" ? entry.action : "";
   const hasTarget = (typeof entry.target === "string" && entry.target !== "") || entry.index != null || (typeof entry.element === "string" && entry.element.trim() !== "");
   const gap = (reason: string, n?: string): BrowseTraceReproAction[] => [{ op: "gap", gap: reason, ...(n ? { note: note(n) } : {}) }];
+  const atPoint = typeof entry.x === "number" && typeof entry.y === "number";
   const targeted = (op: "click" | "hover" | "fill" | "select" | "press", extra: Partial<BrowseTraceReproAction>): BrowseTraceReproAction[] => {
     if (cap?.gap !== undefined) return gap(String(cap.gap), `${action} (${String(cap.gap)})`);
     if (!cap?.locator) return gap("not-found", `${action} (no locator)`);
@@ -239,8 +240,11 @@ function actReproOf(entry: Record<string, unknown>, redacted: Record<string, unk
   switch (action) {
     case "click":
     case "hover":
+      // A click at a point has no locator: the Playwright spec cannot name the element.
+      if (atPoint && !hasTarget) return gap("not-found", `${action} at x and y (no locator)`);
       return targeted(action, {});
     case "type": {
+      if (atPoint && !hasTarget) return gap("not-found", "type at x and y (no locator)");
       // The text is kept only when the host's redacted args hold exactly the same text at the same place.
       // Anything else (masked, dropped, changed, no redacted copy) is a secret.
       const text = typeof entry.text === "string" ? entry.text : "";

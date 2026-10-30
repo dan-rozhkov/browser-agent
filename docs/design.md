@@ -302,6 +302,8 @@ model drives seven `browse_*` tools in a plain tool loop (Pen Editor's
   part for providers that carry tool-result images natively.
 - Element targeting: neutral `browse_act` has no `element` field or text;
   `elementTargeting: true` in the slots adds both.
+- Coordinate actions: `coordinateActions: true` in the slots adds `x`, `y`, `button`, `clicks` and one
+  description passage. Native desktop app mode only; the web controller refuses them.
 - Session state: hooks with state expose `fork()`; a session forks them at
   creation, so `singleUseTool` objects can be reused across runs.
 - Boundaries: model choice, provider routing, reasoning switch, nested chat

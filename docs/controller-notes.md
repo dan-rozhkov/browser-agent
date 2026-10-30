@@ -1857,3 +1857,8 @@ takes `{ freshTitles: true }`; every `tabs` action result passes it; click detec
 Each page has one title read in flight: lists reuse it, a read that a navigation overtook writes nothing, and a running read never blocks a script. The launcher passes `{ skipPlaceholderPages: true }`
 to an injected `deps.connect` as the third argument, clamps `placeholderGraceMs` (NaN/undefined: 5000, negative: 0), and
 connects instead of failing when a page was seen but the last polls errored.
+
+Coordinates (`x`, `y`, `button`, `clicks`) are native-only. `actUnlocked` refuses any of them with an error, so an Electron browser tab and a
+cloud browser never click at a point; only a native desktop app controller (in pen-editor-desktop) handles them. `executeBrowseTool` checks the pair
+(`x` with `y`, not with `index`/`target`/`element`, only on `click` and `type`) before the bridge. The trace redacts the `text` of a `type` at a point or
+into an unknown focus (no call named the field), and a click at a point has no Playwright locator, so its repro is a gap.

@@ -415,6 +415,10 @@ What the package owns:
   `BrowserBridge.launchApp({ app })` (the host implements it, for example with
   `launchElectronApp`) and attaches a snapshot; without `launchApp` it answers
   with a neutral error (`texts.appLaunchMissing`). The controller ignores `app`.
+  `coordinateActions: true` adds `x`, `y`, `button` and `clicks` to `browse_act`
+  (click and type at a pixel of the latest screenshot) and one passage to its
+  description. Only a host with a native desktop app controller sets it:
+  `BrowserController` refuses these fields in a browser tab.
 - **Limits**: `BROWSE_AGENT_MAX_REQUESTS` (60), `BROWSE_AGENT_DEADLINE_MS`
   (14 min), answer and error caps.
 - **Session core**: `createBrowseAgentSession`. The deadline, the abort signal,

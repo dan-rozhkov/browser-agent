@@ -1125,6 +1125,15 @@ const ACT_ACTIONS: readonly ActAction[] = [
   "viewport",
 ];
 
+// x/y/button/clicks are for a native desktop app window only. A browser tab (built-in or cloud) refuses them.
+const COORDINATE_REFUSAL =
+  'browse_act: "x" and "y" work only in a desktop app window in native mode. This browser tab does not accept them. Use "target" or "index" with "snapshotId".';
+
+function hasCoordinateFields(args: Record<string, unknown>): boolean {
+  const fields = [args, ...(Array.isArray(args.actions) ? args.actions : [])];
+  return fields.some((e) => isRecord(e) && (e.x != null || e.y != null || e.button != null || e.clicks != null));
+}
+
 function isActAction(value: unknown): value is ActAction {
   return typeof value === "string" && (ACT_ACTIONS as readonly string[]).includes(value);
 }
@@ -2605,6 +2614,7 @@ export class BrowserController {
       );
     }
     const action = args.action;
+    if (hasCoordinateFields(args)) return errorResult(COORDINATE_REFUSAL);
 
     if (action === "reload") {
       return this.withCommandTimeout(async () => {

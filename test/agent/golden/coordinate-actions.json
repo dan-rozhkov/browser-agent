@@ -1,0 +1,300 @@
+{
+  "description": "Act on the currently open browser tab: click, type, scroll, go back/forward, press a key, hover, pick a `<select>` option, upload files, reload, wait, or change the viewport. `target` (for click/type) is matched first as visible text (case-insensitive, trimmed, first match in document order), then as a CSS selector; alternatively pass `index` (from browse_snapshot or an annotated browse_screenshot) together with that call's `snapshotId` to act on a specific element by its number — more reliable than text matching once you have a snapshot. Scrolling is what makes an infinite-scroll grid usable: call `scroll` to load more results, then call browse_find_images (or browse_snapshot) again — `scroll` also takes `index`+`snapshotId` (or `target`) to scroll INSIDE that element (a scrollable panel/modal, or any element browse_snapshot marked `scrollable: true`) instead of the whole window. `press` sends a real key event (`key`: \"Enter\", \"Escape\", \"Tab\", \"ArrowDown\", \"Meta+a\", …), optionally focusing `target`/`index` first — this is how you submit a form with Enter or close a modal with Escape. `hover` moves the pointer over `target`/`index` without clicking, for hover-revealed menus. `select` needs `index`+`snapshotId` and `text` = the option's label or value. `upload` sets files on a file input: pass `index`+`snapshotId` and `files`, 1 to 5 entries of `{ name, mimeType?, text | base64 | sample }`, 2 MB in total. `sample` is a tiny valid file: png, jpg, pdf, txt or csv. Target the input, its label, or a drop zone. A drop zone gets a file drop. `viewport` changes the device emulation, for example to check a responsive layout: `device` is iphone-15, pixel-8, ipad, desktop-1440, desktop-1920, or custom with `width` and `height` (200 to 4000) and optional `mobile`. A change of device can reload the page (the result has `reloaded: true`). `device: \"reset\"` goes back to the start state. Put `viewport` last in a batch: it makes the snapshotId stale for every index-based entry after it. `reload` takes no fields. `wait` polls for `text` to appear (or just sleeps `ms`, default 3000, hard cap 15000) — use it after an action that triggers an async page update before your next snapshot/screenshot. Batching: pass `actions` (1-10 entries, each the same shape as this call minus `snapshotId` — all index-based entries refer to THIS call's top-level `snapshotId`) instead of a single `action` to run several simple steps in one round trip — e.g. fill a few fields then press Enter to submit — rather than spending one chat turn per step. When `actions` is given the top-level `action`/`target`/`index`/etc. fields are ignored; provide exactly one of `action` or `actions`. Entries run in order and stop at the first one that errors or whose target goes stale; the result is `{ results: [...one per entry actually run], completed, stoppedAt?, error? }` alongside the usual fields below. A batch also has its own internal time budget and may stop early with `stoppedAt` and an error saying so if it runs too long — check `completed` rather than assuming every entry ran. Returns `{ url, title, matched }` on success or `{ error }` naming what wasn't found. A click/type/press result may also carry `openedTab: { tabId, url, title }` when the action opened a new browser tab — a click on your own tab that opens a popup DOES make that popup your current tab, so your next browse_* call already acts on it; use browse_tabs to switch back to the previous one — and `dialogs: [{ type, message }]` listing any JS alert/confirm/prompt the browser auto-handled since your last command. `changed` (with `changes`, when present) tells you whether the action actually altered the page — check it instead of assuming success; when the action changed the page (or at the end of an `actions` batch, or for `wait`/`scroll`), the result also carries `snapshot` — a compact current snapshot (same shape as browse_snapshot) taken after the action settles, whose `snapshotId` is current — use it for your next index-based call instead of taking a fresh browse_snapshot yourself. May also carry `consoleErrors: string[]` listing new page JS errors observed since your last command. Desktop app windows in native mode only: when an element is not in the accessibility tree (empty snapshot, a control drawn on a canvas), `click` and `type` also accept `x` and `y`. They are pixels in the image of the latest browse_screenshot of the same window. Prefer `index` from browse_snapshot when the element is in the tree. `click` at `x` and `y` takes `button` (left or right) and `clicks` (1, or 2 for a double click). `type` with `text` and `x`, `y` clicks the point, then types. `type` with `text` and no `target`, `index`, `x` or `y` types into the element that has focus. Take browse_screenshot before the first click at `x` and `y`, and again when the window moved or changed size. After a click that changes the screen, take a new browse_screenshot before you use `x` and `y` again. Other actions do not accept `x` and `y`. A browser tab refuses them.",
+  "passage": "Desktop app windows in native mode only: when an element is not in the accessibility tree (empty snapshot, a control drawn on a canvas), `click` and `type` also accept `x` and `y`. They are pixels in the image of the latest browse_screenshot of the same window. Prefer `index` from browse_snapshot when the element is in the tree. `click` at `x` and `y` takes `button` (left or right) and `clicks` (1, or 2 for a double click). `type` with `text` and `x`, `y` clicks the point, then types. `type` with `text` and no `target`, `index`, `x` or `y` types into the element that has focus. Take browse_screenshot before the first click at `x` and `y`, and again when the window moved or changed size. After a click that changes the screen, take a new browse_screenshot before you use `x` and `y` again. Other actions do not accept `x` and `y`. A browser tab refuses them.",
+  "jsonSchema": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "click",
+          "type",
+          "scroll",
+          "back",
+          "forward",
+          "press",
+          "hover",
+          "select",
+          "upload",
+          "reload",
+          "wait",
+          "viewport"
+        ],
+        "description": "Which action to perform. Omit when `actions` is given instead."
+      },
+      "target": {
+        "type": "string",
+        "description": "Visible text or CSS selector to act on. Used by click/type/press (to focus first)/hover."
+      },
+      "index": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Element index from a browse_snapshot or annotated browse_screenshot call, used instead of `target`. Requires `snapshotId` from that same call. Also used by `scroll` to scroll inside that element instead of the window."
+      },
+      "snapshotId": {
+        "type": "string",
+        "description": "The snapshotId that `index` refers to — from the browse_snapshot/browse_screenshot call that produced it (or a previous browse_act/browse_open result's `snapshot`). Stale once a newer snapshot has been taken. Also the snapshotId every entry in `actions` resolves its own `index` against."
+      },
+      "text": {
+        "type": "string",
+        "description": "Text to type (action: type), or the option label/value to choose (action: select)."
+      },
+      "amount": {
+        "type": "number",
+        "description": "Scroll distance in viewport heights. Used by scroll, default 1."
+      },
+      "key": {
+        "type": "string",
+        "description": "Key to press, e.g. \"Enter\", \"Escape\", \"Tab\", \"ArrowDown\", \"Meta+a\". Used by press."
+      },
+      "ms": {
+        "type": "number",
+        "maximum": 15000,
+        "description": "Milliseconds to wait. Used by wait, default 3000, hard cap 15000."
+      },
+      "files": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "description": "File name the page sees, e.g. \"avatar.png\". Up to 100 characters, no / or \\."
+            },
+            "mimeType": {
+              "type": "string",
+              "description": "MIME type. Default: from the sample kind, else from the name."
+            },
+            "text": {
+              "type": "string",
+              "description": "UTF-8 text content. Give exactly one of text, base64 or sample."
+            },
+            "base64": {
+              "type": "string",
+              "description": "Raw bytes as base64. Give exactly one of text, base64 or sample."
+            },
+            "sample": {
+              "type": "string",
+              "enum": [
+                "png",
+                "jpg",
+                "pdf",
+                "txt",
+                "csv"
+              ],
+              "description": "A built-in tiny valid file. Give exactly one of text, base64 or sample."
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "additionalProperties": false
+        },
+        "minItems": 1,
+        "maxItems": 5,
+        "description": "Files for upload: 1-5 entries, 2 MB decoded in total. Each is { name, mimeType?, and one of text | base64 | sample }."
+      },
+      "device": {
+        "type": "string",
+        "enum": [
+          "iphone-15",
+          "pixel-8",
+          "ipad",
+          "desktop-1440",
+          "desktop-1920",
+          "custom",
+          "reset"
+        ],
+        "description": "Device for the viewport action: iphone-15, pixel-8, ipad, desktop-1440, desktop-1920, custom (needs width and height), or reset (back to the start state)."
+      },
+      "width": {
+        "type": "integer",
+        "minimum": 200,
+        "maximum": 4000,
+        "description": "Viewport width in CSS pixels, 200 to 4000. Used by viewport with device custom."
+      },
+      "height": {
+        "type": "integer",
+        "minimum": 200,
+        "maximum": 4000,
+        "description": "Viewport height in CSS pixels, 200 to 4000. Used by viewport with device custom."
+      },
+      "mobile": {
+        "type": "boolean",
+        "description": "Set true for a phone-like viewport (touch, mobile layout). Used by viewport with device custom, default false."
+      },
+      "x": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10000,
+        "description": "Horizontal position in pixels in the image of the latest browse_screenshot of this window. 0 is the left edge. Use with y. For click and type only."
+      },
+      "y": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10000,
+        "description": "Vertical position in pixels in the image of the latest browse_screenshot of this window. 0 is the top edge. Use with x."
+      },
+      "button": {
+        "type": "string",
+        "enum": [
+          "left",
+          "right"
+        ],
+        "description": "Mouse button for a click at x and y. Default left."
+      },
+      "clicks": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2,
+        "description": "1 or 2. Use 2 for a double click at x and y. Default 1."
+      },
+      "actions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "click",
+                "type",
+                "scroll",
+                "back",
+                "forward",
+                "press",
+                "hover",
+                "select",
+                "upload",
+                "reload",
+                "wait",
+                "viewport"
+              ]
+            },
+            "target": {
+              "type": "string"
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "text": {
+              "type": "string"
+            },
+            "amount": {
+              "type": "number"
+            },
+            "key": {
+              "type": "string"
+            },
+            "ms": {
+              "type": "number",
+              "maximum": 15000
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                    "description": "File name the page sees, e.g. \"avatar.png\". Up to 100 characters, no / or \\."
+                  },
+                  "mimeType": {
+                    "type": "string",
+                    "description": "MIME type. Default: from the sample kind, else from the name."
+                  },
+                  "text": {
+                    "type": "string",
+                    "description": "UTF-8 text content. Give exactly one of text, base64 or sample."
+                  },
+                  "base64": {
+                    "type": "string",
+                    "description": "Raw bytes as base64. Give exactly one of text, base64 or sample."
+                  },
+                  "sample": {
+                    "type": "string",
+                    "enum": [
+                      "png",
+                      "jpg",
+                      "pdf",
+                      "txt",
+                      "csv"
+                    ],
+                    "description": "A built-in tiny valid file. Give exactly one of text, base64 or sample."
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1,
+              "maxItems": 5
+            },
+            "device": {
+              "type": "string",
+              "enum": [
+                "iphone-15",
+                "pixel-8",
+                "ipad",
+                "desktop-1440",
+                "desktop-1920",
+                "custom",
+                "reset"
+              ]
+            },
+            "width": {
+              "type": "integer",
+              "minimum": 200,
+              "maximum": 4000
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 200,
+              "maximum": 4000
+            },
+            "mobile": {
+              "type": "boolean"
+            },
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            },
+            "y": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            },
+            "button": {
+              "type": "string",
+              "enum": [
+                "left",
+                "right"
+              ]
+            },
+            "clicks": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "minItems": 1,
+        "maxItems": 10,
+        "description": "Run up to 10 steps in one call instead of a single `action` — see the description above. Each entry has the same fields as this call except `snapshotId` (they all share the top-level one)."
+      }
+    },
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+}

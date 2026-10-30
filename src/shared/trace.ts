@@ -316,11 +316,19 @@ export function redactTraceArgsTracked(args: unknown, state: TraceRedactionState
     let secretField = record.inputType === "password" || record.type === "password";
     if (action !== undefined && TYPED_ACTIONS.includes(action)) {
       // Typing without a target goes into the field the last click/focus (or type) reached.
-      secretField ||= named ? matches : state.secretFocus;
+      // With no target, index or element it goes into whatever has focus, and a Tab or other key may have
+      // moved the focus since the last click: the field is unknown, so a blind type is always redacted.
+      const atPoint = typeof record.x === "number" && typeof record.y === "number";
+      const blind = !named && record.index == null;
+      secretField ||= named ? matches : state.secretFocus || atPoint || blind;
       state.secretFocus = named ? matches : state.secretFocus;
+      // Typing at a point clicks the field first: its name is unknown.
+      if (!named && atPoint) state.secretFocus = true;
     } else if (action !== undefined && FOCUS_ACTIONS.includes(action)) {
       // A click by index moves the focus to a field we cannot name: the memory resets.
       state.secretFocus = named && matches;
+      // A click at a point lands in a field we cannot name: treat the focus as a possible secret.
+      if (!named && typeof record.x === "number" && typeof record.y === "number") state.secretFocus = true;
     }
     const out: Record<string, unknown> = {};
     for (const [key, v] of Object.entries(record)) {
@@ -344,9 +352,11 @@ export function redactTraceArgsTracked(args: unknown, state: TraceRedactionState
  * - Typed text: in an object with `action` "type" or "fill" (a `browse_act` call, also each entry of `actions`),
  *   `text` and `value` become "[redacted]" when its `target`, `element`, `label`, `selector`, `name` or `placeholder`
  *   matches /pass|pwd|secret|otp|one.?time|code|pin|cvv|cvc|card|token|key|ssn/i, or when the object has
- *   `inputType` or `type` "password". Other typed text (a search query) stays. This function has no memory: a
- *   type without a target, after a click on a secret field, is redacted only by `redactTraceArgsTracked` (the
- *   recorder's default). A call that names its field only by `index` has no word to match, so its text stays visible.
+ *   `inputType` or `type` "password". Other typed text (a search query) stays.
+ * - A blind type (no target, element or index, so it goes into whatever has focus) or a type at `x` and `y` is
+ *   always redacted, in both this stateless function and `redactTraceArgsTracked`: the focused field is unknown.
+ * - Only `redactTraceArgsTracked` (the recorder's default) has memory: a type with an `index` but no name is
+ *   redacted after a click on a secret field. In this stateless function such a call stays visible, as it has no word to match.
  */
 export function redactTraceArgs(args: unknown): unknown {
   return redactTraceArgsTracked(args, { secretFocus: false }).value;

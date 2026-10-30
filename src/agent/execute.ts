@@ -146,6 +146,26 @@ function validateActionArgs(action: string, rest: Record<string, unknown>): stri
   return null;
 }
 
+const COORDINATE_ACTIONS = ["click", "type"];
+
+/** Cheap check of the `x`/`y` fields of one entry; the controller still refuses them outside a native app window. */
+function validateCoordinates(entry: Record<string, unknown>): string | null {
+  const hasX = entry.x != null;
+  const hasY = entry.y != null;
+  if (!hasX && !hasY) {
+    if (entry.button != null || entry.clicks != null) return 'browse_act: "button" and "clicks" work only with "x" and "y".';
+    return null;
+  }
+  if (hasX !== hasY) return 'browse_act: "x" and "y" must be given together.';
+  if (entry.index != null || entry.element != null || (typeof entry.target === "string" && entry.target !== "")) {
+    return 'browse_act: use either "index"/"target"/"element" or "x" and "y", not both.';
+  }
+  if (typeof entry.action !== "string" || !COORDINATE_ACTIONS.includes(entry.action)) {
+    return 'browse_act: "x" and "y" work only with "click" and "type".';
+  }
+  return null;
+}
+
 async function resolveByElement(
   browser: BrowserBridge,
   locate: ElementLocator,
@@ -222,6 +242,9 @@ async function performOne(
   opts: ExecuteBrowseToolOptions,
 ): Promise<string> {
   const { element, ...rest } = entryArgs;
+
+  const coordinateError = validateCoordinates(entryArgs);
+  if (coordinateError) return err(coordinateError);
 
   if (routesToElement(entryArgs)) {
     if (!opts.locateElement) return err(ELEMENT_UNAVAILABLE);

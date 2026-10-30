@@ -45,6 +45,10 @@ const BROWSE_ACT_SINGLE_FIELDS = [
   "width",
   "height",
   "mobile",
+  "x",
+  "y",
+  "button",
+  "clicks",
 ] as const;
 
 const BROWSE_ACT_NO_ELEMENT_ACTIONS = new Set([
@@ -95,6 +99,10 @@ function stripBrowseActPlaceholders(
     if ((key === "width" || key === "height") && value === 0 && entry.device !== "custom") continue;
     // `mobile: false` is the default of a custom viewport, so dropping it loses nothing.
     if (key === "mobile" && value === false) continue;
+    // `x` and `y` of 0 together are the placeholder pair; a lone 0 is a real edge, and the pair check refuses it.
+    if ((key === "x" || key === "y") && value === 0 && entry.x === 0 && entry.y === 0) continue;
+    // `clicks` 0 is the placeholder; 1 is the default, so dropping it loses nothing.
+    if (key === "clicks" && (value === 0 || value === 1)) continue;
     out[key] = value;
   }
   // index 0 is a real element, but next to an explicit target/element (or
@@ -102,6 +110,11 @@ function stripBrowseActPlaceholders(
   // Strict-mode models also send index 0 for a window scroll and for actions
   // that take no element: kept, it scrolled INSIDE element 0 instead of the
   // page (gpt-6-luna, OM2W 2026-10-14).
+  // A real coordinate pair (not the (0,0) placeholder, already stripped) makes index 0 the strict-mode
+  // placeholder too, even with a snapshotId: index and x/y are exclusive.
+  if (out.index === 0 && typeof out.x === "number" && typeof out.y === "number") {
+    delete out.index;
+  }
   if (
     out.index === 0 &&
     (!hasSnapshotId ||
@@ -163,7 +176,22 @@ export interface BrowseActSchemaOptions {
    * `executeBrowseTool` always refuses an element-only call.
    */
   elementTargeting?: boolean;
+  /**
+   * Add `x`, `y`, `button` and `clicks` (click and type at a point of the latest screenshot).
+   * Default false, and then the schema is byte-identical to before. Only a host whose
+   * controller can map a screenshot pixel to the screen (a native desktop app window) turns it on.
+   */
+  coordinates?: boolean;
 }
+
+const X_DESCRIPTION =
+  "Horizontal position in pixels in the image of the latest browse_screenshot of this window. 0 is the left edge. Use with y. For click and type only.";
+const Y_DESCRIPTION =
+  "Vertical position in pixels in the image of the latest browse_screenshot of this window. 0 is the top edge. Use with x.";
+const BUTTON_DESCRIPTION = "Mouse button for a click at x and y. Default left.";
+const CLICKS_DESCRIPTION = "1 or 2. Use 2 for a double click at x and y. Default 1.";
+
+const coordinate = z.number().int().min(0).max(10000);
 
 /**
  * One file for the `upload` action: a name, an optional MIME type and exactly
@@ -215,6 +243,14 @@ export function createBrowseActEntrySchema(opts: BrowseActSchemaOptions = {}) {
     width: viewportSize.optional(),
     height: viewportSize.optional(),
     mobile: z.boolean().optional(),
+    ...(opts.coordinates
+      ? {
+          x: coordinate.optional(),
+          y: coordinate.optional(),
+          button: z.enum(["left", "right"]).optional(),
+          clicks: z.number().int().min(1).max(2).optional(),
+        }
+      : {}),
   });
 }
 
@@ -269,6 +305,14 @@ export function createBrowseActInputSchema(opts: BrowseActSchemaOptions = {}) {
         width: viewportSize.optional().describe(`Viewport width in CSS pixels, ${VIEWPORT_MIN} to ${VIEWPORT_MAX}. Used by viewport with device custom.`),
         height: viewportSize.optional().describe(`Viewport height in CSS pixels, ${VIEWPORT_MIN} to ${VIEWPORT_MAX}. Used by viewport with device custom.`),
         mobile: z.boolean().optional().describe("Set true for a phone-like viewport (touch, mobile layout). Used by viewport with device custom, default false."),
+        ...(opts.coordinates
+          ? {
+              x: coordinate.optional().describe(X_DESCRIPTION),
+              y: coordinate.optional().describe(Y_DESCRIPTION),
+              button: z.enum(["left", "right"]).optional().describe(BUTTON_DESCRIPTION),
+              clicks: z.number().int().min(1).max(2).optional().describe(CLICKS_DESCRIPTION),
+            }
+          : {}),
         actions: z
           .array(createBrowseActEntrySchema(opts))
           .min(1)
