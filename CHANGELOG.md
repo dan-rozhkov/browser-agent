@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.4...v0.4.5) (2026-10-30)
+
+
+### Features
+
+* **agent:** click and type at screenshot coordinates in native app windows ([7545245](https://github.com/dan-rozhkov/browser-agent/commit/754524525f64c36d17c4500a4bcea02b3358b3cd))
+
 ## [0.4.4](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.3...v0.4.4) (2026-10-27)
 
 
