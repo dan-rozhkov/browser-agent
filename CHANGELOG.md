@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.7](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.6...v0.4.7) (2026-11-01)
+
+
+### Features
+
+* **cursor:** label pill looks like the app's Tooltip ([54ad178](https://github.com/dan-rozhkov/browser-agent/commit/54ad178c07e1ade23b82aa737bc28cbfc3273c81))
+
 ## [0.4.6](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.5...v0.4.6) (2026-11-01)
 
 
