@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.8](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.7...v0.4.8) (2026-11-01)
+
+
+### Bug Fixes
+
+* **cursor:** light arrow-only shadow, no grey smudge on light pages ([35d6455](https://github.com/dan-rozhkov/browser-agent/commit/35d645503ae8ac53b0d36cb6d0fbefa522c3aafb))
+
 ## [0.4.7](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.6...v0.4.7) (2026-11-01)
 
 
