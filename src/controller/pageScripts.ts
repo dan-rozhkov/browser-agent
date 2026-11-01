@@ -5325,10 +5325,12 @@ export const CURSOR_JS = `(() => {
   // (https://github.com/trycua/cua): the whole move is planned once as timed
   // samples (120 Hz), then every animation frame interpolates by elapsed time.
   var args = ${ARGS_MARKER};
-  var CURSOR_VERSION = "7";
+  var CURSOR_VERSION = "8";
 
   ${FIND_BY_TEXT_JS}
 
+  var DEFAULT_COLOR = "#0d99ff";
+  var DEFAULT_GLOW = "radial-gradient(circle closest-side,rgba(94,192,232,1),rgba(94,192,232,0))";
   var RIPPLE_MS = 380;
   var PRESS_HOLD_MS = 90;
   var PRESS_IN_MS = 50;
@@ -5369,7 +5371,7 @@ export const CURSOR_JS = `(() => {
     glow.setAttribute("data-pen-cursor-glow", "1");
     glow.style.cssText =
       "position:absolute;left:-50px;top:-50px;width:100px;height:100px;border-radius:50%;" +
-      "background:radial-gradient(circle closest-side,rgba(94,192,232,1),rgba(94,192,232,0));" +
+      "background:" + DEFAULT_GLOW + ";" +
       "pointer-events:none;opacity:0;z-index:2147483647;";
     root.appendChild(glow);
 
@@ -5437,7 +5439,8 @@ export const CURSOR_JS = `(() => {
       return poly;
     }
     svg.appendChild(arrowPolygon("#fff", 7.8));
-    svg.appendChild(arrowPolygon("#0d99ff", 5.4));
+    var arrowTop = arrowPolygon(DEFAULT_COLOR, 5.4);
+    svg.appendChild(arrowTop);
     carrier.appendChild(svg);
     root.appendChild(carrier);
 
@@ -5450,6 +5453,8 @@ export const CURSOR_JS = `(() => {
       svg: svg,
       ring: ring,
       glow: glow,
+      arrowTop: arrowTop,
+      pill: null,
       pos: priorPos,
       hideTimer: null,
       token: 0,
@@ -5460,6 +5465,68 @@ export const CURSOR_JS = `(() => {
     };
     window.__penCursor = state;
     return state;
+  }
+
+  // Optional identity (args.label / args.color), applied on EVERY call: the
+  // overlay persists across calls, so a call without a label removes the
+  // pill and a call without a colour restores the default. The label is a
+  // text node only (never markup); the colour must be #rrggbb.
+  function applyIdentity(state) {
+    var color = DEFAULT_COLOR;
+    var glowBg = DEFAULT_GLOW;
+    if (typeof args.color === "string" && /^#[0-9a-fA-F]{6}$/.test(args.color) && args.color.toLowerCase() !== DEFAULT_COLOR) {
+      color = args.color;
+      var rgb = parseInt(color.slice(1), 16);
+      var rgbText = ((rgb >> 16) & 255) + "," + ((rgb >> 8) & 255) + "," + (rgb & 255);
+      glowBg = "radial-gradient(circle closest-side,rgba(" + rgbText + ",1),rgba(" + rgbText + ",0))";
+    }
+    var label = typeof args.label === "string" ? args.label.trim().slice(0, 24) : "";
+    if (state.appliedColor === color && state.appliedLabel === label) return;
+    state.appliedColor = color;
+    state.appliedLabel = label;
+    state.arrowTop.setAttribute("fill", color);
+    state.arrowTop.setAttribute("stroke", color);
+    state.glow.style.background = glowBg;
+    if (label === "") {
+      if (state.pill) {
+        if (state.pill.parentNode) state.pill.parentNode.removeChild(state.pill);
+        state.pill = null;
+      }
+      state.pillWidth = 0;
+      state.pillSide = "";
+      return;
+    }
+    if (!state.pill) {
+      var pill = document.createElement("div");
+      pill.setAttribute("data-pen-cursor-label", "1");
+      pill.style.cssText =
+        "position:absolute;left:18px;top:22px;padding:0 7px;border-radius:999px;" +
+        "color:#fff;font:600 11px/16px system-ui,-apple-system,sans-serif;" +
+        "box-shadow:0 0 0 1.5px #fff;white-space:nowrap;pointer-events:none;" +
+        "user-select:none;-webkit-user-select:none;";
+      state.carrier.appendChild(pill);
+      state.pill = pill;
+    }
+    state.pill.style.background = color;
+    state.pill.textContent = label;
+    // Measured once per text change, never per frame.
+    state.pillWidth = state.pill.offsetWidth || 0;
+    state.pillSide = "";
+    if (state.pos) placePill(state, state.pos.x, state.pos.y);
+  }
+
+  // Keeps the pill inside the viewport: down-right of the tip by default,
+  // flipped left and/or above when it would overflow. Writes the style only
+  // when the side changes; reads no layout.
+  function placePill(state, x, y) {
+    if (!state.pill) return;
+    var flipX = x + 18 + (state.pillWidth || 0) > window.innerWidth;
+    var flipY = y + 22 + 16 > window.innerHeight;
+    var side = (flipX ? "l" : "r") + (flipY ? "a" : "b");
+    if (state.pillSide === side) return;
+    state.pillSide = side;
+    state.pill.style.left = (flipX ? -((state.pillWidth || 0) + 6) : 18) + "px";
+    state.pill.style.top = (flipY ? -22 : 22) + "px";
   }
 
   // Stops a still-running animation (a previous move's follow-through, or
@@ -5517,6 +5584,7 @@ export const CURSOR_JS = `(() => {
   function place(state, x, y) {
     state.carrier.style.transform = "translate3d(" + x + "px," + y + "px,0)";
     state.pos = { x: x, y: y };
+    placePill(state, x, y);
     if (state.glowOn) drawGlow(state, x, y, 0, 0);
   }
 
@@ -5628,6 +5696,7 @@ export const CURSOR_JS = `(() => {
 
     try {
       var state = ensureOverlay();
+      applyIdentity(state);
       show(state);
 
       var reduceMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -5758,6 +5827,7 @@ export const CURSOR_JS = `(() => {
           }
 
           state.carrier.style.transform = "translate3d(" + s.x + "px," + s.y + "px,0)";
+          placePill(state, s.x, s.y);
           // Glow follows the motion only; the rotation tail extends
           // just the arrow transform.
           if (state.glowOn) {

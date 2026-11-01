@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
-import { describe, it, expect, beforeEach } from "vitest";
-import { ARGS_MARKER, CAPTURE_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { ARGS_MARKER, CAPTURE_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
 import { BrowserController } from "../../src/controller/controller.js";
 
 /** Runs a page script in the happy-dom document, like page.evaluate would. */
@@ -789,5 +789,117 @@ describe("CSS_QUERY_JS", () => {
 
   it("errors on a missing element stamp", () => {
     expect(query({ snapshotId: "s1", index: 9 }).error).toMatch(/not found/);
+  });
+});
+
+describe("CURSOR_JS label and colour", () => {
+  const move = async (extra: Record<string, unknown> = {}) => {
+    await run(CURSOR_JS, { action: "scroll", ...extra });
+  };
+  const pill = () => document.querySelector<HTMLElement>("[data-pen-cursor-label]");
+  const topPoly = () => document.querySelectorAll("[data-pen-cursor-arrow] polygon")[1] as SVGElement;
+  const glow = () => document.querySelector<HTMLElement>("[data-pen-cursor-glow]")!;
+
+  beforeEach(() => {
+    (window as any).__penCursor?.root?.remove();
+    (window as any).__penCursor = null;
+  });
+
+  it("renders the label as text only", async () => {
+    await move({ label: "<img src=x onerror=alert(1)>" });
+    const el = pill()!;
+    expect(el.textContent).toBe("<img src=x onerror=alert(1)>".slice(0, 24));
+    expect(el.querySelector("img")).toBeNull();
+    expect(el.closest("[data-pen-cursor-carrier]")).not.toBeNull();
+  });
+
+  it("trims and cuts the label at 24 characters", async () => {
+    await move({ label: "  " + "a".repeat(40) + "  " });
+    expect(pill()!.textContent).toBe("a".repeat(24));
+  });
+
+  it("has no pill without a label, and removes it on a later call without one", async () => {
+    await move();
+    expect(pill()).toBeNull();
+    await move({ label: "Agent 1" });
+    expect(pill()!.textContent).toBe("Agent 1");
+    await move({ label: "   " });
+    expect(pill()).toBeNull();
+    await move({ label: "Agent 1" });
+    await move();
+    expect(pill()).toBeNull();
+    await move({ label: 5 });
+    expect(pill()).toBeNull();
+  });
+
+  it("applies a valid colour to arrow, glow and pill, and restores the default", async () => {
+    await move({ label: "A", color: "#ff8800" });
+    expect(topPoly().getAttribute("fill")).toBe("#ff8800");
+    expect(topPoly().getAttribute("stroke")).toBe("#ff8800");
+    expect(document.querySelectorAll("[data-pen-cursor-arrow] polygon")[0].getAttribute("fill")).toBe("#fff");
+    expect(glow().style.background).toContain("rgba(255,136,0,1)");
+    expect(pill()!.style.background).toMatch(/#ff8800|rgb\(255, 136, 0\)/);
+    await move({ label: "A" });
+    expect(topPoly().getAttribute("fill")).toBe("#0d99ff");
+    expect(glow().style.background).toContain("rgba(94,192,232,1)");
+  });
+
+  it.each(["red; x", "#fff", "#gggggg", 12])("falls back to the default for invalid colour %j", async (color) => {
+    await move({ label: "A", color });
+    expect(topPoly().getAttribute("fill")).toBe("#0d99ff");
+    expect(topPoly().getAttribute("stroke")).toBe("#0d99ff");
+    expect(glow().style.background).toContain("rgba(94,192,232,1)");
+  });
+
+  it("uses the exact default glow when the default colour is passed explicitly", async () => {
+    await move({ label: "A", color: "#0D99FF" });
+    expect(glow().style.background).toContain("rgba(94,192,232,1)");
+    expect(topPoly().getAttribute("fill")).toBe("#0d99ff");
+  });
+
+  it("skips redundant writes but a fresh overlay still applies", async () => {
+    await move({ label: "A", color: "#ff8800" });
+    const p = pill()!;
+    p.textContent = "tampered";
+    await move({ label: "A", color: "#ff8800" });
+    expect(pill()!.textContent).toBe("tampered");
+    (window as any).__penCursor.version = "old";
+    await move({ label: "A", color: "#ff8800" });
+    expect(pill()!.textContent).toBe("A");
+  });
+
+  describe("pill edge flip", () => {
+    afterEach(() => {
+      delete (HTMLElement.prototype as any).offsetWidth;
+    });
+    const at = async (x: number, y: number) => {
+      // happy-dom has no layout: stub the one-off pill width measurement.
+      Object.defineProperty(HTMLElement.prototype, "offsetWidth", { get: () => 60, configurable: true });
+      (window as any).innerWidth = 1000;
+      (window as any).innerHeight = 800;
+      await move({ label: "Agent", point: { x, y }, action: "click" });
+    };
+    it("defaults down-right in the middle", async () => {
+      await at(400, 300);
+      expect(pill()!.style.left).toBe("18px");
+      expect(pill()!.style.top).toBe("22px");
+    });
+    it("flips left near the right edge", async () => {
+      await at(990, 300);
+      expect(pill()!.style.left).toBe("-66px");
+      expect(pill()!.style.top).toBe("22px");
+    });
+    it("flips above near the bottom edge", async () => {
+      await at(400, 795);
+      expect(pill()!.style.left).toBe("18px");
+      expect(pill()!.style.top).toBe("-22px");
+    });
+  });
+
+  it("keeps the pill out of SNAPSHOT_JS", async () => {
+    document.body.innerHTML = "<button>Go</button>";
+    await move({ label: "Agent 1" });
+    const snap = run(SNAPSHOT_JS, { maxElements: 50 });
+    expect(JSON.stringify(snap)).not.toContain("Agent 1");
   });
 });
