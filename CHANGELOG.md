@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.6](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.5...v0.4.6) (2026-11-01)
+
+
+### Features
+
+* **cursor:** optional label pill and colour for CURSOR_JS ([398969c](https://github.com/dan-rozhkov/browser-agent/commit/398969c2d0f1a3c3aed39ecf5e4d8ef3fdb7181d))
+
 ## [0.4.5](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.4...v0.4.5) (2026-10-30)
 
 
