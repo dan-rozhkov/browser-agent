@@ -820,15 +820,18 @@ actually rests, never mid-path. Target lookup before the cancel cannot throw
 (null on error), and the outer catch resets rot only if the call owns the
 animation. `sampleAt` wraps the interpolated rot so `state.rot` stays in (-π, π]. Glow stays velocity-based
 (offset back along the velocity, as in cua), independent of rot.
-`CURSOR_VERSION` is `"8"`.
+`CURSOR_VERSION` is `"9"`.
 
-**Label and colour (v8).** Optional `args.label` (trimmed, cut at 24 characters,
+**Label and colour (v9).** Optional `args.label` (trimmed, cut at 24 characters,
 rendered with `textContent` in a `[data-pen-cursor-label]` pill inside the
 non-rotating carrier, down-right of the tip) and `args.color` (only `#rrggbb`;
-else `#0d99ff`; colours the top arrow polygon, the glow and the pill) are applied
+else `#0d99ff`; colours the top arrow polygon and the glow only) are applied
 on every call, so a call without them removes the pill and restores the default.
 Browser tabs pass neither. The consumer (the native-app overlay) picks labels and
-colours; this package ships no palette.
+colours; this package ships no palette. The pill looks like the pen-editor
+Tooltip regardless of colour: `#171717` surface, `#fafafa` 12px/16px text,
+5px radius, `4px 8px` padding (24px tall; `placePill` uses its measured height), a 1px
+hairline ring plus a shadow-lg drop shadow.
 
 **Agent speed.** Every non-reduced plan is multiplied by `MOTION_TIME_SCALE` = 0.4
 (2.5× faster than the cua timings; the cursor used to cost ~0.8s of a ~1.2s

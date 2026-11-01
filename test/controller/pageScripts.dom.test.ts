@@ -832,13 +832,15 @@ describe("CURSOR_JS label and colour", () => {
     expect(pill()).toBeNull();
   });
 
-  it("applies a valid colour to arrow, glow and pill, and restores the default", async () => {
+  it("applies a valid colour to arrow and glow (not the pill), and restores the default", async () => {
     await move({ label: "A", color: "#ff8800" });
     expect(topPoly().getAttribute("fill")).toBe("#ff8800");
     expect(topPoly().getAttribute("stroke")).toBe("#ff8800");
     expect(document.querySelectorAll("[data-pen-cursor-arrow] polygon")[0].getAttribute("fill")).toBe("#fff");
     expect(glow().style.background).toContain("rgba(255,136,0,1)");
-    expect(pill()!.style.background).toMatch(/#ff8800|rgb\(255, 136, 0\)/);
+    // The pill is a dark tooltip surface, independent of the cursor colour.
+    expect(pill()!.style.background).toMatch(/#171717|rgb\(23, 23, 23\)/);
+    expect(pill()!.style.background).not.toMatch(/#ff8800|rgb\(255, 136, 0\)/);
     await move({ label: "A" });
     expect(topPoly().getAttribute("fill")).toBe("#0d99ff");
     expect(glow().style.background).toContain("rgba(94,192,232,1)");
@@ -892,7 +894,7 @@ describe("CURSOR_JS label and colour", () => {
     it("flips above near the bottom edge", async () => {
       await at(400, 795);
       expect(pill()!.style.left).toBe("18px");
-      expect(pill()!.style.top).toBe("-22px");
+      expect(pill()!.style.top).toBe("-30px");
     });
   });
 

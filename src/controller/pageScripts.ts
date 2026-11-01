@@ -5325,7 +5325,7 @@ export const CURSOR_JS = `(() => {
   // (https://github.com/trycua/cua): the whole move is planned once as timed
   // samples (120 Hz), then every animation frame interpolates by elapsed time.
   var args = ${ARGS_MARKER};
-  var CURSOR_VERSION = "8";
+  var CURSOR_VERSION = "9";
 
   ${FIND_BY_TEXT_JS}
 
@@ -5493,6 +5493,7 @@ export const CURSOR_JS = `(() => {
         state.pill = null;
       }
       state.pillWidth = 0;
+      state.pillHeight = 0;
       state.pillSide = "";
       return;
     }
@@ -5500,17 +5501,19 @@ export const CURSOR_JS = `(() => {
       var pill = document.createElement("div");
       pill.setAttribute("data-pen-cursor-label", "1");
       pill.style.cssText =
-        "position:absolute;left:18px;top:22px;padding:0 7px;border-radius:999px;" +
-        "color:#fff;font:600 11px/16px system-ui,-apple-system,sans-serif;" +
-        "box-shadow:0 0 0 1.5px #fff;white-space:nowrap;pointer-events:none;" +
+        "position:absolute;left:18px;top:22px;padding:4px 8px;border-radius:5px;" +
+        "background:#171717;color:#fafafa;font:400 12px/16px system-ui,-apple-system,sans-serif;" +
+        "box-shadow:0 0 0 1px rgba(255,255,255,0.1),0 10px 15px -3px rgba(0,0,0,0.1),0 4px 6px -4px rgba(0,0,0,0.1);" +
+        "white-space:nowrap;pointer-events:none;" +
         "user-select:none;-webkit-user-select:none;";
       state.carrier.appendChild(pill);
       state.pill = pill;
     }
-    state.pill.style.background = color;
     state.pill.textContent = label;
     // Measured once per text change, never per frame.
     state.pillWidth = state.pill.offsetWidth || 0;
+    // 24 = 16px line + 2 * 4px padding, for a layout-less DOM.
+    state.pillHeight = state.pill.offsetHeight || 24;
     state.pillSide = "";
     if (state.pos) placePill(state, state.pos.x, state.pos.y);
   }
@@ -5521,12 +5524,12 @@ export const CURSOR_JS = `(() => {
   function placePill(state, x, y) {
     if (!state.pill) return;
     var flipX = x + 18 + (state.pillWidth || 0) > window.innerWidth;
-    var flipY = y + 22 + 16 > window.innerHeight;
+    var flipY = y + 22 + state.pillHeight > window.innerHeight;
     var side = (flipX ? "l" : "r") + (flipY ? "a" : "b");
     if (state.pillSide === side) return;
     state.pillSide = side;
     state.pill.style.left = (flipX ? -((state.pillWidth || 0) + 6) : 18) + "px";
-    state.pill.style.top = (flipY ? -22 : 22) + "px";
+    state.pill.style.top = (flipY ? -(state.pillHeight + 6) : 22) + "px";
   }
 
   // Stops a still-running animation (a previous move's follow-through, or
