@@ -859,6 +859,20 @@ describe("CURSOR_JS label and colour", () => {
     expect(topPoly().getAttribute("fill")).toBe("#0d99ff");
   });
 
+  it("shadows only the arrow, lightly, on a non-rotating wrapper (not the pill)", async () => {
+    await move({ label: "A", color: "#ff8800" });
+    const carrier = document.querySelector<HTMLElement>("[data-pen-cursor-carrier]")!;
+    const wrap = document.querySelector<HTMLElement>("[data-pen-cursor-arrow-wrap]")!;
+    const arrow = document.querySelector<SVGElement>("[data-pen-cursor-arrow]")!;
+    expect(carrier.style.filter).toBe("");
+    expect(wrap.parentElement).toBe(carrier);
+    expect(arrow.parentElement).toBe(wrap);
+    expect(wrap.style.filter.replace(/\s+/g, "")).toMatch(/^drop-shadow\(01px1pxrgba\(0,0,0,0?\.16\)\)$/);
+    expect((window as any).__penCursor.arrowWrap).toBe(wrap);
+    expect(wrap.style.transform).toBe("");
+    expect(wrap.contains(pill())).toBe(false);
+  });
+
   it("skips redundant writes but a fresh overlay still applies", async () => {
     await move({ label: "A", color: "#ff8800" });
     const p = pill()!;

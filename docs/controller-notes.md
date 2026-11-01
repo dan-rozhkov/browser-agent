@@ -803,8 +803,10 @@ the arrow SVG (`arrowTransform`), with `transform-origin` = `ARROW_PIVOT` =
 1px" pivot guarantee covers the blue fill's rounded tip
 (`test/controller/cursorPlan.test.ts` checks it, and that the pivot is fixed under
 rotate+scale); the white rim's rounded tip extends ~1.5–2px past it, as it
-always did. The drop-shadow filter sits on the non-rotating carrier so the
-shadow always falls downward. The current rot is stored on
+always did. The drop-shadow filter (`0 1px 1px rgba(0,0,0,.16)`, light so it
+does not smudge the white rim on light pages) sits on a non-rotating wrapper
+around the arrow only, so the shadow always falls downward and the label pill
+keeps just its own tooltip shadow. The current rot is stored on
 `window.__penCursor.rot`. **Carry-over:** a new move starts from it (cua
 `from_heading`, no snap) only when the previous move had already *arrived* and
 its settle tail was still playing. A move cancelled mid-flight goes through the
@@ -820,7 +822,7 @@ actually rests, never mid-path. Target lookup before the cancel cannot throw
 (null on error), and the outer catch resets rot only if the call owns the
 animation. `sampleAt` wraps the interpolated rot so `state.rot` stays in (-π, π]. Glow stays velocity-based
 (offset back along the velocity, as in cua), independent of rot.
-`CURSOR_VERSION` is `"9"`.
+`CURSOR_VERSION` is `"10"` (v10: lighter arrow-only shadow).
 
 **Label and colour (v9).** Optional `args.label` (trimmed, cut at 24 characters,
 rendered with `textContent` in a `[data-pen-cursor-label]` pill inside the

@@ -5325,7 +5325,7 @@ export const CURSOR_JS = `(() => {
   // (https://github.com/trycua/cua): the whole move is planned once as timed
   // samples (120 Hz), then every animation frame interpolates by elapsed time.
   var args = ${ARGS_MARKER};
-  var CURSOR_VERSION = "9";
+  var CURSOR_VERSION = "10";
 
   ${FIND_BY_TEXT_JS}
 
@@ -5391,9 +5391,17 @@ export const CURSOR_JS = `(() => {
     var carrier = document.createElement("div");
     carrier.setAttribute("data-pen-cursor-carrier", "1");
     carrier.style.cssText =
-      "position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;will-change:transform;z-index:2147483647;" +
-      // The shadow lives on the NON-rotating carrier so it always falls downward.
-      "filter:drop-shadow(0 1px 2px rgba(0,0,0,.45));";
+      "position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;will-change:transform;z-index:2147483647;";
+
+    // The arrow's shadow lives on a NON-rotating wrapper, so it always falls
+    // downward, and only around the arrow: the label pill (also in the
+    // carrier) keeps its own tooltip shadow. Light on purpose: a darker one
+    // reads as a grey smudge around the white rim on light pages.
+    var arrowWrap = document.createElement("div");
+    arrowWrap.setAttribute("data-pen-cursor-arrow-wrap", "1");
+    arrowWrap.style.cssText =
+      "position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;" +
+      "filter:drop-shadow(0 1px 1px rgba(0,0,0,.16));";
 
     var svgNS = "http://www.w3.org/2000/svg";
     var svg = document.createElementNS(svgNS, "svg");
@@ -5441,7 +5449,8 @@ export const CURSOR_JS = `(() => {
     svg.appendChild(arrowPolygon("#fff", 7.8));
     var arrowTop = arrowPolygon(DEFAULT_COLOR, 5.4);
     svg.appendChild(arrowTop);
-    carrier.appendChild(svg);
+    arrowWrap.appendChild(svg);
+    carrier.appendChild(arrowWrap);
     root.appendChild(carrier);
 
     (document.documentElement || document.body).appendChild(root);
@@ -5453,6 +5462,7 @@ export const CURSOR_JS = `(() => {
       svg: svg,
       ring: ring,
       glow: glow,
+      arrowWrap: arrowWrap,
       arrowTop: arrowTop,
       pill: null,
       pos: priorPos,
