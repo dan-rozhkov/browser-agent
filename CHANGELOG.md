@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.9](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.8...v0.4.9) (2026-11-15)
+
+
+### Bug Fixes
+
+* **controller:** no trusted mouse-down on a dropdown &lt;select&gt; ([efaaad7](https://github.com/dan-rozhkov/browser-agent/commit/efaaad70b9fc038a0a1b5412b5b9dac20c4af3d7))
+
 ## [0.4.8](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.7...v0.4.8) (2026-11-01)
 
 
