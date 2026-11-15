@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.10](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.9...v0.4.10) (2026-11-15)
+
+
+### Bug Fixes
+
+* **controller:** no trusted popup keys on a focused dropdown &lt;select&gt; ([c396c19](https://github.com/dan-rozhkov/browser-agent/commit/c396c19bf133739afd1e8901ccfd9fae088aa22a))
+
 ## [0.4.9](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.8...v0.4.9) (2026-11-15)
 
 
