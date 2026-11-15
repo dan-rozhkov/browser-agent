@@ -72,6 +72,7 @@ import {
   CAPTURE_JS,
   CSS_QUERY_JS,
   TARGET_BUSY_JS,
+  CLICK_STAMPED_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
   CURSOR_JS,
@@ -121,6 +122,7 @@ const SCRIPT_TEMPLATES = {
   CAPTURE_JS,
   CSS_QUERY_JS,
   TARGET_BUSY_JS,
+  CLICK_STAMPED_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
   CURSOR_JS,
@@ -924,6 +926,10 @@ function fixtureResult<T>(result: BrowserCommandResult, stage?: FixtureStage): T
 /** The default error of `lockNavigation` (app mode). */
 export const APP_MODE_LOCK_MESSAGE =
   "This is a desktop app window, not a browser tab. Opening URLs and new tabs is off. Use the elements in the snapshot.";
+
+/** Added to the result of a click on a dropdown `<select>`: the click does not open its options. */
+const NATIVE_SELECT_CLICK_HINT =
+  'This is a dropdown <select>; clicking it does not open its options. Use action "select" with the option\'s text or value.';
 
 function errorResult(message: string): BrowserCommandResult {
   return { error: message };
@@ -2845,6 +2851,10 @@ export class BrowserController {
    * `__targetSelfDisabled` the same way the DOM path does inline. Reports
    * `via: "cdp"`.
    *
+   * A dropdown `<select>` target (`nativePopup`) also takes the DOM path: a
+   * trusted mouse-down would open the native popup (a blocking modal NSMenu
+   * in Electron on macOS), while `el.click()` does not.
+   *
    * Any other outcome — the hit-test failed (covered, zero-size, offscreen
    * after scroll), no CDP session, or the trusted dispatch itself threw —
    * falls back to the pre-existing DOM click entirely (a fresh resolve, not
@@ -2989,7 +2999,10 @@ export class BrowserController {
     const scopedBefore = extractScopedBefore(located);
     const busyBefore = extractBusyBefore(located);
 
-    if (located.hitOk === true && page.sendCdp) {
+    // `nativePopup` (a dropdown <select>): a trusted mouse-down opens the
+    // native popup, an NSMenu with a modal run loop on macOS Electron that
+    // blocks the main process until dismissed, so use the DOM click instead.
+    if (located.hitOk === true && located.nativePopup !== true && page.sendCdp) {
       const x = located.x as number;
       const y = located.y as number;
       // Code review finding 8: whether `Input.dispatchMouseEvent`'s
@@ -3035,6 +3048,21 @@ export class BrowserController {
         // dropped mid-command) must not turn a click that would otherwise
         // have worked via el.click() into a hard failure.
       }
+    }
+
+    // A dropdown select: click the element CLICK_RESOLVE_JS stamped (no
+    // re-resolve, which could match something else) and tell the model the
+    // popup did not open, so it does not loop on clicks.
+    if (located.nativePopup === true) {
+      const domResult = await this.executeScript(page, "CLICK_STAMPED_JS", {});
+      if ("error" in domResult) return domResult;
+      return {
+        ...domResult,
+        matched: located.matched,
+        via: "dom",
+        __scopedBefore: scopedBefore,
+        hint: NATIVE_SELECT_CLICK_HINT,
+      };
     }
 
     // DOM fallback — re-resolves independently (CLICK_JS/PERFORM_JS already

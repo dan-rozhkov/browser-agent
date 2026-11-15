@@ -4516,6 +4516,69 @@ describe("BrowserController — Wave 1 speed", () => {
         expect(sendCdp).toHaveBeenCalledWith("Input.dispatchMouseEvent", expect.objectContaining({ type: "mousePressed" }));
       });
 
+      it("a dropdown select target (nativePopup) skips the trusted click and uses the DOM click, via: \"dom\"", async () => {
+        const sendCdp = vi.fn((_method: string, _params?: Record<string, unknown>) => Promise.resolve({}));
+        const page = makeFakePage({
+          getURL: vi.fn(() => "https://x/"),
+          getTitle: vi.fn(() => "X"),
+          sendCdp,
+          executeJavaScript: vi.fn((code: string) => {
+            if (isSignatureCall(code) || isCursorCall(code)) return Promise.resolve({ ok: true });
+            if (isResolveCall(code)) return Promise.resolve({ found: true, x: 12, y: 34, hitOk: true, nativePopup: true, matched: "Select" });
+            return Promise.resolve({ url: "https://x/", title: "X", matched: "Select" });
+          }),
+        });
+        const controller = new BrowserController(makeFakeTarget(page));
+        const result = await controller.act({ action: "click", target: "Select" });
+        expect(result).toMatchObject({ via: "dom", matched: "Select", hint: expect.stringContaining('action "select"') });
+        expect(sendCdp).not.toHaveBeenCalledWith("Input.dispatchMouseEvent", expect.anything());
+        // The stamped element is clicked: neither CLICK_JS nor PERFORM_JS re-resolves it.
+        const codes = (page.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string);
+        expect(codes.some((c) => c.includes("the stamped click target is gone"))).toBe(true);
+        expect(codes.some((c) => c.includes("matched: target,"))).toBe(false);
+      });
+
+      it("index+snapshotId click on a dropdown select also uses the DOM path", async () => {
+        const sendCdp = vi.fn((_method: string, _params?: Record<string, unknown>) => Promise.resolve({}));
+        const page = makeFakePage({
+          getURL: vi.fn(() => "https://x/"),
+          getTitle: vi.fn(() => "X"),
+          sendCdp,
+          executeJavaScript: vi.fn((code: string) => {
+            if (isSignatureCall(code) || isCursorCall(code)) return Promise.resolve({ ok: true });
+            if (isResolveCall(code)) return Promise.resolve({ found: true, x: 1, y: 2, hitOk: true, nativePopup: true });
+            if (isBusyCall(code)) return Promise.resolve({ present: false, busy: false });
+            return Promise.resolve({ ok: true });
+          }),
+        });
+        const controller = new BrowserController(makeFakeTarget(page));
+        const snapshot = (await controller.snapshot()) as { snapshotId: string };
+        const result = await controller.perform({ snapshotId: snapshot.snapshotId, index: 0, operation: "CLICK" });
+        expect(result).toMatchObject({ via: "dom", hint: expect.stringContaining("dropdown") });
+        expect(sendCdp).not.toHaveBeenCalledWith("Input.dispatchMouseEvent", expect.anything());
+        const codes = (page.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string);
+        expect(codes.some((c) => c.includes("the stamped click target is gone"))).toBe(true);
+      });
+
+      it("nativePopup: false (ordinary button, multiple or listbox select) still gets the trusted click", async () => {
+        const sendCdp = vi.fn((_method: string, _params?: Record<string, unknown>) => Promise.resolve({}));
+        const page = makeFakePage({
+          getURL: vi.fn(() => "https://x/"),
+          getTitle: vi.fn(() => "X"),
+          sendCdp,
+          executeJavaScript: vi.fn((code: string) => {
+            if (isSignatureCall(code) || isCursorCall(code)) return Promise.resolve({ ok: true });
+            if (isResolveCall(code)) return Promise.resolve({ found: true, x: 12, y: 34, hitOk: true, nativePopup: false, matched: "List" });
+            if (isBusyCall(code)) return Promise.resolve({ present: true, busy: false });
+            return Promise.resolve({ ok: true });
+          }),
+        });
+        const controller = new BrowserController(makeFakeTarget(page));
+        const result = await controller.act({ action: "click", target: "List" });
+        expect(result).toMatchObject({ via: "cdp" });
+        expect(sendCdp).toHaveBeenCalledWith("Input.dispatchMouseEvent", expect.objectContaining({ type: "mousePressed" }));
+      });
+
       it("target text resolving to only a hidden element is refused, not clicked", async () => {
         const page = makeFakePage({
           executeJavaScript: vi.fn((code: string) => {

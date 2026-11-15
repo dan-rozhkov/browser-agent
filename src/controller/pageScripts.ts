@@ -2808,6 +2808,33 @@ export const TYPE_JS = `(() => {
 })()`;
 
 /**
+ * `penDropdownSelectOf(node)`: the closed-dropdown <select> that `node` is or
+ * sits in (a <select>, or an <option>/<optgroup> inside one), else null. A
+ * dropdown is `!multiple && !(size > 1)` (the same split roleOf makes between
+ * combobox and listbox); a customizable select (`appearance: base-select`)
+ * is excluded, since it renders an in-page picker, not a native popup.
+ */
+const NATIVE_SELECT_HELPER_JS = `
+  function penDropdownSelectOf(node) {
+    var sel = null;
+    var guard = 0;
+    while (node && guard < 5) {
+      var tag = node.nodeType === 1 && node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "select") { sel = node; break; }
+      if (tag !== "option" && tag !== "optgroup") return null;
+      node = node.parentNode;
+      guard++;
+    }
+    if (!sel) return null;
+    if (sel.multiple || sel.hasAttribute("multiple") || Number(sel.size) > 1 || Number(sel.getAttribute("size")) > 1) return null;
+    try {
+      if (typeof getComputedStyle === "function" && String(getComputedStyle(sel).appearance) === "base-select") return null;
+    } catch (err) {}
+    return sel;
+  }
+`;
+
+/**
  * Wave 2 reliability, item 1/2: resolves a click/type target — by `target`
  * text/selector (LOCATE_TARGET_JS's text-first order, same as CLICK_JS/
  * TYPE_JS) or by `index`+`snapshotId` (the existing PERFORM_JS lookup) —
@@ -2836,6 +2863,12 @@ export const TYPE_JS = `(() => {
  * event at an off-screen or invisible point is not meaningfully "a click on
  * this element" even if some other element happens to occupy that point.
  *
+ * Also reports `nativePopup`: true when the target is a dropdown `<select>`
+ * (not `multiple`, `size` <= 1) or an `<option>` inside one. A trusted
+ * mouse-down on it opens the native select popup, which in Electron on macOS
+ * is an NSMenu with a nested modal run loop that blocks the main process, so
+ * `dispatchClick` must not send CDP mouse events for it.
+ *
  * Also reports `editable` (code review finding 4) — a read-only tag/
  * `isContentEditable` check, the same one `SELECT_ALL_CONTENT_JS` uses —
  * so `controller.ts`'s `dispatchType` can check it BEFORE sending any
@@ -2850,6 +2883,7 @@ export const CLICK_RESOLVE_JS = `(() => {
   ${SCOPED_SIGNATURE_JS}
   ${TARGET_BUSY_HELPER_JS}
   ${FOCUS_FOLLOW_HELPER_JS}
+  ${NATIVE_SELECT_HELPER_JS}
 
   var located = locateTarget(args);
   if (located.hidden) return { error: "target is not visible (hidden element)", noEffect: true };
@@ -2907,11 +2941,28 @@ export const CLICK_RESOLVE_JS = `(() => {
     tagForEditable === "textarea" ||
     el.isContentEditable === true;
 
+  // A dropdown <select> (not multiple, size <= 1; including an <option>/
+  // <optgroup> inside one) opens a native popup on a trusted mouse-down; in
+  // Electron on macOS that is an NSMenu with a nested modal loop that blocks
+  // the main process. It is looked for on the target AND on the element the
+  // hit-test lands on (a label/wrapper target whose inner or overlaid select
+  // takes the click). A customizable select (appearance: base-select) renders
+  // an in-page picker, not a native popup. dispatchClick then clicks the
+  // stamped select through the DOM (CLICK_STAMPED_JS) instead.
+  var popupSelect = penDropdownSelectOf(el);
+  if (!popupSelect && hitOk) {
+    var hitNode = elementFromPointDeep(x, y);
+    if (hitNode) popupSelect = penDropdownSelectOf(hitNode);
+  }
+  var nativePopup = popupSelect !== null;
+  if (nativePopup && popupSelect !== el) penStampSigTarget(popupSelect);
+
   var result = {
     found: true,
     x: x,
     y: y,
     hitOk: hitOk,
+    nativePopup: nativePopup,
     editable: editable,
     __scopedBefore: scopedBefore,
     __busyBefore: busyBefore,
@@ -2919,6 +2970,27 @@ export const CLICK_RESOLVE_JS = `(() => {
   if (typeof args.target === "string") result.matched = args.target;
   if (located.relocated) result.relocated = true;
   return result;
+})()`;
+
+/**
+ * The DOM click for a `nativePopup` target (see CLICK_RESOLVE_JS): clicks the
+ * element CLICK_RESOLVE_JS stamped (the dropdown <select> itself), without
+ * re-resolving the target, which could match a different element. Returns
+ * the same shape CLICK_JS does, minus `matched`/`__scopedBefore`, which the
+ * controller already has from the resolve step.
+ */
+export const CLICK_STAMPED_JS = `(() => {
+  ${TARGET_BUSY_HELPER_JS}
+  ${SIG_TARGET_HELPER_JS}
+  var el = penFindSigTarget();
+  if (!el) return { error: "No element matched: the stamped click target is gone", noEffect: true };
+  var busyBefore = penTargetIsBusy(el);
+  el.click();
+  return {
+    url: location.href,
+    title: document.title,
+    __targetSelfDisabled: !busyBefore && penTargetIsBusy(el),
+  };
 })()`;
 
 /**

@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { ARGS_MARKER, CAPTURE_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
+import { ARGS_MARKER, CAPTURE_JS, CLICK_RESOLVE_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
 import { BrowserController } from "../../src/controller/controller.js";
 
 /** Runs a page script in the happy-dom document, like page.evaluate would. */
@@ -917,5 +917,54 @@ describe("CURSOR_JS label and colour", () => {
     await move({ label: "Agent 1" });
     const snap = run(SNAPSHOT_JS, { maxElements: 50 });
     expect(JSON.stringify(snap)).not.toContain("Agent 1");
+  });
+});
+
+describe("CLICK_RESOLVE_JS nativePopup", () => {
+  function resolve(html: string, target: string): any {
+    document.body.innerHTML = html;
+    return run(CLICK_RESOLVE_JS, { target });
+  }
+
+  it("is true for a dropdown select, and for an option inside one", () => {
+    const html = '<select id="s"><option id="o">Alpha</option><option>Beta</option></select>';
+    expect(resolve(html, "#s").nativePopup).toBe(true);
+    expect(resolve(html, "#o").nativePopup).toBe(true);
+  });
+
+  it("is true for size=1 and is false for multiple or size>1 selects", () => {
+    expect(resolve('<select id="s" size="1"><option>A</option></select>', "#s").nativePopup).toBe(true);
+    expect(resolve('<select id="s" multiple><option>A</option></select>', "#s").nativePopup).toBe(false);
+    expect(resolve('<select id="s" size="4"><option>A</option></select>', "#s").nativePopup).toBe(false);
+    expect(resolve('<select id="s" size="4"><option id="o">A</option></select>', "#o").nativePopup).toBe(false);
+  });
+
+  it("is true when the hit lands on an inner select of a label or an overlaid select of a wrapper", () => {
+    const orig = document.elementFromPoint;
+    try {
+      document.body.innerHTML = '<label id="l">Country <select id="s"><option>A</option></select></label>';
+      document.elementFromPoint = () => document.getElementById("s");
+      const r = run(CLICK_RESOLVE_JS, { target: "#l" });
+      expect(r.hitOk).toBe(true);
+      expect(r.nativePopup).toBe(true);
+      expect(document.querySelector("[data-pen-sig-target]")?.id).toBe("s");
+    } finally {
+      document.elementFromPoint = orig;
+    }
+  });
+
+  it("is false for a customizable (base-select) select", () => {
+    document.body.innerHTML = '<select id="s"><option>A</option></select>';
+    const orig = window.getComputedStyle;
+    (window as any).getComputedStyle = () => ({ appearance: "base-select" });
+    try {
+      expect(run(CLICK_RESOLVE_JS, { target: "#s" }).nativePopup).toBe(false);
+    } finally {
+      (window as any).getComputedStyle = orig;
+    }
+  });
+
+  it("is false for an ordinary button", () => {
+    expect(resolve('<button id="b">Go</button>', "#b").nativePopup).toBe(false);
   });
 });
