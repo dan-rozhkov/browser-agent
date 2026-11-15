@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { ARGS_MARKER, CAPTURE_JS, CLICK_RESOLVE_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
+import { ARGS_MARKER, CAPTURE_JS, CLICK_RESOLVE_JS, FOCUSED_SELECT_KEY_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
 import { BrowserController } from "../../src/controller/controller.js";
 
 /** Runs a page script in the happy-dom document, like page.evaluate would. */
@@ -966,5 +966,145 @@ describe("CLICK_RESOLVE_JS nativePopup", () => {
 
   it("is false for an ordinary button", () => {
     expect(resolve('<button id="b">Go</button>', "#b").nativePopup).toBe(false);
+  });
+});
+
+describe("FOCUSED_SELECT_KEY_JS", () => {
+  const OPTS = '<option>A</option><option>B</option><option>C</option>';
+  function press(key: string, mods: Partial<{ alt: boolean; ctrl: boolean; meta: boolean; shift: boolean }> = {}): any {
+    return run(FOCUSED_SELECT_KEY_JS, { key, alt: false, ctrl: false, meta: false, shift: false, ...mods });
+  }
+  function setup(html: string, id = "s"): HTMLSelectElement {
+    document.body.innerHTML = html;
+    const sel = document.getElementById(id) as HTMLSelectElement;
+    sel.focus();
+    return sel;
+  }
+  function track(sel: HTMLSelectElement): string[] {
+    const events: string[] = [];
+    sel.addEventListener("input", () => events.push("input"));
+    sel.addEventListener("change", () => events.push("change"));
+    return events;
+  }
+
+  it("ArrowDown moves to the next option and fires input then change", () => {
+    const sel = setup(`<select id="s">${OPTS}</select>`);
+    const events = track(sel);
+    const r = press("ArrowDown");
+    expect(r).toMatchObject({ handled: true, moved: true, from: 0, to: 1, value: "B" });
+    expect(sel.selectedIndex).toBe(1);
+    expect(events).toEqual(["input", "change"]);
+  });
+
+  it("ArrowUp at the first option and ArrowDown at the last stay put without events", () => {
+    const sel = setup(`<select id="s">${OPTS}</select>`);
+    const events = track(sel);
+    expect(press("ArrowUp")).toMatchObject({ handled: true, moved: false });
+    sel.selectedIndex = 2;
+    expect(press("ArrowDown")).toMatchObject({ handled: true, moved: false });
+    expect(sel.selectedIndex).toBe(2);
+    expect(events).toEqual([]);
+  });
+
+  it("skips disabled options and options in a disabled optgroup", () => {
+    const sel = setup(
+      '<select id="s"><option>A</option><option disabled>B</option><optgroup disabled><option>C</option></optgroup><option>D</option></select>',
+    );
+    expect(press("ArrowDown")).toMatchObject({ moved: true, to: 3, text: "D" });
+    expect(sel.selectedIndex).toBe(3);
+    expect(press("ArrowUp")).toMatchObject({ moved: true, to: 0 });
+  });
+
+  it("an arrow with any modifier, and Space or F4 with or without one, are handled no-ops", () => {
+    const sel = setup(`<select id="s">${OPTS}</select>`);
+    const events = track(sel);
+    for (const r of [
+      press(" "),
+      press(" ", { ctrl: true }),
+      press("F4"),
+      press("ArrowDown", { alt: true }),
+      press("ArrowUp", { alt: true }),
+      press("ArrowDown", { meta: true }),
+      press("ArrowDown", { ctrl: true }),
+      press("ArrowDown", { shift: true }),
+    ]) {
+      expect(r).toMatchObject({ handled: true, moved: false });
+    }
+    expect(sel.selectedIndex).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it("leaves Enter, letters, Tab and Ctrl/Meta combos to the trusted dispatch", () => {
+    setup(`<select id="s">${OPTS}</select>`);
+    for (const r of [press("Enter"), press("a"), press("Tab"), press("Escape"), press("a", { meta: true }), press("ArrowLeft")]) {
+      expect(r).toEqual({ handled: false });
+    }
+  });
+
+  it("does not handle a multiple/listbox select or a text input", () => {
+    setup(`<select id="s" multiple>${OPTS}</select>`);
+    expect(press("ArrowDown")).toEqual({ handled: false });
+    setup(`<select id="s" size="4">${OPTS}</select>`);
+    expect(press("ArrowDown")).toEqual({ handled: false });
+    setup('<input id="s">');
+    expect(press("ArrowDown")).toEqual({ handled: false });
+    document.body.innerHTML = "<button id='b'>x</button>";
+    expect(press(" ")).toEqual({ handled: false });
+  });
+
+  it("does not handle a customizable (base-select) select", () => {
+    setup(`<select id="s">${OPTS}</select>`);
+    const orig = window.getComputedStyle;
+    (window as any).getComputedStyle = () => ({ appearance: "base-select" });
+    try {
+      expect(press("ArrowDown")).toEqual({ handled: false });
+    } finally {
+      (window as any).getComputedStyle = orig;
+    }
+  });
+
+  it("finds a select focused inside an open shadow root", () => {
+    document.body.innerHTML = '<div id="host"></div>';
+    const root = document.getElementById("host")!.attachShadow({ mode: "open" });
+    root.innerHTML = `<select id="in">${OPTS}</select>`;
+    const sel = root.getElementById("in") as HTMLSelectElement;
+    sel.focus();
+    expect(press("ArrowDown")).toMatchObject({ handled: true, moved: true, to: 1 });
+    expect(sel.selectedIndex).toBe(1);
+  });
+
+  it("skips hidden options and options with display: none", () => {
+    const sel = setup('<select id="s"><option>A</option><option hidden>B</option><option id="c">C</option><option>D</option></select>');
+    const orig = window.getComputedStyle;
+    (window as any).getComputedStyle = (el: Element) => ({ display: el.id === "c" ? "none" : "block", appearance: "auto" });
+    try {
+      expect(press("ArrowDown")).toMatchObject({ moved: true, to: 3 });
+    } finally {
+      (window as any).getComputedStyle = orig;
+    }
+    expect(sel.selectedIndex).toBe(3);
+  });
+
+  it("dispatches input as bubbling and composed, change as bubbling", () => {
+    const sel = setup(`<select id="s">${OPTS}</select>`);
+    const seen: Record<string, Event> = {};
+    sel.addEventListener("input", (e) => (seen.input = e));
+    sel.addEventListener("change", (e) => (seen.change = e));
+    press("ArrowDown");
+    expect(seen.input.bubbles).toBe(true);
+    expect(seen.input.composed).toBe(true);
+    expect(seen.change.bubbles).toBe(true);
+  });
+
+  it("reports opaqueFrame when focus sits in a frame whose document cannot be read", () => {
+    document.body.innerHTML = "<div></div>";
+    const fake = { tagName: "IFRAME", shadowRoot: null, get contentDocument() { throw new Error("cross-origin"); } };
+    Object.defineProperty(document, "activeElement", { get: () => fake, configurable: true });
+    try {
+      expect(press("ArrowDown")).toEqual({ handled: false, opaqueFrame: true });
+      expect(press("Enter")).toEqual({ handled: false });
+    } finally {
+      delete (document as any).activeElement;
+    }
   });
 });

@@ -58,7 +58,7 @@ import {
 } from "./captureCss.js";
 import { validateUploadFiles, type UploadPayloadFile } from "./uploadFiles.js";
 import { isPlaceholderPageUrl } from "../shared/placeholderUrl.js";
-import { parseKeySpec, resolveNamedKey, keyDispatchOptions, dispatchKeyPair as dispatchKeyPairShared } from "./keys.js";
+import { parseKeySpec, resolveNamedKey, keyDispatchOptions, dispatchKeyPair as dispatchKeyPairShared, type ParsedKeySpec } from "./keys.js";
 import {
   ARGS_MARKER,
   FIND_IMAGES_JS,
@@ -73,6 +73,7 @@ import {
   CSS_QUERY_JS,
   TARGET_BUSY_JS,
   CLICK_STAMPED_JS,
+  FOCUSED_SELECT_KEY_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
   CURSOR_JS,
@@ -123,6 +124,7 @@ const SCRIPT_TEMPLATES = {
   CSS_QUERY_JS,
   TARGET_BUSY_JS,
   CLICK_STAMPED_JS,
+  FOCUSED_SELECT_KEY_JS,
   AUTOCOMPLETE_STATE_JS,
   DISMISS_DIALOG_STATE_JS,
   CURSOR_JS,
@@ -930,6 +932,10 @@ export const APP_MODE_LOCK_MESSAGE =
 /** Added to the result of a click on a dropdown `<select>`: the click does not open its options. */
 const NATIVE_SELECT_CLICK_HINT =
   'This is a dropdown <select>; clicking it does not open its options. Use action "select" with the option\'s text or value.';
+
+/** Added to the result of a key press on a focused dropdown `<select>`: keys that open its options are not sent. */
+const NATIVE_SELECT_KEY_HINT =
+  'This is a dropdown <select>; keys that open its options are not sent. Use action "select" with the option\'s text or value.';
 
 function errorResult(message: string): BrowserCommandResult {
   return { error: message };
@@ -1882,6 +1888,7 @@ export class BrowserController {
         },
         press: async (page, key) => {
           if (!page.sendCdp) return false;
+          if (await this.handleSelectKey(page, key, null)) return true;
           await this.dispatchKeyPair(page, key.descriptor, keyDispatchOptions(key));
           return true;
         },
@@ -3793,6 +3800,11 @@ export class BrowserController {
     const networkBaseline = this.captureNetworkBaseline(page);
 
     const { descriptor } = parsed;
+    // A key that would open a focused dropdown <select>'s native popup is
+    // handled through the DOM instead (see handleSelectKey).
+    // The check runs in the document the focus step used; with no focus step, the top document.
+    const focusRan = Boolean(focus.target) || hasIndexTarget;
+    const selectKey = await this.handleSelectKey(page, parsed, focusRan ? frameRoute.frameId : null);
     // Review finding 2: a Meta/Ctrl-modified combo (Cmd+A, Ctrl+C, …) is
     // sent as a *textless* event with CDP's `commands` field naming the
     // editing command (see `keyDispatchOptions`) — Chromium doesn't run its
@@ -3800,11 +3812,13 @@ export class BrowserController {
     // way it would a genuine OS-level shortcut, and `text` alongside a
     // modified combo would insert the literal character "a" on Cmd+A.
     const dispatchOpts = keyDispatchOptions(parsed);
-    try {
-      await this.dispatchKeyPair(page, descriptor, dispatchOpts);
-    } catch (err) {
-      navWatcher.dispose();
-      return errorResult(`Failed to dispatch key "${keySpec}": ${toMessage(err)}`);
+    if (!selectKey) {
+      try {
+        await this.dispatchKeyPair(page, descriptor, dispatchOpts);
+      } catch (err) {
+        navWatcher.dispose();
+        return errorResult(`Failed to dispatch key "${keySpec}": ${toMessage(err)}`);
+      }
     }
 
     // Wave 1 speed: Enter routinely submits a form — the same event-driven
@@ -3827,7 +3841,67 @@ export class BrowserController {
       ...this.diffSignatures(before, after, { previousUrl, currentUrl }),
     };
     if (openedTab) result.openedTab = openedTab;
+    if (selectKey) {
+      result.via = "dom";
+      result.hint = NATIVE_SELECT_KEY_HINT;
+      result.moved = selectKey.moved === true;
+      if (selectKey.moved === true) {
+        result.selected = { value: String(selectKey.value ?? ""), text: String(selectKey.text ?? "") };
+      }
+    }
     return result;
+  }
+
+  /** A key press on a focused dropdown `<select>`: a key that opens the native
+   * popup (ArrowDown/ArrowUp, Alt+Arrow, Space, F4) is never sent as a trusted
+   * CDP event (in Electron on macOS the popup is an NSMenu whose modal run loop
+   * blocks the main process). FOCUSED_SELECT_KEY_JS handles it in the page
+   * instead (plain arrows move the selection and fire input + change) and this
+   * returns true. Returns false for any other focus or key, and when the check
+   * itself fails (then the trusted dispatch runs as before). `frameId` is the
+   * frame the focus step used (null: the top document). */
+  private async handleSelectKey(
+    page: BrowserPageHandle,
+    parsed: ParsedKeySpec,
+    frameId: number | null,
+  ): Promise<BrowserCommandResult | null> {
+    const args = {
+      key: parsed.descriptor.key,
+      alt: parsed.modifiers.alt,
+      ctrl: parsed.modifiers.ctrl,
+      meta: parsed.modifiers.meta,
+      shift: parsed.modifiers.shift,
+    };
+    // Fail open on purpose: a check that cannot run (error, exception) means
+    // we could not see a select, so the key is sent as before.
+    try {
+      const res =
+        frameId === null
+          ? await this.executeScript(page, "FOCUSED_SELECT_KEY_JS", args)
+          : await this.executeScriptInFrame(page, frameId, "FOCUSED_SELECT_KEY_JS", args);
+      if ("error" in res) return null;
+      if (res.handled === true) return res;
+      if (res.opaqueFrame !== true || !page.listFrames || !page.executeJavaScriptInFrame) return null;
+      // Focus sits in a frame the top document cannot read: ask the child
+      // frames, and use the one whose document has focus on a select.
+      let frames: { frameId: number }[];
+      try {
+        frames = page.listFrames().slice(0, MAX_BROWSER_FRAMES);
+      } catch {
+        return null;
+      }
+      for (const f of frames) {
+        try {
+          const r = await this.executeScriptInFrame(page, f.frameId, "FOCUSED_SELECT_KEY_JS", args);
+          if (!("error" in r) && r.handled === true && r.focusedHere === true) return r;
+        } catch {
+          // A frame that cannot be queried is skipped.
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /** `act`'s `hover` — locates the target (HOVER_TARGET_JS), then dispatches

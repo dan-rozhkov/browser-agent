@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { ARGS_MARKER, FOCUSED_SELECT_KEY_JS } from "../../src/controller/pageScripts.js";
 import {
   BrowserController,
   AUTOCOMPLETE_SETTLE_MS,
@@ -3167,6 +3168,107 @@ describe("act: press", () => {
     const controller = new BrowserController(makeFakeTarget(page));
     const result = await controller.act({ action: "press", key: "Enter" });
     expect(String((result as { error: string }).error)).toMatch(/CDP/i);
+  });
+
+  describe("focused dropdown select", () => {
+    // Recognises the FOCUSED_SELECT_KEY_JS call by its template (prefix and suffix around the args), not by a fragment of its source.
+    const [tplHead, tplTail] = FOCUSED_SELECT_KEY_JS.split(ARGS_MARKER);
+    const isSelectKeyCall = (code: unknown) => typeof code === "string" && code.startsWith(tplHead) && code.endsWith(tplTail);
+    const argsOf = (code: string) => JSON.parse(code.slice(tplHead.length, code.length - tplTail.length)) as Record<string, unknown>;
+    const keyEvents = (sendCdp: ReturnType<typeof vi.fn>) => sendCdp.mock.calls.filter((c) => c[0] === "Input.dispatchKeyEvent");
+    const selectCalls = (fn: unknown) => (fn as ReturnType<typeof vi.fn>).mock.calls.filter((c) => isSelectKeyCall(c[0]));
+
+    function setup(selectAnswer: Record<string, unknown>, extra: Partial<BrowserPageHandle> = {}) {
+      const sendCdp = vi.fn((_method: string, _params?: Record<string, unknown>) => Promise.resolve({}));
+      const base = makeFakePage({ sendCdp });
+      const page = makeFakePage({
+        sendCdp,
+        executeJavaScript: vi.fn((code: string) => {
+          if (isSelectKeyCall(code)) return Promise.resolve(selectAnswer);
+          return (base.executeJavaScript as (c: string) => Promise<unknown>)(code);
+        }),
+        ...extra,
+      });
+      return { sendCdp, page, controller: new BrowserController(makeFakeTarget(page)) };
+    }
+
+    it.each(["ArrowDown", "ArrowUp", "Space", "Alt+ArrowDown", "Meta+ArrowDown", "Shift+ArrowDown"])(
+      "%s on a dropdown select sends no key event, adds the hint and via dom",
+      async (key) => {
+        const { sendCdp, page, controller } = setup({ handled: true, moved: false });
+        const result = await controller.act({ action: "press", key });
+        expect(result).not.toHaveProperty("error");
+        expect(keyEvents(sendCdp)).toHaveLength(0);
+        expect(result).toMatchObject({ via: "dom", moved: false, hint: expect.stringContaining("dropdown <select>") });
+        const calls = selectCalls(page.executeJavaScript);
+        expect(calls).toHaveLength(1);
+        expect(argsOf(calls[0][0] as string)).toMatchObject({ key: key.endsWith("Space") ? " " : key.split("+").pop() });
+      },
+    );
+
+    it("passes the modifiers to the page script", async () => {
+      const { page, controller } = setup({ handled: true, moved: false });
+      await controller.act({ action: "press", key: "Alt+ArrowDown" });
+      expect(argsOf(selectCalls(page.executeJavaScript)[0][0] as string)).toMatchObject({ alt: true, ctrl: false, meta: false });
+    });
+
+    it("a moved selection is reported in the result", async () => {
+      const { sendCdp, controller } = setup({ handled: true, moved: true, value: "b", text: "Beta" });
+      const result = await controller.act({ action: "press", key: "ArrowDown" });
+      expect(keyEvents(sendCdp)).toHaveLength(0);
+      expect(result).toMatchObject({ via: "dom", moved: true, selected: { value: "b", text: "Beta" } });
+    });
+
+    it("a key the script does not handle (Enter, multiple select, text input) is dispatched as before", async () => {
+      const { sendCdp, controller } = setup({ handled: false });
+      const result = await controller.act({ action: "press", key: "Enter" });
+      expect(result).not.toHaveProperty("hint");
+      expect(result).not.toHaveProperty("via");
+      expect(keyEvents(sendCdp)).toHaveLength(2);
+    });
+
+    // Deliberate fail-open: a check that cannot run means we could not see a select, so the key is sent as before.
+    it("fails open: a failing check script sends the trusted key as before", async () => {
+      const { sendCdp, controller } = setup({ error: "boom" });
+      await controller.act({ action: "press", key: "ArrowDown" });
+      expect(keyEvents(sendCdp)).toHaveLength(2);
+    });
+
+    it("with no focus step the check runs in the top document, even for an index with no snapshotId", async () => {
+      const executeJavaScriptInFrame = vi.fn(() => Promise.resolve({ handled: false }));
+      const { page, controller } = setup({ handled: true, moved: false }, { executeJavaScriptInFrame, listFrames: vi.fn(() => []) });
+      (controller as any).lastSnapshot = { frameMap: new Map([[5, { frameId: 7, localIndex: 0 }]]), frameRects: new Map() };
+      // act() rejects an index without a snapshotId, so call runPress directly.
+      await (controller as any).runPress("ArrowDown", { index: 5 });
+      expect(selectCalls(page.executeJavaScript)).toHaveLength(1);
+      expect(executeJavaScriptInFrame).not.toHaveBeenCalled();
+    });
+
+    it("opaqueFrame: the child frames are checked and a focused select there blocks the trusted key", async () => {
+      const executeJavaScriptInFrame = vi.fn((frameId: number) =>
+        Promise.resolve(frameId === 2 ? { handled: true, moved: false, focusedHere: true } : { handled: true, moved: false, focusedHere: false }),
+      );
+      const { sendCdp, controller } = setup(
+        { handled: false, opaqueFrame: true },
+        { listFrames: vi.fn(() => [{ frameId: 1, url: "https://a/", name: "" }, { frameId: 2, url: "https://b/", name: "" }]), executeJavaScriptInFrame },
+      );
+      const result = await controller.act({ action: "press", key: "ArrowDown" });
+      expect(keyEvents(sendCdp)).toHaveLength(0);
+      expect(result).toMatchObject({ via: "dom", hint: expect.stringContaining("dropdown") });
+      expect(executeJavaScriptInFrame).toHaveBeenCalledTimes(2);
+    });
+
+    it("opaqueFrame: no child frame holds a focused select, or one throws, so the key is sent", async () => {
+      const executeJavaScriptInFrame = vi.fn((frameId: number) =>
+        frameId === 1 ? Promise.reject(new Error("gone")) : Promise.resolve({ handled: false }),
+      );
+      const { sendCdp, controller } = setup(
+        { handled: false, opaqueFrame: true },
+        { listFrames: vi.fn(() => [{ frameId: 1, url: "https://a/", name: "" }, { frameId: 2, url: "https://b/", name: "" }]), executeJavaScriptInFrame },
+      );
+      await controller.act({ action: "press", key: "ArrowDown" });
+      expect(keyEvents(sendCdp)).toHaveLength(2);
+    });
   });
 
   it("dispatches a keyDown+keyUp pair via CDP with the resolved key/modifiers", async () => {

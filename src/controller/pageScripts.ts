@@ -2835,6 +2835,87 @@ const NATIVE_SELECT_HELPER_JS = `
 `;
 
 /**
+ * `press` on a focused dropdown <select>. Keys that open the native popup
+ * (ArrowDown, ArrowUp, Alt+Arrow, Space, F4) must never arrive as trusted CDP
+ * key events: in Electron on macOS the popup is an NSMenu whose modal run loop
+ * blocks the main process. The script finds the focused element (descending
+ * through open shadow roots and same-origin iframes; a cross-origin frame is
+ * skipped), and when it is a dropdown select (see penDropdownSelectOf) it
+ * handles those keys itself: plain ArrowDown/ArrowUp move to the next/previous
+ * enabled option and fire bubbling input then change (like Chromium on
+ * Windows/Linux for a closed select); the others do nothing. Returns
+ * { handled: false } for any other focus or key ({ handled: false, opaqueFrame: true } when
+ * focus sits in a frame whose document cannot be read; the caller then runs it in the child frames, using `focusedHere`), so the caller dispatches the
+ * trusted key as usual. Args: { key, alt, ctrl, meta, shift }.
+ */
+export const FOCUSED_SELECT_KEY_JS = `(() => {
+  var args = ${ARGS_MARKER};
+  ${NATIVE_SELECT_HELPER_JS}
+  try {
+    var key = args.key;
+    var anyMod = !!(args.alt || args.ctrl || args.meta || args.shift);
+    var isArrow = key === "ArrowDown" || key === "ArrowUp";
+    if (!isArrow && key !== " " && key !== "F4") return { handled: false };
+    var a = document.activeElement;
+    var guard = 0;
+    while (a && guard < 20) {
+      guard++;
+      if (a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; continue; }
+      var tag = a.tagName ? a.tagName.toLowerCase() : "";
+      if (tag === "iframe" || tag === "frame") {
+        var inner = null;
+        try { inner = a.contentDocument ? a.contentDocument.activeElement : null; } catch (err) { inner = null; }
+        // A cross-origin / out-of-process frame: its document cannot be read from here.
+        if (!inner) return { handled: false, opaqueFrame: true };
+        a = inner;
+        continue;
+      }
+      break;
+    }
+    var sel = a ? penDropdownSelectOf(a) : null;
+    if (!sel || sel !== a) return { handled: false };
+    var focusedHere = false;
+    try {
+      var d = sel.ownerDocument;
+      focusedHere = d.hasFocus() && d.activeElement !== d.body;
+    } catch (err) {}
+    var result = { handled: true, moved: false, focusedHere: focusedHere };
+    // Only a plain arrow moves the selection; an arrow with any modifier (Alt,
+    // Ctrl, Meta, Shift), Space and F4 can open the popup and do nothing here.
+    if (isArrow && !anyMod) {
+      var opts = sel.options;
+      var step = key === "ArrowDown" ? 1 : -1;
+      var from = sel.selectedIndex;
+      var view = sel.ownerDocument.defaultView || window;
+      var skip = function (o) {
+        if (o.disabled || o.hidden || o.hasAttribute("hidden")) return true;
+        var og = o.parentNode && o.parentNode.tagName && o.parentNode.tagName.toLowerCase() === "optgroup" ? o.parentNode : null;
+        if (og && (og.disabled || og.hasAttribute("disabled") || og.hidden || og.hasAttribute("hidden"))) return true;
+        try {
+          if (String(view.getComputedStyle(o).display) === "none") return true;
+        } catch (err) {}
+        return false;
+      };
+      var i = from + step;
+      while (i >= 0 && i < opts.length && skip(opts[i])) i += step;
+      if (i >= 0 && i < opts.length && i !== from) {
+        sel.selectedIndex = i;
+        sel.dispatchEvent(new view.Event("input", { bubbles: true, composed: true }));
+        sel.dispatchEvent(new view.Event("change", { bubbles: true }));
+        result.moved = true;
+        result.from = from;
+        result.to = i;
+        result.value = sel.value;
+        result.text = String(opts[i].text || "").trim();
+      }
+    }
+    return result;
+  } catch (err) {
+    return { handled: false };
+  }
+})()`;
+
+/**
  * Wave 2 reliability, item 1/2: resolves a click/type target — by `target`
  * text/selector (LOCATE_TARGET_JS's text-first order, same as CLICK_JS/
  * TYPE_JS) or by `index`+`snapshotId` (the existing PERFORM_JS lookup) —
