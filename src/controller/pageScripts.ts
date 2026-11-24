@@ -1915,6 +1915,17 @@ const FOCUS_FOLLOW_HELPER_JS = `
     );
   }
 
+  // Fields the controller types into key by key: a plain single-line text
+  // input. Not a textarea or contenteditable (Enter may send, editors
+  // auto-close brackets and open mention menus on single keys), and not a
+  // date/time/color input (its keys edit segments, not text).
+  function penTakesKeystrokes(n) {
+    if ((n.tagName || "").toLowerCase() !== "input") return false;
+    var type = (n.getAttribute("type") || "text").toLowerCase();
+    return ["date", "time", "datetime-local", "month", "week", "color", "range", "file", "checkbox", "radio",
+      "button", "submit", "reset", "image", "hidden"].indexOf(type) === -1;
+  }
+
   function penFollowableFocus(el) {
     var a = penDeepActive();
     if (!a || a === el || !penIsEditable(a) || (el.contains && el.contains(a))) return null;
@@ -3271,7 +3282,7 @@ export const SELECT_ALL_CONTENT_JS = `(() => {
       if (typeof el.select === "function") el.select();
       else if (typeof el.setSelectionRange === "function") el.setSelectionRange(0, String(el.value || "").length);
     } catch (e) {}
-    result = { editable: true };
+    result = { editable: true, keystrokes: penTakesKeystrokes(el) };
   } else if (el.isContentEditable) {
     try {
       var range = document.createRange();
@@ -3312,10 +3323,42 @@ export const READ_TARGET_VALUE_JS = `(() => {
     if (n.isContentEditable) return n.textContent;
     return null;
   }
+  // A mask that only INSERTED separators: "(415) 555-0123" for "4155550123".
+  // "." and "," are not separators here (12.50 is not 1250), and nothing typed
+  // may be missing ("5" is not "-5").
+  function penIsMaskOf(actual, expected) {
+    if (typeof actual !== "string" || expected.length === 0) return false;
+    var i = 0;
+    for (var j = 0; j < actual.length; j++) {
+      if (i < expected.length && actual.charAt(j) === expected.charAt(i)) i++;
+      else if (!/[\\s()\\-\\/:+]/.test(actual.charAt(j))) return false;
+    }
+    return i === expected.length;
+  }
+  // A one-character-per-box code input that moves focus on: the boxes from
+  // el on hold the text, one character each.
+  function penIsSplitAcross(el, expected) {
+    if (expected.length < 2 || (el.tagName || "").toLowerCase() !== "input") return false;
+    var all = Array.prototype.slice.call(el.getRootNode().querySelectorAll("input")).filter(function (n) {
+      return (n.getAttribute("type") || "").toLowerCase() !== "hidden";
+    });
+    var at = all.indexOf(el);
+    for (var k = 0; k < expected.length; k++) {
+      var box = all[at + k];
+      if (!box || box.value !== expected.charAt(k)) return false;
+    }
+    return true;
+  }
   var el = penFindSigTarget();
   if (!el) return { matches: false, present: false };
   var actual = penReadText(el);
   if (actual === expected) return { matches: true, present: true };
+  // Key-by-key typing (args.keys) goes through the page's own key handlers,
+  // so two more outcomes are the page doing its job, not a failed type. The
+  // legacy setter would break both.
+  if (args.keys === true && (penIsMaskOf(actual, expected) || penIsSplitAcross(el, expected))) {
+    return { matches: true, present: true };
+  }
   // The click's focus move can land AFTER SELECT_ALL_CONTENT_JS ran (a slow
   // overlay): the text then went into the newly focused field, not the
   // stamped one. If that field holds exactly the expected text, adopt it as
@@ -3333,6 +3376,16 @@ export const READ_TARGET_VALUE_JS = `(() => {
     return { matches: true, present: true, retargeted: true, __scopedBefore: before };
   }
   return { matches: false, present: true };
+})()`;
+
+/**
+ * Checked before every key of key-by-key typing: is keyboard focus still on an
+ * editable element? If not, the remaining characters would reach the page's
+ * own keyboard shortcuts, so the controller stops typing.
+ */
+export const TYPING_FOCUS_JS = `(() => {
+  ${FOCUS_FOLLOW_HELPER_JS}
+  return { editable: penIsEditable(penDeepActive()) };
 })()`;
 
 /**

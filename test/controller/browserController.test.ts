@@ -4445,6 +4445,9 @@ describe("BrowserController — Wave 1 speed", () => {
     function isBusyCall(code: unknown): boolean {
       return typeof code === "string" && code.includes("present: true, busy: penTargetIsBusy(el)");
     }
+    function isTypingFocusCall(code: unknown): boolean {
+      return typeof code === "string" && code.includes("editable: penIsEditable(penDeepActive())");
+    }
 
     describe("dispatchClick (act click / perform CLICK)", () => {
       it("act click: dispatches a trusted CDP mouseMoved/mousePressed/mouseReleased triple when the hit-test passes, and reports via: \"cdp\"", async () => {
@@ -4827,6 +4830,124 @@ describe("BrowserController — Wave 1 speed", () => {
         const controller = new BrowserController(makeFakeTarget(page));
         const result = await controller.act({ action: "type", target: "Search", text: "shoes" });
         expect(result).toMatchObject({ via: "dom" });
+      });
+
+      // Key-by-key typing: SELECT_ALL_CONTENT_JS reports `keystrokes: true` for
+      // a plain single-line <input>; every character is then its own trusted
+      // key press, with the focus checked before each one.
+      describe("key-by-key typing", () => {
+        function typingPage(opts: {
+          keystrokes?: boolean;
+          /** Answers of the focus check, one per character; the last repeats. */
+          focus?: boolean[];
+          verify?: Record<string, unknown>;
+          url?: () => string;
+          onSend?: (method: string, params?: Record<string, unknown>) => void;
+        }) {
+          const legacy = vi.fn();
+          const verifyCodes: string[] = [];
+          let checks = 0;
+          const sendCdp = vi.fn((method: string, params?: Record<string, unknown>) => {
+            opts.onSend?.(method, params);
+            return Promise.resolve({});
+          });
+          const page = makeFakePage({
+            getURL: vi.fn(opts.url ?? (() => "https://x/")),
+            getTitle: vi.fn(() => "X"),
+            sendCdp,
+            executeJavaScript: vi.fn((code: string) => {
+              if (isSignatureCall(code) || isCursorCall(code)) return Promise.resolve({ ok: true });
+              if (isResolveCall(code)) return Promise.resolve({ found: true, x: 5, y: 6, hitOk: true, matched: "Code", editable: true });
+              if (isSelectAllCall(code)) return Promise.resolve({ editable: true, keystrokes: opts.keystrokes ?? true });
+              if (isTypingFocusCall(code)) {
+                const list = opts.focus ?? [true];
+                return Promise.resolve({ editable: list[Math.min(checks++, list.length - 1)] });
+              }
+              if (isReadValueCall(code)) {
+                verifyCodes.push(code);
+                return Promise.resolve(opts.verify ?? { matches: true, present: true });
+              }
+              if (isBusyCall(code)) return Promise.resolve({ present: false, busy: false });
+              if (code.includes("autocomplete: false")) return Promise.resolve({ autocomplete: false });
+              legacy();
+              return Promise.resolve({ url: "https://x/", title: "X", matched: "Code" });
+            }),
+          });
+          const keyDowns = () =>
+            sendCdp.mock.calls
+              .filter((c) => c[0] === "Input.dispatchKeyEvent" && c[1]!.type === "keyDown")
+              .map((c) => c[1]!.text);
+          const inserted = () => sendCdp.mock.calls.filter((c) => c[0] === "Input.insertText").map((c) => c[1]!.text);
+          return { controller: new BrowserController(makeFakeTarget(page)), sendCdp, legacy, verifyCodes, keyDowns, inserted };
+        }
+
+        it("presses one trusted key per character and never bulk-inserts", async () => {
+          const t = typingPage({});
+          const result = await t.controller.act({ action: "type", target: "Code", text: "a1 я" });
+          expect(result).toMatchObject({ via: "cdp" });
+          expect(t.keyDowns()).toEqual(["a", "1", " ", "я"]);
+          expect(t.inserted()).toEqual([]);
+          const ups = t.sendCdp.mock.calls.filter((c) => c[0] === "Input.dispatchKeyEvent" && c[1]!.type === "keyUp");
+          expect(ups).toHaveLength(4);
+          expect(t.verifyCodes[0]).toMatch(/"keys":\s*true/);
+        });
+
+        it.each([
+          ["the field is not a plain single-line input", "abc", false],
+          ["the text has a line break", "a\nb", true],
+          ["the text has characters outside the BMP", "hi 👋", true],
+          ["the text is long", "x".repeat(101), true],
+          ["the text is empty (clearing the field)", "", true],
+        ])("bulk-inserts when %s", async (_why, text, keystrokes) => {
+          const t = typingPage({ keystrokes });
+          await t.controller.act({ action: "type", target: "Code", text });
+          expect(t.keyDowns()).toEqual([]);
+          expect(t.inserted()).toEqual([text]);
+          expect(t.verifyCodes[0]).not.toMatch(/"keys":\s*true/);
+        });
+
+        it("stops when focus leaves every editable field, so the rest cannot hit page shortcuts", async () => {
+          const t = typingPage({ focus: [true, true, false], verify: { matches: false, present: true } });
+          const result = await t.controller.act({ action: "type", target: "Code", text: "delete" });
+          expect(t.keyDowns()).toEqual(["d", "e"]);
+          expect(t.legacy).toHaveBeenCalled();
+          expect(result).toMatchObject({ via: "dom" });
+        });
+
+        it("inserts the rest in one call once a slow CDP link has used the time budget", async () => {
+          const start = Date.now();
+          let offset = 0;
+          const clock = vi.spyOn(Date, "now").mockImplementation(() => start + offset);
+          try {
+            const t = typingPage({
+              onSend: (method, params) => {
+                if (method === "Input.dispatchKeyEvent" && params?.type === "keyUp") offset += 3_000;
+              },
+            });
+            const result = await t.controller.act({ action: "type", target: "Code", text: "abcdef" });
+            expect(t.keyDowns()).toEqual(["a", "b"]);
+            expect(t.inserted()).toEqual(["cdef"]);
+            expect(result).toMatchObject({ via: "cdp" });
+          } finally {
+            clock.mockRestore();
+          }
+        });
+
+        it("does not retype on the next page when the last key submitted the form", async () => {
+          let url = "https://x/code";
+          let downs = 0;
+          const t = typingPage({
+            url: () => url,
+            onSend: (method, params) => {
+              if (method === "Input.dispatchKeyEvent" && params?.type === "keyDown" && ++downs === 4) url = "https://x/done";
+            },
+            verify: { matches: false, present: false },
+          });
+          const result = await t.controller.act({ action: "type", target: "Code", text: "1234" });
+          expect(t.keyDowns()).toEqual(["1", "2", "3", "4"]);
+          expect(t.legacy).not.toHaveBeenCalled();
+          expect(result).toMatchObject({ via: "cdp", url: "https://x/done" });
+        });
       });
 
       it("perform TYPE_TEXT: routes an index-based type through the trusted-CDP path too", async () => {

@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { ARGS_MARKER, CAPTURE_JS, CLICK_RESOLVE_JS, FOCUSED_SELECT_KEY_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
+import { ARGS_MARKER, CAPTURE_JS, CLICK_RESOLVE_JS, FOCUSED_SELECT_KEY_JS, CURSOR_JS, CSS_QUERY_JS, PASSWORD_MASK_JS, READ_TARGET_VALUE_JS, SELECT_ALL_CONTENT_JS, SIGNATURE_JS, SNAPSHOT_JS } from "../../src/controller/pageScripts.js";
 import { BrowserController } from "../../src/controller/controller.js";
 
 /** Runs a page script in the happy-dom document, like page.evaluate would. */
@@ -1106,5 +1106,57 @@ describe("FOCUSED_SELECT_KEY_JS", () => {
     } finally {
       delete (document as any).activeElement;
     }
+  });
+});
+
+describe("key-by-key typing scripts", () => {
+  function stamp(id: string): void {
+    const el = document.getElementById(id)!;
+    el.setAttribute("data-pen-sig-target", "");
+    (window as any).__penSigTarget = el;
+  }
+  function verify(actual: string, text: string, keys = true): boolean {
+    document.body.innerHTML = '<input id="f">';
+    (document.getElementById("f") as HTMLInputElement).value = actual;
+    stamp("f");
+    return run(READ_TARGET_VALUE_JS, keys ? { text, keys: true } : { text }).matches;
+  }
+
+  it.each([
+    ['<input id="f">', true],
+    ['<input id="f" type="tel">', true],
+    ['<input id="f" type="password">', true],
+    ['<input id="f" type="date">', false],
+    ['<textarea id="f"></textarea>', false],
+  ])("SELECT_ALL_CONTENT_JS: %s takes keystrokes: %s", (html, expected) => {
+    document.body.innerHTML = html;
+    stamp("f");
+    expect(run(SELECT_ALL_CONTENT_JS, {}).keystrokes === true).toBe(expected);
+  });
+
+  it.each([
+    ["(415) 555-0123", "4155550123", true],
+    ["12/34/56", "123456", true],
+    ["4242 4242", "42424242", true],
+    ["15.00", "1500", false],
+    ["5", "-5", false],
+    ["1234", "12a34", false],
+    ["abcde", "abcdefgh", false],
+    ["", "abc", false],
+  ])("READ_TARGET_VALUE_JS: field %j after typing %j matches: %s", (actual, text, expected) => {
+    expect(verify(actual, text)).toBe(expected);
+  });
+
+  it("READ_TARGET_VALUE_JS keeps the exact comparison for bulk inserts", () => {
+    expect(verify("(415) 555-0123", "4155550123", false)).toBe(false);
+  });
+
+  it("READ_TARGET_VALUE_JS accepts a code split one character per box, and not a partial one", () => {
+    document.body.innerHTML = '<input id="a"><input type="hidden" value="t"><input id="b"><input id="c">';
+    ["a", "b", "c"].forEach((id, i) => ((document.getElementById(id) as HTMLInputElement).value = "123"[i]));
+    stamp("a");
+    expect(run(READ_TARGET_VALUE_JS, { text: "123", keys: true }).matches).toBe(true);
+    (document.getElementById("c") as HTMLInputElement).value = "";
+    expect(run(READ_TARGET_VALUE_JS, { text: "123", keys: true }).matches).toBe(false);
   });
 });

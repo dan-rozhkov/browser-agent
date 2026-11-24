@@ -93,6 +93,7 @@ import {
   REVEAL_TARGET_JS,
   SELECT_ALL_CONTENT_JS,
   READ_TARGET_VALUE_JS,
+  TYPING_FOCUS_JS,
   SLIDER_READ_JS,
   SLIDER_SCROLL_JS,
   BOT_CHECK_JS,
@@ -143,6 +144,7 @@ const SCRIPT_TEMPLATES = {
   REVEAL_TARGET_JS,
   SELECT_ALL_CONTENT_JS,
   READ_TARGET_VALUE_JS,
+  TYPING_FOCUS_JS,
   SLIDER_READ_JS,
   SLIDER_SCROLL_JS,
   BOT_CHECK_JS,
@@ -153,6 +155,17 @@ const SCRIPT_TEMPLATES = {
 } as const;
 
 type ScriptName = keyof typeof SCRIPT_TEMPLATES;
+
+/** Key-by-key typing (`typeByKeys`). Text longer than KEYSTROKE_MAX_CHARS is
+ * inserted in one call. KEYSTROKE_GAP_MS lets the page react between keys.
+ * KEYSTROKE_BUDGET_MS bounds a slow CDP link (cloud browser): past it, the
+ * rest of the text is inserted in one call. */
+const KEYSTROKE_MAX_CHARS = 100;
+const KEYSTROKE_GAP_MS = 15;
+const KEYSTROKE_BUDGET_MS = 5_000;
+/** One printable key per UTF-16 unit: no line breaks, tabs, combining marks or
+ * characters outside the BMP (emoji), which have no single key. */
+const KEYSTROKE_TEXT_RE = /^[\p{L}\p{N}\p{P}\p{S} ]+$/u;
 
 /** Hard bounds on `driveSlider`: total trusted key presses (what a
  * misbehaving widget can cost; large ranges are covered by Home/End and page
@@ -3110,14 +3123,18 @@ export class BrowserController {
    * Range for `contenteditable`) so the inserted text *replaces* it, the way
    * a real keyboard-driven fill would.
    *
-   * The actual typing is one `keyDown`+`keyUp` pair for the first character
+   * A plain single-line `<input>` gets short text key by key
+   * (`typeByKeys`): the page's own key handlers then see every character, which
+   * code boxes, masks, key filters and keyup-driven search need. Measured cost
+   * in Chromium is well under 1 ms per key plus KEYSTROKE_GAP_MS. Everything else
+   * (long text, textarea, contenteditable) uses the bulk path:
+   *
+   * one `keyDown`+`keyUp` pair for the first character
    * — carrying no `text`, so it fires `keydown`/`keyup` listeners without
    * itself inserting anything — followed by a single `Input.insertText` for
    * the *entire* string, which fires `beforeinput`/`input` the same way a
    * real paste/IME commit would (React-compatible, unlike a raw `.value =`
-   * assignment). Sending one `dispatchKeyEvent` pair per character (matching
-   * a real keystroke-by-keystroke type) was considered and rejected here as
-   * too slow for anything but a short string — see the shared contract doc.
+   * assignment).
    *
    * The result is verified (`READ_TARGET_VALUE_JS`, comparing on the page,
    * never returning the raw value itself) before being trusted: a
@@ -3195,23 +3212,34 @@ export class BrowserController {
     // Focus has settled (a focus-time suggestion list is on screen by now):
     // the last moment to record what was visible before the text goes in.
     await baseline?.take();
+    const byKeys =
+      selectResult.keystrokes === true && text.length <= KEYSTROKE_MAX_CHARS && KEYSTROKE_TEXT_RE.test(text) && !/[\uD800-\uDFFF]/.test(text);
+    const urlBefore = page.getURL();
+    let allKeysSent = false;
     try {
-      if (text.length > 0) {
-        const firstKey = resolveNamedKey(text[0]);
-        if (firstKey) await this.dispatchKeyPair(page, firstKey);
+      if (byKeys) {
+        allKeysSent = await this.typeByKeys(page, text, deadlineAt);
+      } else {
+        if (text.length > 0) {
+          const firstKey = resolveNamedKey(text[0]);
+          if (firstKey) await this.dispatchKeyPair(page, firstKey);
+        }
+        await page.sendCdp("Input.insertText", { text });
       }
-      await page.sendCdp("Input.insertText", { text });
     } catch {
       return this.legacyTypeFallback(page, locateArgs, text, deadlineAt, baseline);
     }
 
     let verify: BrowserCommandResult;
     try {
-      verify = await this.executeScript(page, "READ_TARGET_VALUE_JS", { text });
+      verify = await this.executeScript(page, "READ_TARGET_VALUE_JS", byKeys ? { text, keys: true } : { text });
     } catch {
-      return this.legacyTypeFallback(page, locateArgs, text, deadlineAt, baseline);
+      verify = { matches: false };
     }
-    if ("error" in verify || verify.matches !== true) {
+    // A full key-by-key type that left the page (a code input that submits on
+    // its last digit) is done. The fallback would type into the NEXT page.
+    const submitted = allKeysSent && page.getURL() !== urlBefore;
+    if (!submitted && ("error" in verify || verify.matches !== true)) {
       return this.legacyTypeFallback(page, locateArgs, text, deadlineAt, baseline);
     }
     // Focus moved AFTER the select step (slow overlay): the text landed in
@@ -3240,6 +3268,32 @@ export class BrowserController {
       __scopedBefore: scopedBefore,
       __targetSelfDisabled: !busyBefore && busyAfter,
     };
+  }
+
+  /** Types `text` into the focused field, one trusted key press per character,
+   * like a keyboard. Before every key it checks that focus is still on an
+   * editable element, so a field that loses focus cannot turn the remaining
+   * characters into page shortcuts. Returns false if it stopped for that (the
+   * caller's verify then decides). Past the time budget the rest goes in with
+   * one `Input.insertText`. Past the command's own deadline it stops: an
+   * abandoned command must not keep typing. Throws if a dispatch rejects. */
+  private async typeByKeys(page: BrowserPageHandle, text: string, deadlineAt: number): Promise<boolean> {
+    const budgetEnd = Date.now() + KEYSTROKE_BUDGET_MS;
+    for (let i = 0; i < text.length; i++) {
+      if (i > 0) await new Promise((resolve) => setTimeout(resolve, KEYSTROKE_GAP_MS));
+      const focus = await this.executeScript(page, "TYPING_FOCUS_JS", {});
+      if (focus.editable !== true || Date.now() > deadlineAt) return false;
+      if (Date.now() > budgetEnd) {
+        await page.sendCdp!("Input.insertText", { text: text.slice(i) });
+        return true;
+      }
+      const ch = text[i];
+      // No entry in the key table (Cyrillic, CJK): a key event that names only
+      // the character, as a layout unknown to the page would produce.
+      const key = resolveNamedKey(ch) ?? { key: ch, code: "", windowsVirtualKeyCode: 0 };
+      await this.dispatchKeyPair(page, key, { text: ch, commands: undefined });
+    }
+    return true;
   }
 
   /** `dispatchType`'s fallback — the pre-Wave-2 native-setter + input/change

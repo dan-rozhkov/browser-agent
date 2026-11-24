@@ -1392,10 +1392,20 @@ below).
   `resolveNamedKey`, the same table `act`'s `press` uses) followed by a
   single `Input.insertText` for the *entire* string — this fires
   `beforeinput`/`input` the way real typing or an IME/paste commit would,
-  React-compatible, unlike a raw `.value =` assignment. One `insertText` call
-  for the whole string, not one `dispatchKeyEvent` pair per character, was a
-  deliberate choice — character-at-a-time dispatch is far slower for
-  anything but a short string. The result is verified
+  React-compatible, unlike a raw `.value =` assignment. **Short text in a
+  plain single-line `<input>` is typed key by key instead** (`typeByKeys`: at
+  most 100 characters, no line breaks, emoji or combining marks; a 15ms gap,
+  about 17ms per character in all). The bulk insert fired one key event for the
+  whole string, so a six-box code input got `123456` in the first box, a
+  keydown-driven mask got `1`, and a keyup-driven search saw nothing. Before
+  each key `TYPING_FOCUS_JS` checks that focus is still editable (otherwise the
+  rest of the text would hit the page's keyboard shortcuts), and a 5s budget
+  bounds a slow CDP link (the rest is then inserted in one call). The verify
+  (`keys: true`) also accepts a mask that only inserted separators and a code
+  split one character per box; a page that navigated after the last key counts
+  as done, with no fallback into the next page. Textareas, contenteditable and
+  date/time inputs keep the bulk path: Enter may send, editors auto-close
+  brackets, date keys edit segments. The result is verified
   (`READ_TARGET_VALUE_JS`, comparing on the page — it never returns the raw
   value itself, matching this file's existing value-privacy rules) before
   being trusted: a masked/formatted input that rewrites what was inserted
