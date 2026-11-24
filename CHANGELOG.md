@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.11](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.10...v0.4.11) (2026-11-24)
+
+
+### Bug Fixes
+
+* **controller:** type short text into plain inputs key by key ([e6eaad4](https://github.com/dan-rozhkov/browser-agent/commit/e6eaad4bd3d238fdfa341c5657e28379f7cf4eb6))
+
 ## [0.4.10](https://github.com/dan-rozhkov/browser-agent/compare/v0.4.9...v0.4.10) (2026-11-15)
 
 
